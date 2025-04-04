@@ -12,11 +12,12 @@ test = []
 
 [dependencies]
 anyhow = { workspace = true }
-manifest-dex = "2.0.0"
-hypertree = "1.0.0"
-jupiter-amm-interface = "=0.4.5"
+manifest-dex = { path = "../../programs/manifest", features = ["no-entrypoint"] }
+hypertree = { path = "../../lib" }
+jupiter-amm-interface = "=0.5.0"
 solana-sdk = { workspace = true }
 solana-program = { workspace = true }
 spl-token = { workspace = true }
 spl-token-2022 = { workspace = true }
 tokio = { workspace = true }
+solana-zk-sdk = { workspace = true }

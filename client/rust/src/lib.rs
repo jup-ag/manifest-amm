@@ -197,10 +197,6 @@ impl Amm for ManifestLocalMarket {
         false
     }
 
-    fn get_user_setup(&self) -> Option<jupiter_amm_interface::AmmUserSetup> {
-        None
-    }
-
     fn unidirectional(&self) -> bool {
         false
     }

@@ -302,14 +302,10 @@ impl<'a, 'info> SwapContext<'a, 'info> {
         let base_mint_key: Pubkey = *market_fixed.get_base_mint();
         let quote_mint_key: Pubkey = *market_fixed.get_quote_mint();
 
-        let trader_base: TokenAccountInfo = TokenAccountInfo::new(
-            next_account_info(account_iter)?,
-            &base_mint_key,
-        )?;
-        let trader_quote: TokenAccountInfo = TokenAccountInfo::new(
-            next_account_info(account_iter)?,
-            &quote_mint_key,
-        )?;
+        let trader_base: TokenAccountInfo =
+            TokenAccountInfo::new(next_account_info(account_iter)?, &base_mint_key)?;
+        let trader_quote: TokenAccountInfo =
+            TokenAccountInfo::new(next_account_info(account_iter)?, &quote_mint_key)?;
         let base_vault_address: &Pubkey = market_fixed.get_base_vault();
         let quote_vault_address: &Pubkey = market_fixed.get_quote_vault();
 

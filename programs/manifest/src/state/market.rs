@@ -25,8 +25,10 @@ use crate::{
     quantities::{BaseAtoms, GlobalAtoms, QuoteAtoms, QuoteAtomsPerBaseAtom, WrapperU64},
     require,
     state::{
-        utils::{assert_can_take, remove_from_global, try_to_move_global_tokens},
-        OrderType,
+        utils::{
+            assert_can_take, jup_can_back_order, remove_from_global, try_to_move_global_tokens,
+        },
+        GlobalRef, OrderType,
     },
     validation::{
         get_vault_address, loaders::GlobalTradeAccounts, ManifestAccount, MintAccountInfo,
@@ -481,6 +483,71 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         )
     }
 
+    pub fn jup_impact_quote_atoms_with_slot(
+        &self,
+        is_bid: bool,
+        limit_base_atoms: BaseAtoms,
+        global_dynamic_account_opt: &Option<GlobalRef>,
+        now_slot: u32,
+    ) -> Result<QuoteAtoms, ProgramError> {
+        let book: BooksideReadOnly = if is_bid {
+            self.get_asks()
+        } else {
+            self.get_bids()
+        };
+
+        let mut total_matched_quote_atoms: QuoteAtoms = QuoteAtoms::ZERO;
+        let mut remaining_base_atoms: BaseAtoms = limit_base_atoms;
+        for (_, resting_order) in book.iter::<RestingOrder>() {
+            // Skip expired orders
+            if resting_order.is_expired(now_slot) {
+                continue;
+            }
+            let matched_price: QuoteAtomsPerBaseAtom = resting_order.get_price();
+
+            // Either fill the entire resting order, or only the
+            // remaining_base_atoms, in which case, this is the last iteration
+            let matched_base_atoms: BaseAtoms =
+                resting_order.get_num_base_atoms().min(remaining_base_atoms);
+            let did_fully_match_resting_order: bool =
+                remaining_base_atoms >= resting_order.get_num_base_atoms();
+
+            // Number of quote atoms matched exactly. Round in taker favor if
+            // fully matching.
+            let matched_quote_atoms: QuoteAtoms = matched_price.checked_quote_for_base(
+                matched_base_atoms,
+                is_bid != did_fully_match_resting_order,
+            )?;
+
+            // Skip unbacked global orders.
+            if self.jup_is_unbacked_global_order(
+                &resting_order,
+                is_bid,
+                global_dynamic_account_opt,
+                matched_base_atoms,
+                matched_quote_atoms,
+            ) {
+                continue;
+            }
+
+            total_matched_quote_atoms =
+                total_matched_quote_atoms.checked_add(matched_quote_atoms)?;
+
+            if !did_fully_match_resting_order {
+                break;
+            }
+
+            // prepare for next iteration
+            remaining_base_atoms = remaining_base_atoms.checked_sub(matched_base_atoms)?;
+        }
+
+        // Note that when there are not enough orders on the market to use up or
+        // to receive the desired number of base atoms, this returns just the
+        // full amount on the bookside without differentiating that return.
+
+        return Ok(total_matched_quote_atoms);
+    }
+
     pub fn impact_quote_atoms_with_slot(
         &self,
         is_bid: bool,
@@ -772,6 +839,31 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
             };
             let has_enough_tokens: bool = can_back_order(
                 global_trade_accounts_opt,
+                self.get_trader_key_by_index(resting_order.get_trader_index()),
+                GlobalAtoms::new(if is_bid {
+                    matched_base_atoms.as_u64()
+                } else {
+                    matched_quote_atoms.as_u64()
+                }),
+            );
+            if !has_enough_tokens {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn jup_is_unbacked_global_order(
+        &self,
+        resting_order: &RestingOrder,
+        is_bid: bool,
+        global_dynamic_account_opt: &Option<GlobalRef>,
+        matched_base_atoms: BaseAtoms,
+        matched_quote_atoms: QuoteAtoms,
+    ) -> bool {
+        if resting_order.get_order_type() == OrderType::Global {
+            let has_enough_tokens: bool = jup_can_back_order(
+                global_dynamic_account_opt,
                 self.get_trader_key_by_index(resting_order.get_trader_index()),
                 GlobalAtoms::new(if is_bid {
                     matched_base_atoms.as_u64()

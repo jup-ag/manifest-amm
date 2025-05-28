@@ -19,6 +19,7 @@ use solana_program::{account_info::AccountInfo, system_program};
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use std::{cell::RefCell, mem::size_of, rc::Rc};
 
+#[macro_export]
 macro_rules! dynamic_value_opt_to_account_info {
     ( $name:ident, $value_opt:expr, $fixed_size:expr, $type:ident, $key:expr ) => {
         let mut data_vec: Vec<u8> = Vec::new();

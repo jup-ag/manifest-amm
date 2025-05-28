@@ -1,6 +1,4 @@
-# ![Logo](assets/brown-contrast-split.png)
-
-# <span style="font-family: 'Vollkorn', serif;">MANIFEST</span>
+# ![Logo](assets/manifest-wide.png)
 
 *The Unlimited Orderbook*
 
@@ -109,8 +107,6 @@ cargo test-sbf
 sh local-validator-test.sh
 ```
 ## Resources
-### Version
-  Currently deployed version [1.4.0 release](https://github.com/CKS-Systems/manifest/releases/tag/program-v1.4.0)
 ### Client SDK
   [NPM Package](https://www.npmjs.com/package/@cks-systems/manifest-sdk)
 

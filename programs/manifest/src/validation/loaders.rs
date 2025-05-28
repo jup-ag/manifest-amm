@@ -193,6 +193,8 @@ impl<'a, 'info> DepositContext<'a, 'info> {
 
 /// Withdraw account infos
 pub(crate) struct WithdrawContext<'a, 'info> {
+    // TODO: Separate owner and payer so you can crank a withdraw on behalf of
+    // someone else to their token account.
     pub payer: Signer<'a, 'info>,
     pub market: ManifestAccountInfo<'a, 'info, MarketFixed>,
     pub trader_token: TokenAccountInfo<'a, 'info>,
@@ -252,6 +254,7 @@ impl<'a, 'info> WithdrawContext<'a, 'info> {
 /// Swap account infos
 pub(crate) struct SwapContext<'a, 'info> {
     pub payer: Signer<'a, 'info>,
+    pub owner: Signer<'a, 'info>,
     pub market: ManifestAccountInfo<'a, 'info, MarketFixed>,
     pub trader_base: TokenAccountInfo<'a, 'info>,
     pub trader_quote: TokenAccountInfo<'a, 'info>,
@@ -272,8 +275,25 @@ impl<'a, 'info> SwapContext<'a, 'info> {
         let account_iter: &mut Iter<AccountInfo<'info>> = &mut accounts.iter();
 
         let payer: Signer = Signer::new(next_account_info(account_iter)?)?;
-        let market: ManifestAccountInfo<MarketFixed> =
-            ManifestAccountInfo::<MarketFixed>::new(next_account_info(account_iter)?)?;
+
+        let owner_or_market: &'a AccountInfo<'info> = next_account_info(account_iter)?;
+        let (owner, market): (Signer, ManifestAccountInfo<MarketFixed>) =
+            if *owner_or_market.owner == crate::ID {
+                // Normal case where the payer of rent is the same as the token account
+                // owners and the caller has only included one to save ix call data
+                // bytes.
+                (
+                    payer.clone(),
+                    ManifestAccountInfo::<MarketFixed>::new(owner_or_market)?,
+                )
+            } else {
+                // Separate token account owner from rent payer. This is SwapV2.
+                (
+                    Signer::new(owner_or_market)?,
+                    ManifestAccountInfo::<MarketFixed>::new(next_account_info(account_iter)?)?,
+                )
+            };
+
         // Included in case we need to expand for a reverse order.
         let _system_program: Program =
             Program::new(next_account_info(account_iter)?, &system_program::id())?;
@@ -282,16 +302,10 @@ impl<'a, 'info> SwapContext<'a, 'info> {
         let base_mint_key: Pubkey = *market_fixed.get_base_mint();
         let quote_mint_key: Pubkey = *market_fixed.get_quote_mint();
 
-        let trader_base: TokenAccountInfo = TokenAccountInfo::new_with_owner(
-            next_account_info(account_iter)?,
-            &base_mint_key,
-            payer.key,
-        )?;
-        let trader_quote: TokenAccountInfo = TokenAccountInfo::new_with_owner(
-            next_account_info(account_iter)?,
-            &quote_mint_key,
-            payer.key,
-        )?;
+        let trader_base: TokenAccountInfo =
+            TokenAccountInfo::new(next_account_info(account_iter)?, &base_mint_key)?;
+        let trader_quote: TokenAccountInfo =
+            TokenAccountInfo::new(next_account_info(account_iter)?, &quote_mint_key)?;
         let base_vault_address: &Pubkey = market_fixed.get_base_vault();
         let quote_vault_address: &Pubkey = market_fixed.get_quote_vault();
 
@@ -413,6 +427,7 @@ impl<'a, 'info> SwapContext<'a, 'info> {
 
         Ok(Self {
             payer,
+            owner,
             market,
             trader_base,
             trader_quote,

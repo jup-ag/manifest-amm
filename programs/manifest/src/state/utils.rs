@@ -26,6 +26,7 @@ use super::{
     order_type_can_take, GlobalRefMut, OrderType, RestingOrder, GAS_DEPOSIT_LAMPORTS,
     NO_EXPIRATION_LAST_VALID_SLOT,
 };
+use crate::state::GlobalRef;
 
 pub fn get_now_slot() -> u32 {
     // If we cannot get the clock (happens in tests, then only match with
@@ -200,6 +201,21 @@ pub(crate) fn can_back_order<'a, 'info>(
     let global_data: &mut RefMut<&mut [u8]> = &mut global.try_borrow_mut_data().unwrap();
     let global_dynamic_account: GlobalRefMut = get_mut_dynamic_account(global_data);
 
+    let num_deposited_atoms: GlobalAtoms =
+        global_dynamic_account.get_balance_atoms(resting_order_trader);
+    return desired_global_atoms <= num_deposited_atoms;
+}
+
+pub(crate) fn jup_can_back_order<'a, 'info>(
+    global_dynamic_account_opt: &Option<GlobalRef>,
+    resting_order_trader: &Pubkey,
+    desired_global_atoms: GlobalAtoms,
+) -> bool {
+    if global_dynamic_account_opt.is_none() {
+        return false;
+    }
+
+    let global_dynamic_account = global_dynamic_account_opt.as_ref().unwrap();
     let num_deposited_atoms: GlobalAtoms =
         global_dynamic_account.get_balance_atoms(resting_order_trader);
     return desired_global_atoms <= num_deposited_atoms;

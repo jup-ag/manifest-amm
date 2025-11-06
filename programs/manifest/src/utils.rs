@@ -46,6 +46,10 @@ pub fn create_account<'a, 'info>(
 fn test_get_discriminant() {
     // Update this when updating program id.
     assert_eq!(
+        std::any::type_name::<crate::state::MarketFixed>(),
+        "MarketFixed"
+    );
+    assert_eq!(
         get_discriminant::<crate::state::MarketFixed>().unwrap(),
         4859840929024028656
     );

@@ -316,6 +316,29 @@ impl QuoteAtomsPerBaseAtom {
         }
     }
 
+    #[inline(always)]
+    pub fn checked_multiply_rational(
+        self,
+        numerator: u32,
+        denominator: u32,
+        round_up: bool,
+    ) -> Result<Self, PriceConversionError> {
+        // Stored as u128 * 10^-26
+        let inner: u128 = u64_slice_to_u128(self.inner);
+        // multiply then divide
+        let Some(product) = inner.checked_mul(numerator as u128) else {
+            return Err(PriceConversionError(0x4));
+        };
+        let new_inner: u128 = if round_up {
+            product.div_ceil(denominator as u128)
+        } else {
+            product.div(denominator as u128)
+        };
+        Ok(QuoteAtomsPerBaseAtom {
+            inner: u128_to_u64_slice(new_inner),
+        })
+    }
+
     pub fn try_from_mantissa_and_exponent(
         mantissa: u32,
         exponent: i8,

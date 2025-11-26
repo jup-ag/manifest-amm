@@ -4,4 +4,4 @@ mod global;
 mod market;
 mod resting_order;
 
-pub use {claimed_seat::*, dynamic_account::*, global::*, market::*};
+pub use {claimed_seat::*, dynamic_account::*, global::*, market::*, resting_order::*};

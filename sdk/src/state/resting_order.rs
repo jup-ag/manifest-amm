@@ -1,6 +1,6 @@
 use crate::{
     constants::NO_EXPIRATION_LAST_VALID_SLOT,
-    quantities::{BaseAtoms, QuoteAtomsPerBaseAtom, u64_slice_to_u128},
+    quantities::{BaseAtoms, PriceConversionError, QuoteAtomsPerBaseAtom, u64_slice_to_u128},
 };
 use bytemuck::{Pod, Zeroable};
 use hypertree::{DataIndex, PodBool};
@@ -26,12 +26,21 @@ pub enum OrderType {
     // the other side of the book with a small fee (spread).
     // Note: reverse orders can take but don't reverse when taking.
     Reverse = 4,
+
+    // Same as a reverse order except that it is much tighter, allowing for
+    // stables to have even smaller spreads.
+    ReverseTight = 5,
 }
 unsafe impl bytemuck::Zeroable for OrderType {}
 unsafe impl bytemuck::Pod for OrderType {}
 impl Default for OrderType {
     fn default() -> Self {
         OrderType::Limit
+    }
+}
+impl OrderType {
+    pub fn is_reversible(self) -> bool {
+        matches!(self, OrderType::Reverse | OrderType::ReverseTight)
     }
 }
 
@@ -63,7 +72,7 @@ impl RestingOrder {
         // Reverse orders cannot have expiration. The purpose of those orders is to
         // be a permanent liquidity on the book.
         assert!(
-            !(order_type == OrderType::Reverse && last_valid_slot != NO_EXPIRATION_LAST_VALID_SLOT)
+            !(order_type.is_reversible() && last_valid_slot != NO_EXPIRATION_LAST_VALID_SLOT)
         );
 
         Ok(RestingOrder {
@@ -100,7 +109,31 @@ impl RestingOrder {
     }
 
     pub fn is_reverse(&self) -> bool {
-        self.order_type == OrderType::Reverse
+        self.order_type.is_reversible()
+    }
+
+    pub fn is_reversible(&self) -> bool {
+        self.order_type.is_reversible()
+    }
+
+    pub fn reverse_price(&self) -> Result<QuoteAtomsPerBaseAtom, PriceConversionError> {
+        let base = match self.order_type {
+            OrderType::Reverse => 100_000_u32,
+            OrderType::ReverseTight => 100_000_000_u32,
+            _ => return Ok(self.price),
+        };
+
+        if self.get_is_bid() {
+            // Bid @P * (1 - spread) --> Ask @P
+            // equivalent to
+            // Bid @P --> Ask @P / (1 - spread)
+            self.price
+                .checked_multiply_rational(base, base - self.reverse_spread as u32, false)
+        } else {
+            // Ask @P --> Bid @P * (1 - spread)
+            self.price
+                .checked_multiply_rational(base - self.reverse_spread as u32, base, true)
+        }
     }
 
     pub fn get_reverse_spread(self) -> u16 {
@@ -160,7 +193,7 @@ impl PartialEq for RestingOrder {
         if self.trader_index != other.trader_index || self.order_type != other.order_type {
             return false;
         }
-        if self.order_type == OrderType::Reverse {
+        if self.order_type.is_reversible() {
             // Allow off by 1 for reverse orders to enable coalescing. Otherwise there is a back and forth that fragments into many orders.
             self.price == other.price
                 || u64_slice_to_u128(self.price.inner) + 1 == u64_slice_to_u128(other.price.inner)

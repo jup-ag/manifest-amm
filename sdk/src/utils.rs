@@ -30,13 +30,16 @@ pub(crate) fn can_back_order<'a, 'info>(
     resting_order_trader: &Pubkey,
     desired_global_atoms: GlobalAtoms,
 ) -> bool {
-    if global_trade_accounts_opt.is_none() {
+    let Some(global_trade_accounts) = global_trade_accounts_opt.as_ref() else {
         return false;
-    }
-    let global_trade_accounts: &GlobalTradeAccounts = &global_trade_accounts_opt.as_ref().unwrap();
+    };
     let GlobalTradeAccounts { global, .. } = global_trade_accounts;
 
-    let global_data: &mut RefMut<&mut [u8]> = &mut global.try_borrow_mut_data().unwrap();
+    let Ok(mut global_data_ref) = global.try_borrow_mut_data() else {
+        // If the account data is already borrowed, conservatively disallow the back order.
+        return false;
+    };
+    let global_data: &mut RefMut<&mut [u8]> = &mut global_data_ref;
     let global_dynamic_account: GlobalRefMut = get_mut_dynamic_account(global_data);
 
     let num_deposited_atoms: GlobalAtoms =

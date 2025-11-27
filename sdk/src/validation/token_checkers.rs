@@ -54,20 +54,26 @@ impl<'a, 'info> TokenAccountInfo<'a, 'info> {
         Ok(Self { info })
     }
 
-    pub fn get_owner(&self) -> Pubkey {
-        Pubkey::new_from_array(
-            self.info.try_borrow_data().unwrap()[32..64]
-                .try_into()
-                .unwrap(),
-        )
+    pub fn get_owner(&self) -> Result<Pubkey, ProgramError> {
+        let data = self.info.try_borrow_data()?;
+        let owner_slice = data
+            .get(32..64)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        let owner_array: [u8; 32] = owner_slice
+            .try_into()
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        Ok(Pubkey::new_from_array(owner_array))
     }
 
-    pub fn get_balance_atoms(&self) -> u64 {
-        u64::from_le_bytes(
-            self.info.try_borrow_data().unwrap()[64..72]
-                .try_into()
-                .unwrap(),
-        )
+    pub fn get_balance_atoms(&self) -> Result<u64, ProgramError> {
+        let data = self.info.try_borrow_data()?;
+        let balance_slice = data
+            .get(64..72)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        let balance_array: [u8; 8] = balance_slice
+            .try_into()
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        Ok(u64::from_le_bytes(balance_array))
     }
 
     pub fn new_with_owner(

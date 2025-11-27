@@ -20,21 +20,17 @@ macro_rules! checked_math {
         impl $type_name {
             #[inline(always)]
             pub fn checked_add(self, other: Self) -> Result<$type_name, ManifestError> {
-                let result_or: Option<u64> = self.inner.checked_add(other.inner);
-                if result_or.is_none() {
-                    Err(ManifestError::Overflow)
-                } else {
-                    Ok($type_name::new(result_or.unwrap()))
+                match self.inner.checked_add(other.inner) {
+                    Some(value) => Ok($type_name::new(value)),
+                    None => Err(ManifestError::Overflow),
                 }
             }
 
             #[inline(always)]
             pub fn checked_sub(self, other: Self) -> Result<$type_name, ManifestError> {
-                let result_or: Option<u64> = self.inner.checked_sub(other.inner);
-                if result_or.is_none() {
-                    Err(ManifestError::Overflow)
-                } else {
-                    Ok($type_name::new(result_or.unwrap()))
+                match self.inner.checked_sub(other.inner) {
+                    Some(value) => Ok($type_name::new(value)),
+                    None => Err(ManifestError::Overflow),
                 }
             }
         }
@@ -533,29 +529,31 @@ fn test_new_constructor_macro() {
 }
 
 #[test]
-fn test_checked_add() {
+fn test_checked_add() -> Result<(), ManifestError> {
     let base_atoms_1: BaseAtoms = BaseAtoms::new(1);
     let base_atoms_2: BaseAtoms = BaseAtoms::new(2);
     assert_eq!(
-        base_atoms_1.checked_add(base_atoms_2).unwrap(),
+        base_atoms_1.checked_add(base_atoms_2)?,
         BaseAtoms::new(3)
     );
 
     let base_atoms_1: BaseAtoms = BaseAtoms::new(u64::MAX - 1);
     let base_atoms_2: BaseAtoms = BaseAtoms::new(2);
     assert!(base_atoms_1.checked_add(base_atoms_2).is_err());
+    Ok(())
 }
 
 #[test]
-fn test_checked_sub() {
+fn test_checked_sub() -> Result<(), ManifestError> {
     let base_atoms_1: BaseAtoms = BaseAtoms::new(1);
     let base_atoms_2: BaseAtoms = BaseAtoms::new(2);
     assert_eq!(
-        base_atoms_2.checked_sub(base_atoms_1).unwrap(),
+        base_atoms_2.checked_sub(base_atoms_1)?,
         BaseAtoms::new(1)
     );
 
     assert!(base_atoms_1.checked_sub(base_atoms_2).is_err());
+    Ok(())
 }
 
 #[test]
@@ -577,13 +575,13 @@ fn test_wrapping_add() {
 }
 
 #[test]
-fn test_checked_base_for_quote_edge_cases() {
+fn test_checked_base_for_quote_edge_cases() -> Result<(), ProgramError> {
     let quote_atoms_per_base_atom: QuoteAtomsPerBaseAtom =
         QuoteAtomsPerBaseAtom::from_mantissa_and_exponent_(0, 0);
     assert_eq!(
         quote_atoms_per_base_atom
             .checked_base_for_quote(QuoteAtoms::new(1), false)
-            .unwrap(),
+            ?,
         BaseAtoms::new(0)
     );
 
@@ -594,6 +592,7 @@ fn test_checked_base_for_quote_edge_cases() {
             .checked_base_for_quote(QuoteAtoms::new(u64::MAX), false)
             .is_err(),
     );
+    Ok(())
 }
 
 #[test]
@@ -613,7 +612,7 @@ fn test_quote_atoms_per_base_atom_edge_case() {
 }
 
 #[test]
-fn test_multiply_macro() {
+fn test_multiply_macro() -> Result<(), ProgramError> {
     let base_atoms: BaseAtoms = BaseAtoms::new(5);
     let quote_atoms_per_base_atom: QuoteAtomsPerBaseAtom = QuoteAtomsPerBaseAtom {
         inner: u128_to_u64_slice(100 * D18 - 1),
@@ -621,9 +620,10 @@ fn test_multiply_macro() {
     assert_eq!(
         base_atoms
             .checked_mul(quote_atoms_per_base_atom, true)
-            .unwrap(),
+            ?,
         QuoteAtoms::new(500)
     );
+    Ok(())
 }
 
 #[test]
@@ -689,7 +689,7 @@ struct AlignmentTest {
 }
 
 #[test]
-fn test_alignment() {
+fn test_alignment() -> Result<(), ProgramError> {
     let mut t = AlignmentTest::default();
     t.price = QuoteAtomsPerBaseAtom::from_mantissa_and_exponent_(u32::MAX, 0);
     let mut s = t.clone();
@@ -697,11 +697,12 @@ fn test_alignment() {
     let q = t
         .price
         .checked_base_for_quote(QuoteAtoms::new(u32::MAX as u64), true)
-        .unwrap();
+        ?;
     t._pad = q.as_u64();
-    s._pad = s.price.checked_quote_for_base(q, true).unwrap().as_u64();
+    s._pad = s.price.checked_quote_for_base(q, true)?.as_u64();
 
     println!("s:{s:?} t:{t:?}");
+    Ok(())
 }
 
 #[test]

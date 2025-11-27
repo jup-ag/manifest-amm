@@ -1,22 +1,40 @@
+# --- Cargo.toml: Package Manifest for manifest-jupiter ---
+
 [package]
+# The package name published to crates.io (if applicable).
 name = "manifest-jupiter"
+# Current package version, following SemVer standards.
 version = "0.3.0"
+# Edition of Rust to compile with (2021 is current standard).
 edition = "2021"
+# Link to the source code repository.
 repository = "https://github.com/CKS-systems/manifest"
+# Authors and their contact information.
 authors = ["Britt Cyr <britt@cks.systems>"]
+# Brief package description.
 description = "Jupiter AMM interface for Manifest exchange"
+# Path to the license file.
 license-file = "LICENSE"
 
+# --- Features ---
 [features]
+# Feature flag used to enable test-specific code paths or dependencies.
 test = []
 
+# --- Dependencies ---
 [dependencies]
+# Dependencies using the workspace version defined in the top-level Cargo.toml.
 anyhow = { workspace = true }
-manifest-dex = { path = "../../programs/manifest" }
-hypertree = { path = "../../lib" }
-jupiter-amm-interface = "0.5.1"
 solana-sdk = { workspace = true }
 solana-program = { workspace = true }
 spl-token = { workspace = true }
 spl-token-2022 = { workspace = true }
 tokio = { workspace = true }
+
+# Local dependencies within the monorepo/workspace.
+manifest-dex = { path = "../../programs/manifest" }
+hypertree = { path = "../../lib" }
+
+# External dependency: The main integration point.
+# Note: Keeping this version explicit (0.5.1) is good practice.
+jupiter-amm-interface = "0.5.1"

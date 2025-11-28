@@ -204,6 +204,11 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         } else {
             self.get_bids()
         };
+        let required_global_opt: &Option<GlobalTradeAccounts> = if is_bid {
+            &global_trade_accounts_opts[0]
+        } else {
+            &global_trade_accounts_opts[1]
+        };
 
         let mut total_matched_quote_atoms: QuoteAtoms = QuoteAtoms::ZERO;
         let mut remaining_base_atoms: BaseAtoms = limit_base_atoms;
@@ -212,14 +217,18 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
             if resting_order.is_expired(now_slot) {
                 continue;
             }
+            let resting_order_type: OrderType = resting_order.get_order_type();
+            if resting_order_type == OrderType::Global && required_global_opt.is_none() {
+                // Stop walking if we cannot service the first needed global order.
+                break;
+            }
             let matched_price: QuoteAtomsPerBaseAtom = resting_order.get_price();
+            let resting_base_atoms: BaseAtoms = resting_order.get_num_base_atoms();
 
             // Either fill the entire resting order, or only the
             // remaining_base_atoms, in which case, this is the last iteration
-            let matched_base_atoms: BaseAtoms =
-                resting_order.get_num_base_atoms().min(remaining_base_atoms);
-            let did_fully_match_resting_order: bool =
-                remaining_base_atoms >= resting_order.get_num_base_atoms();
+            let matched_base_atoms: BaseAtoms = resting_base_atoms.min(remaining_base_atoms);
+            let did_fully_match_resting_order: bool = remaining_base_atoms >= resting_base_atoms;
 
             // Number of quote atoms matched exactly. Round in taker favor if
             // fully matching.
@@ -228,16 +237,11 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
                 is_bid != did_fully_match_resting_order,
             )?;
 
-            // Stop walking if missing the needed global account.
-            if self.is_missing_global_account(&resting_order, is_bid, global_trade_accounts_opts) {
-                break;
-            }
-
             // Skip unbacked global orders.
             if self.is_unbacked_global_order(
                 &resting_order,
                 is_bid,
-                global_trade_accounts_opts,
+                required_global_opt,
                 matched_base_atoms,
                 matched_quote_atoms,
             ) {
@@ -280,49 +284,19 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         )
     }
 
-    fn is_missing_global_account(
-        &self,
-        resting_order: &RestingOrder,
-        is_bid: bool,
-        global_trade_accounts_opts: &[Option<GlobalTradeAccounts>; 2],
-    ) -> bool {
-        if resting_order.get_order_type() == OrderType::Global {
-            // If global accounts are needed but not present, then this will
-            // crash. This is an intentional product decision. Would be
-            // valid to walk past, but we have chosen to give no fill rather
-            // than worse price if the taker takes the shortcut of not
-            // including global account.
-            let global_trade_accounts_opt: &Option<GlobalTradeAccounts> = if is_bid {
-                &global_trade_accounts_opts[0]
-            } else {
-                &global_trade_accounts_opts[1]
-            };
-            if global_trade_accounts_opt.is_none() {
-                return true;
-            }
-        }
-        return false;
-    }
-
     fn is_unbacked_global_order(
         &self,
         resting_order: &RestingOrder,
         is_bid: bool,
-        global_trade_accounts_opts: &[Option<GlobalTradeAccounts>; 2],
+        global_trade_accounts_opt: &Option<GlobalTradeAccounts>,
         matched_base_atoms: BaseAtoms,
         matched_quote_atoms: QuoteAtoms,
     ) -> bool {
         if resting_order.get_order_type() == OrderType::Global {
-            // If global accounts are needed but not present, then this will
-            // crash. This is an intentional product decision. Would be
-            // valid to walk past, but we have chosen to give no fill rather
-            // than worse price if the taker takes the shortcut of not
-            // including global account.
-            let global_trade_accounts_opt: &Option<GlobalTradeAccounts> = if is_bid {
-                &global_trade_accounts_opts[0]
-            } else {
-                &global_trade_accounts_opts[1]
-            };
+            // If global accounts are needed but not present, give no fill.
+            if global_trade_accounts_opt.is_none() {
+                return true;
+            }
             let has_enough_tokens: bool = can_back_order(
                 global_trade_accounts_opt,
                 self.get_trader_key_by_index(resting_order.get_trader_index()),
@@ -357,6 +331,11 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         } else {
             self.get_bids()
         };
+        let required_global_opt: &Option<GlobalTradeAccounts> = if is_bid {
+            &global_trade_accounts_opts[0]
+        } else {
+            &global_trade_accounts_opts[1]
+        };
 
         let mut total_matched_base_atoms: BaseAtoms = BaseAtoms::ZERO;
         let mut remaining_quote_atoms: QuoteAtoms = limit_quote_atoms;
@@ -365,6 +344,11 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
             // Skip expired orders.
             if resting_order.is_expired(now_slot) {
                 continue;
+            }
+            let resting_order_type: OrderType = resting_order.get_order_type();
+            if resting_order_type == OrderType::Global && required_global_opt.is_none() {
+                // Stop walking if we cannot service the first needed global order.
+                break;
             }
 
             let matched_price: QuoteAtomsPerBaseAtom = resting_order.get_price();
@@ -390,16 +374,11 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
                 is_bid != did_fully_match_resting_order,
             )?;
 
-            // Stop walking if missing the needed global account.
-            if self.is_missing_global_account(resting_order, is_bid, global_trade_accounts_opts) {
-                break;
-            }
-
             // Skip unbacked global orders.
             if self.is_unbacked_global_order(
                 &resting_order,
                 is_bid,
-                global_trade_accounts_opts,
+                required_global_opt,
                 matched_base_atoms,
                 matched_quote_atoms,
             ) {

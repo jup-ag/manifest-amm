@@ -19,14 +19,16 @@ use solana_program::{account_info::AccountInfo, system_program};
 use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 use std::{cell::RefCell, mem::size_of, rc::Rc};
 
-macro_rules! dynamic_value_opt_to_account_info {
+macro_rules! 
+ {
     ( $name:ident, $value_opt:expr, $fixed_size:expr, $type:ident, $key:expr ) => {
         let mut data_vec: Vec<u8> = Vec::new();
-        if $value_opt.is_some() {
+        if let Some(value) = $value_opt.as_ref() {
+            data_vec.reserve_exact($fixed_size + value.dynamic.len());
             let mut header_bytes: [u8; $fixed_size] = [0; $fixed_size];
-            *get_mut_helper::<$type>(&mut header_bytes, 0_u32) = $value_opt.as_ref().unwrap().fixed;
+            *get_mut_helper::<$type>(&mut header_bytes, 0_u32) = value.fixed;
             data_vec.extend_from_slice(&header_bytes);
-            data_vec.append(&mut $value_opt.as_ref().unwrap().dynamic.clone());
+            data_vec.extend_from_slice(&value.dynamic);
         }
 
         let mut lamports: u64 = 0;
@@ -153,8 +155,6 @@ impl Amm for ManifestMarket {
     }
 
     fn quote(&self, quote_params: &QuoteParams) -> Result<Quote> {
-        let market: DynamicAccount<MarketFixed, Vec<u8>> = self.market.clone();
-
         // The reason for checking can_expand is that jup does not want the
         // payer to be responsible for gas for the market expansion on a partial
         // fill against a reversible order. This solution is more restrictive
@@ -162,7 +162,7 @@ impl Amm for ManifestMarket {
         // against a reversible will work without the ability to expand, like
         // filling an order completely, or reversing into a coalescing order. Or
         // there just might not be reversible orders on the book.
-        let can_expand = market.has_two_free_blocks();
+        let can_expand = self.market.has_two_free_blocks();
         if !can_expand {
             return Ok(Quote {
                 out_amount: 0,
@@ -227,12 +227,12 @@ impl Amm for ManifestMarket {
 
         let out_amount: u64 = if quote_params.input_mint == self.get_base_mint() {
             let in_atoms: BaseAtoms = BaseAtoms::new(quote_params.amount);
-            market
+            self.market
                 .impact_quote_atoms_with_slot(false, in_atoms, global_trade_accounts, u32::MAX)?
                 .as_u64()
         } else {
             let in_atoms: QuoteAtoms = QuoteAtoms::new(quote_params.amount);
-            market
+            self.market
                 .impact_base_atoms_with_slot(true, in_atoms, global_trade_accounts, u32::MAX)?
                 .as_u64()
         };

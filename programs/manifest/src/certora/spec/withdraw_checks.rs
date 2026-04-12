@@ -1,4 +1,4 @@
-use cvt::{cvt_assert, cvt_assume};
+use cvt::cvt::{cvt_assert, cvt_assume, cvt_vacuity_check};
 use cvt_macros::rule;
 use nondet::*;
 
@@ -23,7 +23,7 @@ use crate::{
 pub fn rule_withdraw_withdraws() {
     crate::certora::spec::verification_utils::init_static();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let used_acc_infos: &[AccountInfo] = &acc_infos[..6];
     let trader_token: &AccountInfo = &used_acc_infos[2];
     let vault_token: &AccountInfo = &used_acc_infos[3];
@@ -101,7 +101,7 @@ pub fn rule_withdraw_withdraws() {
 pub fn rule_withdraw_does_not_revert() {
     crate::certora::spec::verification_utils::init_static();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let used_acc_infos: &[AccountInfo] = &acc_infos[..6];
     let trader: &AccountInfo = &used_acc_infos[0];
 

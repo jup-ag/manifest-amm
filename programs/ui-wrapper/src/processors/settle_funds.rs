@@ -177,9 +177,9 @@ pub(crate) fn process_settle_funds(
 
     trace!("platform_fee_atoms:{platform_fee_atoms}");
 
-    if *token_program_quote.key == spl_token_2022::id() {
+    if *token_program_quote.key == spl_token_2022_interface::id() {
         invoke(
-            &spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022_interface::instruction::transfer_checked(
                 token_program_quote.key,
                 trader_token_account_quote.key,
                 mint_quote.key,
@@ -199,7 +199,7 @@ pub(crate) fn process_settle_funds(
         )?;
     } else {
         invoke(
-            &spl_token::instruction::transfer(
+            &spl_token_interface::instruction::transfer(
                 token_program_quote.key,
                 trader_token_account_quote.key,
                 platform_token_account.key,
@@ -228,9 +228,9 @@ pub(crate) fn process_settle_funds(
         // saturating_sub not needed, but doesn't hurt
         let referrer_fee_atoms = (fee_atoms as u64).saturating_sub(platform_fee_atoms);
 
-        if *token_program_quote.key == spl_token_2022::id() {
+        if *token_program_quote.key == spl_token_2022_interface::id() {
             invoke(
-                &spl_token_2022::instruction::transfer_checked(
+                &spl_token_2022_interface::instruction::transfer_checked(
                     token_program_quote.key,
                     trader_token_account_quote.key,
                     mint_quote.key,
@@ -250,7 +250,7 @@ pub(crate) fn process_settle_funds(
             )?;
         } else {
             invoke(
-                &spl_token::instruction::transfer(
+                &spl_token_interface::instruction::transfer(
                     token_program_quote.key,
                     trader_token_account_quote.key,
                     referrer_token_account.key,

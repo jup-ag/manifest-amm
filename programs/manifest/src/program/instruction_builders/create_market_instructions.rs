@@ -46,8 +46,8 @@ pub fn create_market_instruction(
             AccountMeta::new_readonly(*quote_mint, false),
             AccountMeta::new(base_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
         ],
         data: [ManifestInstruction::CreateMarket.to_vec()].concat(),
     }

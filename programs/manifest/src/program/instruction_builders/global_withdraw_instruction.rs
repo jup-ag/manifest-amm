@@ -2,7 +2,6 @@ use crate::{
     program::{global_withdraw::GlobalWithdrawParams, ManifestInstruction},
     validation::{get_global_address, get_global_vault_address},
 };
-use borsh::BorshSerialize;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -29,7 +28,7 @@ pub fn global_withdraw_instruction(
         ],
         data: [
             ManifestInstruction::GlobalWithdraw.to_vec(),
-            GlobalWithdrawParams::new(num_atoms).try_to_vec().unwrap(),
+            borsh::to_vec(&GlobalWithdrawParams::new(num_atoms)).unwrap(),
         ]
         .concat(),
     }

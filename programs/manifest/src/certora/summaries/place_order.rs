@@ -28,12 +28,12 @@ pub fn place_fully_match_order_with_same_base_and_quote(
     ////////////////////////////////////////
     //
     // Any summary must satisfy this condition
-    cvt::cvt_assume!(base_atoms_traded <= num_base_atoms);
+    cvt::cvt::cvt_assume!(base_atoms_traded <= num_base_atoms);
     // Avoid underflow our ghost variables
-    cvt::cvt_assume!(market.fixed.orderbook_base_atoms >= base_atoms_traded);
-    cvt::cvt_assume!(market.fixed.orderbook_quote_atoms >= quote_atoms_traded);
+    cvt::cvt::cvt_assume!(market.fixed.orderbook_base_atoms >= base_atoms_traded);
+    cvt::cvt::cvt_assume!(market.fixed.orderbook_quote_atoms >= quote_atoms_traded);
     // Condition specific to this summary: we fix price 1:1
-    cvt::cvt_assume!(base_traded == quote_traded);
+    cvt::cvt::cvt_assume!(base_traded == quote_traded);
 
     let trader_index: DataIndex = main_trader_index();
     let maker_trader_index: DataIndex = second_trader_index();

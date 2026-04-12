@@ -1,5 +1,4 @@
 use crate::{processors::withdraw::WrapperWithdrawParams, ManifestWrapperInstruction};
-use borsh::BorshSerialize;
 use manifest::validation::get_vault_address;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
@@ -30,8 +29,7 @@ pub fn withdraw_instruction(
         ],
         data: [
             ManifestWrapperInstruction::Withdraw.to_vec(),
-            WrapperWithdrawParams::new(amount_atoms)
-                .try_to_vec()
+            borsh::to_vec(&WrapperWithdrawParams::new(amount_atoms))
                 .unwrap(),
         ]
         .concat(),

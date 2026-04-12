@@ -1,6 +1,5 @@
 use std::{cell::RefMut, rc::Rc};
 
-use borsh::BorshSerialize;
 use manifest::{
     program::{
         batch_update::PlaceOrderParams, batch_update_instruction, global_add_trader_instruction,
@@ -11,12 +10,11 @@ use manifest::{
     state::{constants::NO_EXPIRATION_LAST_VALID_SLOT, OrderType},
     validation::get_vault_address,
 };
+use solana_keypair::Keypair;
+use solana_program::instruction::{AccountMeta, Instruction};
 use solana_program_test::{tokio, ProgramTestContext};
-use solana_sdk::{
-    instruction::{AccountMeta, Instruction},
-    signature::{Keypair, Signer},
-    transaction::Transaction,
-};
+use solana_signer::Signer;
+use solana_transaction::Transaction;
 
 use crate::{
     send_tx_with_retry, Side, TestFixture, Token, TokenAccountFixture, SOL_UNIT_SIZE,
@@ -553,8 +551,8 @@ async fn swap_fail_limit_test() -> anyhow::Result<()> {
         2 * SOL_UNIT_SIZE,
         false,
         true,
-        spl_token::id(),
-        spl_token::id(),
+        spl_token_interface::id(),
+        spl_token_interface::id(),
         false,
     );
 
@@ -607,12 +605,11 @@ async fn swap_fail_wrong_user_base_test() -> anyhow::Result<()> {
             AccountMeta::new(test_fixture.payer_usdc_fixture.key, false),
             AccountMeta::new(vault_base_account, false),
             AccountMeta::new(vault_quote_account, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestInstruction::Swap.to_vec(),
-            SwapParams::new(2_000 * USDC_UNIT_SIZE, 2 * SOL_UNIT_SIZE, false, true)
-                .try_to_vec()
+            borsh::to_vec(&SwapParams::new(2_000 * USDC_UNIT_SIZE, 2 * SOL_UNIT_SIZE, false, true))
                 .unwrap(),
         ]
         .concat(),
@@ -667,12 +664,11 @@ async fn swap_fail_wrong_user_quote_test() -> anyhow::Result<()> {
             AccountMeta::new(test_fixture.payer_sol_fixture.key, false),
             AccountMeta::new(vault_base_account, false),
             AccountMeta::new(vault_quote_account, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestInstruction::Swap.to_vec(),
-            SwapParams::new(2_000 * USDC_UNIT_SIZE, 2 * SOL_UNIT_SIZE, false, true)
-                .try_to_vec()
+            borsh::to_vec(&SwapParams::new(2_000 * USDC_UNIT_SIZE, 2 * SOL_UNIT_SIZE, false, true))
                 .unwrap(),
         ]
         .concat(),
@@ -723,12 +719,11 @@ async fn swap_fail_wrong_base_vault_test() -> anyhow::Result<()> {
             AccountMeta::new(test_fixture.payer_usdc_fixture.key, false),
             AccountMeta::new(vault_quote_account, false),
             AccountMeta::new(vault_quote_account, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestInstruction::Swap.to_vec(),
-            SwapParams::new(2_000 * USDC_UNIT_SIZE, 2 * SOL_UNIT_SIZE, false, true)
-                .try_to_vec()
+            borsh::to_vec(&SwapParams::new(2_000 * USDC_UNIT_SIZE, 2 * SOL_UNIT_SIZE, false, true))
                 .unwrap(),
         ]
         .concat(),
@@ -779,12 +774,11 @@ async fn swap_fail_wrong_vault_quote_test() -> anyhow::Result<()> {
             AccountMeta::new(test_fixture.payer_usdc_fixture.key, false),
             AccountMeta::new(vault_base_account, false),
             AccountMeta::new(vault_base_account, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestInstruction::Swap.to_vec(),
-            SwapParams::new(2_000 * USDC_UNIT_SIZE, 2 * SOL_UNIT_SIZE, false, true)
-                .try_to_vec()
+            borsh::to_vec(&SwapParams::new(2_000 * USDC_UNIT_SIZE, 2 * SOL_UNIT_SIZE, false, true))
                 .unwrap(),
         ]
         .concat(),
@@ -842,8 +836,8 @@ async fn swap_fail_insufficient_funds_sell() -> anyhow::Result<()> {
         1000 * USDC_UNIT_SIZE,
         true,
         true,
-        spl_token::id(),
-        spl_token::id(),
+        spl_token_interface::id(),
+        spl_token_interface::id(),
         false,
     );
 
@@ -898,8 +892,8 @@ async fn swap_fail_insufficient_funds_buy() -> anyhow::Result<()> {
         1 * SOL_UNIT_SIZE,
         false,
         true,
-        spl_token::id(),
-        spl_token::id(),
+        spl_token_interface::id(),
+        spl_token_interface::id(),
         false,
     );
 
@@ -956,7 +950,7 @@ async fn swap_global() -> anyhow::Result<()> {
             &test_fixture.global_fixture.mint_key,
             &second_keypair.pubkey(),
             &token_account_fixture.key,
-            &spl_token::id(),
+            &spl_token_interface::id(),
             1 * SOL_UNIT_SIZE,
         )],
         Some(&second_keypair.pubkey()),
@@ -1122,7 +1116,7 @@ async fn swap_global_not_backed() -> anyhow::Result<()> {
             &test_fixture.global_fixture.mint_key,
             &second_keypair.pubkey(),
             &token_account_fixture.key,
-            &spl_token::id(),
+            &spl_token_interface::id(),
             2_000 * USDC_UNIT_SIZE,
         )],
         Some(&second_keypair.pubkey()),
@@ -1182,7 +1176,7 @@ async fn swap_global_not_backed() -> anyhow::Result<()> {
             &test_fixture.global_fixture.mint_key,
             &second_keypair.pubkey(),
             &token_account_fixture.key,
-            &spl_token::id(),
+            &spl_token_interface::id(),
             2_000 * USDC_UNIT_SIZE,
         )],
         Some(&second_keypair.pubkey()),

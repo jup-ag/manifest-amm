@@ -1,4 +1,4 @@
-use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account_interface::address::get_associated_token_address;
 use std::{
     cell::{Ref, RefCell, RefMut},
     io::Error,
@@ -21,14 +21,17 @@ use manifest::{
     state::{GlobalFixed, GlobalValue, MarketFixed, MarketValue, OrderType, RestingOrder},
     validation::{get_global_address, MintAccountInfo},
 };
+use solana_account::Account;
 use solana_program::{hash::Hash, pubkey::Pubkey, rent::Rent};
 use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
-use solana_sdk::{
-    account::Account, account_info::AccountInfo, clock::Clock, instruction::Instruction,
-    program_pack::Pack, signature::Keypair, signer::Signer, system_instruction::create_account,
-    transaction::Transaction,
+use solana_keypair::Keypair;
+use solana_program::{
+    account_info::AccountInfo, clock::Clock, instruction::Instruction, system_instruction::create_account,
 };
-use spl_token_2022::state::Mint;
+use solana_program_pack::Pack;
+use solana_signer::Signer;
+use solana_transaction::Transaction;
+use spl_token_2022_interface::state::Mint;
 use std::rc::Rc;
 
 #[derive(PartialEq)]
@@ -77,10 +80,10 @@ impl TestFixture {
         let second_keypair: Keypair = Keypair::new();
         program.add_account(
             second_keypair.pubkey(),
-            solana_sdk::account::Account::new(
+            solana_account::Account::new(
                 u32::MAX as u64,
                 0,
-                &solana_sdk::system_program::id(),
+                &solana_program::system_program::id(),
             ),
         );
 
@@ -112,17 +115,17 @@ impl TestFixture {
         let usdc_mint: Pubkey =
             Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
         let user_usdc_ata: Pubkey = get_associated_token_address(&second_payer, &usdc_mint);
-        let mut account: solana_sdk::account::Account = solana_sdk::account::Account::new(
+        let mut account: solana_account::Account = solana_account::Account::new(
             u32::MAX as u64,
-            spl_token::state::Account::get_packed_len(),
-            &spl_token::id(),
+            spl_token_interface::state::Account::get_packed_len(),
+            &spl_token_interface::id(),
         );
-        let _ = &spl_token::state::Account {
+        let _ = &spl_token_interface::state::Account {
             mint: usdc_mint,
             owner: second_payer,
             amount: 1_000_000_000_000,
-            state: spl_token::state::AccountState::Initialized,
-            ..spl_token::state::Account::default()
+            state: spl_token_interface::state::AccountState::Initialized,
+            ..spl_token_interface::state::Account::default()
         }
         .pack_into_slice(&mut account.data);
         program.add_account(user_usdc_ata, account);
@@ -130,17 +133,17 @@ impl TestFixture {
         let usdt_mint: Pubkey =
             Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").unwrap();
         let user_usdt_ata: Pubkey = get_associated_token_address(&second_payer, &usdt_mint);
-        let mut account: solana_sdk::account::Account = solana_sdk::account::Account::new(
+        let mut account: solana_account::Account = solana_account::Account::new(
             u32::MAX as u64,
-            spl_token::state::Account::get_packed_len(),
-            &spl_token::id(),
+            spl_token_interface::state::Account::get_packed_len(),
+            &spl_token_interface::id(),
         );
-        let _ = &spl_token::state::Account {
+        let _ = &spl_token_interface::state::Account {
             mint: usdt_mint,
             owner: second_payer,
             amount: 1_000_000_000_000,
-            state: spl_token::state::AccountState::Initialized,
-            ..spl_token::state::Account::default()
+            state: spl_token_interface::state::AccountState::Initialized,
+            ..spl_token_interface::state::Account::default()
         }
         .pack_into_slice(&mut account.data);
         program.add_account(user_usdt_ata, account);
@@ -148,17 +151,17 @@ impl TestFixture {
         let sol_mint: Pubkey =
             Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         let user_sol_ata: Pubkey = get_associated_token_address(&second_payer, &sol_mint);
-        let mut account: solana_sdk::account::Account = solana_sdk::account::Account::new(
+        let mut account: solana_account::Account = solana_account::Account::new(
             u32::MAX as u64,
-            spl_token::state::Account::get_packed_len(),
-            &spl_token::id(),
+            spl_token_interface::state::Account::get_packed_len(),
+            &spl_token_interface::id(),
         );
-        let _ = &spl_token::state::Account {
+        let _ = &spl_token_interface::state::Account {
             mint: sol_mint,
             owner: second_payer,
             amount: 1_000_000_000_000,
-            state: spl_token::state::AccountState::Initialized,
-            ..spl_token::state::Account::default()
+            state: spl_token_interface::state::AccountState::Initialized,
+            ..spl_token_interface::state::Account::default()
         }
         .pack_into_slice(&mut account.data);
         program.add_account(user_sol_ata, account);
@@ -344,7 +347,7 @@ impl TestFixture {
                 &self.global_fixture.mint_key,
                 &keypair.pubkey(),
                 &token_account_fixture.key,
-                &spl_token::id(),
+                &spl_token_interface::id(),
                 num_atoms,
             )],
             Some(&keypair.pubkey()),
@@ -384,7 +387,7 @@ impl TestFixture {
                 &self.global_fixture.mint_key,
                 &keypair.pubkey(),
                 &token_account_fixture.key,
-                &spl_token::id(),
+                &spl_token_interface::id(),
                 num_atoms,
             )],
             Some(&keypair.pubkey()),
@@ -458,7 +461,7 @@ impl TestFixture {
             mint,
             num_atoms,
             &trader_token_account,
-            spl_token::id(),
+            spl_token_interface::id(),
             None,
         );
 
@@ -530,7 +533,7 @@ impl TestFixture {
             mint,
             num_atoms,
             &trader_token_account,
-            spl_token::id(),
+            spl_token_interface::id(),
             None,
         );
         send_tx_with_retry(
@@ -626,8 +629,8 @@ impl TestFixture {
             out_atoms,
             is_base_in,
             is_exact_in,
-            spl_token::id(),
-            spl_token::id(),
+            spl_token_interface::id(),
+            spl_token_interface::id(),
             false,
         );
 
@@ -660,8 +663,8 @@ impl TestFixture {
             out_atoms,
             is_base_in,
             is_exact_in,
-            spl_token::id(),
-            spl_token::id(),
+            spl_token_interface::id(),
+            spl_token_interface::id(),
             false,
         );
 
@@ -694,8 +697,8 @@ impl TestFixture {
             out_atoms,
             is_base_in,
             is_exact_in,
-            spl_token::id(),
-            spl_token::id(),
+            spl_token_interface::id(),
+            spl_token_interface::id(),
             true,
         );
 
@@ -966,7 +969,7 @@ impl GlobalFixture {
     }
 
     pub async fn new(context: Rc<RefCell<ProgramTestContext>>, mint: &Pubkey) -> Self {
-        GlobalFixture::new_with_token_program(context, mint, &spl_token::id()).await
+        GlobalFixture::new_with_token_program(context, mint, &spl_token_interface::id()).await
     }
 
     pub async fn reload(&mut self) {
@@ -988,7 +991,7 @@ impl GlobalFixture {
 pub struct MintFixture {
     pub context: Rc<RefCell<ProgramTestContext>>,
     pub key: Pubkey,
-    pub mint: spl_token::state::Mint,
+    pub mint: spl_token_interface::state::Mint,
 }
 
 impl MintFixture {
@@ -1007,7 +1010,7 @@ impl MintFixture {
     ) -> MintFixture {
         let context_ref: Rc<RefCell<ProgramTestContext>> = Rc::clone(&context);
         let mint_keypair: Keypair = Keypair::new();
-        let mint: spl_token::state::Mint = {
+        let mint: spl_token_interface::state::Mint = {
             let payer: Keypair = context.borrow().payer.insecure_clone();
             let rent: Rent = context.borrow_mut().banks_client.get_rent().await.unwrap();
 
@@ -1015,26 +1018,26 @@ impl MintFixture {
                 &payer.pubkey(),
                 &mint_keypair.pubkey(),
                 rent.minimum_balance(if is_22 {
-                    spl_token_2022::state::Mint::LEN
+                    spl_token_2022_interface::state::Mint::LEN
                 } else {
-                    spl_token::state::Mint::LEN
+                    spl_token_interface::state::Mint::LEN
                 }),
                 if is_22 {
-                    spl_token_2022::state::Mint::LEN as u64
+                    spl_token_2022_interface::state::Mint::LEN as u64
                 } else {
-                    spl_token::state::Mint::LEN as u64
+                    spl_token_interface::state::Mint::LEN as u64
                 },
                 &{
                     if is_22 {
-                        spl_token_2022::id()
+                        spl_token_2022_interface::id()
                     } else {
-                        spl_token::id()
+                        spl_token_interface::id()
                     }
                 },
             );
             let init_mint_ix: Instruction = if is_22 {
-                spl_token_2022::instruction::initialize_mint(
-                    &spl_token_2022::id(),
+                spl_token_2022_interface::instruction::initialize_mint(
+                    &spl_token_2022_interface::id(),
                     &mint_keypair.pubkey(),
                     &payer.pubkey(),
                     None,
@@ -1042,8 +1045,8 @@ impl MintFixture {
                 )
                 .unwrap()
             } else {
-                spl_token::instruction::initialize_mint(
-                    &spl_token::id(),
+                spl_token_interface::instruction::initialize_mint(
+                    &spl_token_interface::id(),
                     &mint_keypair.pubkey(),
                     &payer.pubkey(),
                     None,
@@ -1071,7 +1074,7 @@ impl MintFixture {
 
             // We are not actually using extensions in tests, so can leave this alone
             // https://spl.solana.com/token-2022/onchain#step-6-use-statewithextensions-instead-of-mint-and-account
-            spl_token::state::Mint::unpack_unchecked(&mut mint_account.data.as_slice()).unwrap()
+            spl_token_interface::state::Mint::unpack_unchecked(&mut mint_account.data.as_slice()).unwrap()
         };
 
         MintFixture {
@@ -1091,7 +1094,7 @@ impl MintFixture {
             .unwrap()
             .unwrap();
         self.mint =
-            spl_token::state::Mint::unpack_unchecked(&mut mint_account.data.as_slice()).unwrap();
+            spl_token_interface::state::Mint::unpack_unchecked(&mut mint_account.data.as_slice()).unwrap();
     }
 
     pub async fn mint_to(&mut self, dest: &Pubkey, num_atoms: u64) {
@@ -1110,8 +1113,8 @@ impl MintFixture {
 
     fn make_mint_to_ix(&self, dest: &Pubkey, amount: u64) -> Instruction {
         let context: Ref<ProgramTestContext> = self.context.borrow();
-        let mint_to_instruction: Instruction = spl_token::instruction::mint_to(
-            &spl_token::ID,
+        let mint_to_instruction: Instruction = spl_token_interface::instruction::mint_to(
+            &spl_token_interface::ID,
             &self.key,
             dest,
             &context.payer.pubkey(),
@@ -1138,8 +1141,8 @@ impl MintFixture {
 
     fn make_mint_to_2022_ix(&self, dest: &Pubkey, amount: u64) -> Instruction {
         let context: Ref<ProgramTestContext> = self.context.borrow();
-        let mint_to_instruction: Instruction = spl_token_2022::instruction::mint_to(
-            &spl_token_2022::ID,
+        let mint_to_instruction: Instruction = spl_token_2022_interface::instruction::mint_to(
+            &spl_token_2022_interface::ID,
             &self.key,
             dest,
             &context.payer.pubkey(),
@@ -1167,13 +1170,13 @@ impl TokenAccountFixture {
         let init_account_ix: Instruction = create_account(
             payer_pk,
             &keypair.pubkey(),
-            rent.minimum_balance(spl_token::state::Account::LEN),
-            spl_token::state::Account::LEN as u64,
-            &spl_token::id(),
+            rent.minimum_balance(spl_token_interface::state::Account::LEN),
+            spl_token_interface::state::Account::LEN as u64,
+            &spl_token_interface::id(),
         );
 
-        let init_token_ix: Instruction = spl_token::instruction::initialize_account(
-            &spl_token::id(),
+        let init_token_ix: Instruction = spl_token_interface::instruction::initialize_account(
+            &spl_token_interface::id(),
             &keypair.pubkey(),
             mint_pk,
             owner_pk,
@@ -1192,13 +1195,13 @@ impl TokenAccountFixture {
         let init_account_ix: Instruction = create_account(
             payer_pk,
             &keypair.pubkey(),
-            rent.minimum_balance(spl_token_2022::state::Account::LEN),
-            spl_token_2022::state::Account::LEN as u64,
-            &spl_token_2022::id(),
+            rent.minimum_balance(spl_token_2022_interface::state::Account::LEN),
+            spl_token_2022_interface::state::Account::LEN as u64,
+            &spl_token_2022_interface::id(),
         );
 
-        let init_token_ix: Instruction = spl_token_2022::instruction::initialize_account(
-            &spl_token_2022::id(),
+        let init_token_ix: Instruction = spl_token_2022_interface::instruction::initialize_account(
+            &spl_token_2022_interface::id(),
             &keypair.pubkey(),
             mint_pk,
             owner_pk,
@@ -1273,7 +1276,7 @@ impl TokenAccountFixture {
     }
 
     pub async fn balance_atoms(&self) -> u64 {
-        let token_account: spl_token::state::Account =
+        let token_account: spl_token_interface::state::Account =
             get_and_deserialize(self.context.clone(), self.key).await;
 
         token_account.amount

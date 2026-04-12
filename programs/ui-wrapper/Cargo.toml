@@ -23,8 +23,8 @@ manifest-dex = { path = "../manifest", features = ["no-entrypoint"]  }
 hypertree = { path = "../../lib" }
 # Cannot use workspace because the generator needs to see a version here
 shank = "0.4.2"
-spl-token = { workspace = true, features = ["no-entrypoint"] }
-spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
+spl-token-interface = { workspace = true }
+spl-token-2022-interface = { workspace = true }
 solana-program = { workspace = true }
 borsh = { workspace = true }
 bytemuck = { workspace = true }
@@ -37,7 +37,12 @@ solana-invoke = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+solana-account = { workspace = true }
+solana-account-info = { workspace = true }
+solana-keypair = { workspace = true }
+solana-program-pack = { workspace = true }
 solana-program-test = { workspace = true }
 solana-logger = { workspace = true }
-solana-sdk = { workspace = true }
+solana-signer = { workspace = true }
+solana-transaction = { workspace = true }
 tokio = { workspace = true }

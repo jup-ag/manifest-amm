@@ -2,13 +2,13 @@ use std::rc::Rc;
 
 use borsh::ser::BorshSerialize;
 use manifest::program::{deposit::DepositParams, deposit_instruction, ManifestInstruction};
-use solana_program_test::tokio;
-use solana_sdk::{
+use solana_keypair::Keypair;
+use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    signature::Keypair,
-    signer::Signer,
 };
+use solana_program_test::tokio;
+use solana_signer::Signer;
 
 use crate::{
     send_tx_with_retry, MintFixture, TestFixture, Token, TokenAccountFixture, SOL_UNIT_SIZE,
@@ -59,7 +59,7 @@ async fn deposit_fail_insufficient_funds_test() -> anyhow::Result<()> {
             mint,
             1,
             &user_token_account,
-            spl_token::id(),
+            spl_token_interface::id(),
             None,
         )],
         Some(payer),
@@ -104,7 +104,7 @@ async fn deposit_fail_incorrect_mint_test() -> anyhow::Result<()> {
             mint,
             SOL_UNIT_SIZE,
             &user_token_account,
-            spl_token::id(),
+            spl_token_interface::id(),
             None,
         )],
         Some(payer),
@@ -132,12 +132,11 @@ async fn global_deposit_fail_incorrect_vault_test() -> anyhow::Result<()> {
             AccountMeta::new(test_fixture.market_fixture.key, false),
             AccountMeta::new(user_token_account, false),
             AccountMeta::new(user_token_account, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestInstruction::Deposit.to_vec(),
-            DepositParams::new(SOL_UNIT_SIZE, None)
-                .try_to_vec()
+            borsh::to_vec(&DepositParams::new(SOL_UNIT_SIZE, None))
                 .unwrap(),
         ]
         .concat(),

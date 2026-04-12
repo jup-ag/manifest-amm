@@ -10,14 +10,17 @@ use manifest::{
     state::{GlobalFixed, GlobalValue, MarketFixed, MarketValue},
     validation::{get_global_address, MintAccountInfo},
 };
+use solana_account::Account;
 use solana_program::{hash::Hash, pubkey::Pubkey, rent::Rent};
 use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
-use solana_sdk::{
-    account::Account, account_info::AccountInfo, instruction::Instruction, program_pack::Pack,
-    signature::Keypair, signer::Signer, system_instruction::create_account,
-    transaction::Transaction,
+use solana_keypair::Keypair;
+use solana_program::{
+    account_info::AccountInfo, instruction::Instruction, system_instruction::create_account,
 };
-use spl_token_2022::{
+use solana_program_pack::Pack;
+use solana_signer::Signer;
+use solana_transaction::Transaction;
+use spl_token_2022_interface::{
     extension::{
         transfer_fee::instruction::initialize_transfer_fee_config, transfer_hook,
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
@@ -84,7 +87,7 @@ impl TestFixture {
         let second_keypair: Keypair = Keypair::new();
         program.add_account(
             second_keypair.pubkey(),
-            solana_sdk::account::Account::new(SOL_UNIT_SIZE, 0, &solana_sdk::system_program::id()),
+            solana_account::Account::new(SOL_UNIT_SIZE, 0, &solana_program::system_program::id()),
         );
 
         let market_keypair: Keypair = Keypair::new();
@@ -176,7 +179,7 @@ impl TestFixture {
         let second_keypair: Keypair = Keypair::new();
         program.add_account(
             second_keypair.pubkey(),
-            solana_sdk::account::Account::new(SOL_UNIT_SIZE, 0, &solana_sdk::system_program::id()),
+            solana_account::Account::new(SOL_UNIT_SIZE, 0, &solana_program::system_program::id()),
         );
 
         let market_keypair: Keypair = Keypair::new();
@@ -243,7 +246,7 @@ impl TestFixture {
         let global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
             Rc::clone(&context),
             &usdc_mint_f.key,
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
         )
         .await;
         let sol_global_fixture: GlobalFixture =
@@ -559,7 +562,7 @@ impl GlobalFixture {
     }
 
     pub async fn new(context: Rc<RefCell<ProgramTestContext>>, mint: &Pubkey) -> Self {
-        GlobalFixture::new_with_token_program(context, mint, &spl_token::id()).await
+        GlobalFixture::new_with_token_program(context, mint, &spl_token_interface::id()).await
     }
 
     pub async fn reload(&mut self) {
@@ -582,8 +585,8 @@ pub struct MintFixture {
     pub context: Rc<RefCell<ProgramTestContext>>,
     pub key: Pubkey,
     pub is_22: bool,
-    pub vanilla_mint: Option<spl_token::state::Mint>,
-    pub extension_mint: Option<spl_token_2022::state::Mint>,
+    pub vanilla_mint: Option<spl_token_interface::state::Mint>,
+    pub extension_mint: Option<spl_token_2022_interface::state::Mint>,
 }
 
 impl MintFixture {
@@ -616,7 +619,7 @@ impl MintFixture {
             }
             ExtensionType::try_calculate_account_len::<Mint>(&extensions).unwrap()
         } else {
-            spl_token::state::Mint::LEN
+            spl_token_interface::state::Mint::LEN
         };
 
         let mut instructions = Vec::new();
@@ -628,9 +631,9 @@ impl MintFixture {
             space as u64,
             &{
                 if is_22 {
-                    spl_token_2022::id()
+                    spl_token_2022_interface::id()
                 } else {
-                    spl_token::id()
+                    spl_token_interface::id()
                 }
             },
         ));
@@ -638,7 +641,7 @@ impl MintFixture {
             if transfer_fee {
                 instructions.push(
                     initialize_transfer_fee_config(
-                        &spl_token_2022::id(),
+                        &spl_token_2022_interface::id(),
                         &mint_keypair.pubkey(),
                         None,
                         None,
@@ -651,7 +654,7 @@ impl MintFixture {
             if transfer_hook {
                 instructions.push(
                     transfer_hook::instruction::initialize(
-                        &spl_token_2022::id(),
+                        &spl_token_2022_interface::id(),
                         &mint_keypair.pubkey(),
                         Some(payer.pubkey()),
                         None,
@@ -660,8 +663,8 @@ impl MintFixture {
                 );
             }
             instructions.push(
-                spl_token_2022::instruction::initialize_mint(
-                    &spl_token_2022::id(),
+                spl_token_2022_interface::instruction::initialize_mint(
+                    &spl_token_2022_interface::id(),
                     &mint_keypair.pubkey(),
                     &payer.pubkey(),
                     None,
@@ -671,8 +674,8 @@ impl MintFixture {
             );
         } else {
             instructions.push(
-                spl_token::instruction::initialize_mint(
-                    &spl_token::id(),
+                spl_token_interface::instruction::initialize_mint(
+                    &spl_token_interface::id(),
                     &mint_keypair.pubkey(),
                     &payer.pubkey(),
                     None,
@@ -720,7 +723,7 @@ impl MintFixture {
             )
         } else {
             self.vanilla_mint = Some(
-                spl_token::state::Mint::unpack_unchecked(&mut mint_account.data.as_slice())
+                spl_token_interface::state::Mint::unpack_unchecked(&mut mint_account.data.as_slice())
                     .unwrap(),
             );
         }
@@ -742,8 +745,8 @@ impl MintFixture {
 
     fn make_mint_to_ix(&self, dest: &Pubkey, amount: u64) -> Instruction {
         let context: Ref<ProgramTestContext> = self.context.borrow();
-        let mint_to_instruction: Instruction = spl_token::instruction::mint_to(
-            &spl_token::ID,
+        let mint_to_instruction: Instruction = spl_token_interface::instruction::mint_to(
+            &spl_token_interface::ID,
             &self.key,
             dest,
             &context.payer.pubkey(),
@@ -770,8 +773,8 @@ impl MintFixture {
 
     fn make_mint_to_2022_ix(&self, dest: &Pubkey, amount: u64) -> Instruction {
         let context: Ref<ProgramTestContext> = self.context.borrow();
-        let mint_to_instruction: Instruction = spl_token_2022::instruction::mint_to(
-            &spl_token_2022::ID,
+        let mint_to_instruction: Instruction = spl_token_2022_interface::instruction::mint_to(
+            &spl_token_2022_interface::ID,
             &self.key,
             dest,
             &context.payer.pubkey(),
@@ -799,13 +802,13 @@ impl TokenAccountFixture {
         let init_account_ix: Instruction = create_account(
             payer_pk,
             &keypair.pubkey(),
-            rent.minimum_balance(spl_token::state::Account::LEN),
-            spl_token::state::Account::LEN as u64,
-            &spl_token::id(),
+            rent.minimum_balance(spl_token_interface::state::Account::LEN),
+            spl_token_interface::state::Account::LEN as u64,
+            &spl_token_interface::id(),
         );
 
-        let init_token_ix: Instruction = spl_token::instruction::initialize_account(
-            &spl_token::id(),
+        let init_token_ix: Instruction = spl_token_interface::instruction::initialize_account(
+            &spl_token_interface::id(),
             &keypair.pubkey(),
             mint_pk,
             owner_pk,
@@ -827,11 +830,11 @@ impl TokenAccountFixture {
             &keypair.pubkey(),
             rent.minimum_balance(space),
             space as u64,
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
         );
 
-        let init_token_ix: Instruction = spl_token_2022::instruction::initialize_account(
-            &spl_token_2022::id(),
+        let init_token_ix: Instruction = spl_token_2022_interface::instruction::initialize_account(
+            &spl_token_2022_interface::id(),
             &keypair.pubkey(),
             mint_pk,
             owner_pk,
@@ -864,7 +867,7 @@ impl TokenAccountFixture {
         let mint_extensions = mint_with_extensions.get_extension_types().unwrap();
         let account_extensions =
             ExtensionType::get_required_init_account_extensions(&mint_extensions);
-        let space = ExtensionType::try_calculate_account_len::<spl_token_2022::state::Account>(
+        let space = ExtensionType::try_calculate_account_len::<spl_token_2022_interface::state::Account>(
             &account_extensions,
         )
         .unwrap();
@@ -935,7 +938,7 @@ impl TokenAccountFixture {
     }
 
     pub async fn balance_atoms(&self) -> u64 {
-        let token_account: spl_token::state::Account =
+        let token_account: spl_token_interface::state::Account =
             get_and_deserialize(self.context.clone(), self.key).await;
 
         token_account.amount

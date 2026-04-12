@@ -6,7 +6,7 @@ use crate::{
     },
     create_empty_market, cvt_static_initializer, cvt_vacuity_check,
 };
-use cvt::{cvt_assert, cvt_assume};
+use cvt::cvt::{cvt_assert, cvt_assume};
 use cvt_macros::rule;
 use nondet::*;
 use solana_cvt::token::spl_token_account_get_amount;
@@ -23,7 +23,7 @@ use solana_program::account_info::AccountInfo;
 pub fn rule_integrity_swap() {
     init_static();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let used_acc_infos: &[AccountInfo] = &acc_infos[..8];
     let market_info: &AccountInfo = &used_acc_infos[1];
     let trader_base_info: &AccountInfo = &used_acc_infos[2];
@@ -55,14 +55,14 @@ pub fn rule_integrity_swap() {
 
     cvt_assert!(trader_out <= in_atoms);
 
-    cvt_vacuity_check!()
+    cvt_vacuity_check!();
 }
 
 /// Parametric rule: no loss of funds for swap
 fn rule_swap_check<const IS_BASE: bool, const IS_EXACT: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let used_acc_infos: &[AccountInfo] = &acc_infos[..8];
     let trader: &AccountInfo = &used_acc_infos[0];
     let market: &AccountInfo = &used_acc_infos[1];

@@ -46,7 +46,7 @@ impl<'a, 'info, T: ManifestAccount + Get + Clone> ManifestAccountInfo<'a, 'info,
     pub fn get_fixed(&self) -> Result<Ref<'_, T>, ProgramError> {
         let data: Ref<&mut [u8]> = self.info.try_borrow_data()?;
         Ok(Ref::map(data, |data| {
-            return get_helper::<T>(data, 0_u32);
+            get_helper::<T>(data, 0_u32)
         }))
     }
 }

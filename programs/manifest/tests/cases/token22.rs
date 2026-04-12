@@ -8,11 +8,13 @@ use manifest::{
     quantities::WrapperU64,
     state::{OrderType, NO_EXPIRATION_LAST_VALID_SLOT},
 };
-use solana_program_test::{processor, ProgramTest, ProgramTestContext};
-use solana_sdk::{
-    instruction::Instruction, program_pack::Pack, pubkey::Pubkey, rent::Rent, signature::Keypair,
-    signer::Signer, system_instruction::create_account,
+use solana_keypair::Keypair;
+use solana_program::{
+    instruction::Instruction, program_pack::Pack, pubkey::Pubkey, rent::Rent,
+    system_instruction::create_account,
 };
+use solana_program_test::{processor, ProgramTest, ProgramTestContext};
+use solana_signer::Signer;
 
 use crate::{send_tx_with_retry, MintFixture, RUST_LOG_DEFAULT};
 
@@ -82,12 +84,12 @@ async fn token22_base() -> anyhow::Result<()> {
     let create_spl_token_account_ix: Instruction = create_account(
         payer,
         &spl_token_account_keypair.pubkey(),
-        rent.minimum_balance(spl_token_2022::state::Account::LEN),
-        spl_token_2022::state::Account::LEN as u64,
-        &spl_token_2022::id(),
+        rent.minimum_balance(spl_token_2022_interface::state::Account::LEN),
+        spl_token_2022_interface::state::Account::LEN as u64,
+        &spl_token_2022_interface::id(),
     );
-    let init_spl_token_account_ix: Instruction = spl_token_2022::instruction::initialize_account(
-        &spl_token_2022::id(),
+    let init_spl_token_account_ix: Instruction = spl_token_2022_interface::instruction::initialize_account(
+        &spl_token_2022_interface::id(),
         &spl_token_account_keypair.pubkey(),
         &spl_mint_key,
         payer,
@@ -96,12 +98,12 @@ async fn token22_base() -> anyhow::Result<()> {
     let create_usdc_token_account_ix: Instruction = create_account(
         payer,
         &usdc_token_account_keypair.pubkey(),
-        rent.minimum_balance(spl_token::state::Account::LEN),
-        spl_token::state::Account::LEN as u64,
-        &spl_token::id(),
+        rent.minimum_balance(spl_token_interface::state::Account::LEN),
+        spl_token_interface::state::Account::LEN as u64,
+        &spl_token_interface::id(),
     );
-    let init_usdc_token_account_ix: Instruction = spl_token::instruction::initialize_account(
-        &spl_token::id(),
+    let init_usdc_token_account_ix: Instruction = spl_token_interface::instruction::initialize_account(
+        &spl_token_interface::id(),
         &usdc_token_account_keypair.pubkey(),
         &usdc_mint_key,
         payer,
@@ -125,8 +127,8 @@ async fn token22_base() -> anyhow::Result<()> {
     .await?;
 
     // Add funds to those token accounts.
-    let spl_mint_to_instruction: Instruction = spl_token_2022::instruction::mint_to(
-        &spl_token_2022::ID,
+    let spl_mint_to_instruction: Instruction = spl_token_2022_interface::instruction::mint_to(
+        &spl_token_2022_interface::ID,
         &spl_mint_key,
         &spl_token_account_keypair.pubkey(),
         &payer,
@@ -134,8 +136,8 @@ async fn token22_base() -> anyhow::Result<()> {
         1_000_000_000_000_000,
     )
     .unwrap();
-    let usdc_mint_to_instruction: Instruction = spl_token::instruction::mint_to(
-        &spl_token::ID,
+    let usdc_mint_to_instruction: Instruction = spl_token_interface::instruction::mint_to(
+        &spl_token_interface::ID,
         &usdc_mint_key,
         &usdc_token_account_keypair.pubkey(),
         &payer,
@@ -158,7 +160,7 @@ async fn token22_base() -> anyhow::Result<()> {
         &spl_mint_key,
         1_000_000_000,
         &spl_token_account_keypair.pubkey(),
-        spl_token_2022::id(),
+        spl_token_2022_interface::id(),
         None,
     );
     let deposit_usdc_ix: Instruction = deposit_instruction(
@@ -167,7 +169,7 @@ async fn token22_base() -> anyhow::Result<()> {
         &usdc_mint_key,
         1_000_000_000,
         &usdc_token_account_keypair.pubkey(),
-        spl_token::id(),
+        spl_token_interface::id(),
         None,
     );
     send_tx_with_retry(
@@ -185,7 +187,7 @@ async fn token22_base() -> anyhow::Result<()> {
         &spl_mint_key,
         1_000,
         &spl_token_account_keypair.pubkey(),
-        spl_token_2022::id(),
+        spl_token_2022_interface::id(),
         None,
     );
     let withdraw_usdc_ix: Instruction = withdraw_instruction(
@@ -194,7 +196,7 @@ async fn token22_base() -> anyhow::Result<()> {
         &usdc_mint_key,
         1_000,
         &usdc_token_account_keypair.pubkey(),
-        spl_token::id(),
+        spl_token_interface::id(),
         None,
     );
     send_tx_with_retry(
@@ -205,7 +207,7 @@ async fn token22_base() -> anyhow::Result<()> {
     )
     .await?;
     {
-        let market_account: solana_sdk::account::Account = context
+        let market_account: solana_account::Account = context
             .borrow_mut()
             .banks_client
             .get_account(market_keypair.pubkey())
@@ -268,8 +270,8 @@ async fn token22_base() -> anyhow::Result<()> {
         10,
         true,
         true,
-        spl_token_2022::id(),
-        spl_token::id(),
+        spl_token_2022_interface::id(),
+        spl_token_interface::id(),
         false,
     );
     let swap_base_out_ix: Instruction = swap_instruction(
@@ -283,8 +285,8 @@ async fn token22_base() -> anyhow::Result<()> {
         10,
         false,
         true,
-        spl_token_2022::id(),
-        spl_token::id(),
+        spl_token_2022_interface::id(),
+        spl_token_interface::id(),
         false,
     );
     send_tx_with_retry(
@@ -364,12 +366,12 @@ async fn token22_quote() -> anyhow::Result<()> {
     let create_spl_token_account_ix: Instruction = create_account(
         payer,
         &spl_token_account_keypair.pubkey(),
-        rent.minimum_balance(spl_token::state::Account::LEN),
-        spl_token::state::Account::LEN as u64,
-        &spl_token::id(),
+        rent.minimum_balance(spl_token_interface::state::Account::LEN),
+        spl_token_interface::state::Account::LEN as u64,
+        &spl_token_interface::id(),
     );
-    let init_spl_token_account_ix: Instruction = spl_token::instruction::initialize_account(
-        &spl_token::id(),
+    let init_spl_token_account_ix: Instruction = spl_token_interface::instruction::initialize_account(
+        &spl_token_interface::id(),
         &spl_token_account_keypair.pubkey(),
         &spl_mint_key,
         payer,
@@ -378,12 +380,12 @@ async fn token22_quote() -> anyhow::Result<()> {
     let create_usdc_token_account_ix: Instruction = create_account(
         payer,
         &usdc_token_account_keypair.pubkey(),
-        rent.minimum_balance(spl_token_2022::state::Account::LEN),
-        spl_token_2022::state::Account::LEN as u64,
-        &spl_token_2022::id(),
+        rent.minimum_balance(spl_token_2022_interface::state::Account::LEN),
+        spl_token_2022_interface::state::Account::LEN as u64,
+        &spl_token_2022_interface::id(),
     );
-    let init_usdc_token_account_ix: Instruction = spl_token_2022::instruction::initialize_account(
-        &spl_token_2022::id(),
+    let init_usdc_token_account_ix: Instruction = spl_token_2022_interface::instruction::initialize_account(
+        &spl_token_2022_interface::id(),
         &usdc_token_account_keypair.pubkey(),
         &usdc_mint_key,
         payer,
@@ -407,8 +409,8 @@ async fn token22_quote() -> anyhow::Result<()> {
     .await?;
 
     // Add funds to those token accounts.
-    let spl_mint_to_instruction: Instruction = spl_token::instruction::mint_to(
-        &spl_token::ID,
+    let spl_mint_to_instruction: Instruction = spl_token_interface::instruction::mint_to(
+        &spl_token_interface::ID,
         &spl_mint_key,
         &spl_token_account_keypair.pubkey(),
         &payer,
@@ -416,8 +418,8 @@ async fn token22_quote() -> anyhow::Result<()> {
         1_000_000_000_000_000,
     )
     .unwrap();
-    let usdc_mint_to_instruction: Instruction = spl_token_2022::instruction::mint_to(
-        &spl_token_2022::ID,
+    let usdc_mint_to_instruction: Instruction = spl_token_2022_interface::instruction::mint_to(
+        &spl_token_2022_interface::ID,
         &usdc_mint_key,
         &usdc_token_account_keypair.pubkey(),
         &payer,
@@ -440,7 +442,7 @@ async fn token22_quote() -> anyhow::Result<()> {
         &spl_mint_key,
         1_000_000_000,
         &spl_token_account_keypair.pubkey(),
-        spl_token::id(),
+        spl_token_interface::id(),
         None,
     );
     let deposit_usdc_ix: Instruction = deposit_instruction(
@@ -449,7 +451,7 @@ async fn token22_quote() -> anyhow::Result<()> {
         &usdc_mint_key,
         1_000_000_000,
         &usdc_token_account_keypair.pubkey(),
-        spl_token_2022::id(),
+        spl_token_2022_interface::id(),
         None,
     );
     send_tx_with_retry(
@@ -467,7 +469,7 @@ async fn token22_quote() -> anyhow::Result<()> {
         &spl_mint_key,
         1_000,
         &spl_token_account_keypair.pubkey(),
-        spl_token::id(),
+        spl_token_interface::id(),
         None,
     );
     let withdraw_usdc_ix: Instruction = withdraw_instruction(
@@ -476,7 +478,7 @@ async fn token22_quote() -> anyhow::Result<()> {
         &usdc_mint_key,
         1_000,
         &usdc_token_account_keypair.pubkey(),
-        spl_token_2022::id(),
+        spl_token_2022_interface::id(),
         None,
     );
     send_tx_with_retry(
@@ -536,8 +538,8 @@ async fn token22_quote() -> anyhow::Result<()> {
         10,
         true,
         true,
-        spl_token::id(),
-        spl_token_2022::id(),
+        spl_token_interface::id(),
+        spl_token_2022_interface::id(),
         false,
     );
     let swap_base_out_ix: Instruction = swap_instruction(
@@ -551,8 +553,8 @@ async fn token22_quote() -> anyhow::Result<()> {
         10,
         false,
         true,
-        spl_token::id(),
-        spl_token_2022::id(),
+        spl_token_interface::id(),
+        spl_token_2022_interface::id(),
         false,
     );
     send_tx_with_retry(
@@ -588,10 +590,10 @@ async fn token22_deposit_transfer_fee() -> anyhow::Result<()> {
         MintFixture::new_with_version(Rc::clone(&context), Some(6), false).await;
 
     let spl_mint_keypair: Keypair = Keypair::new();
-    let extension_types: Vec<spl_token_2022::extension::ExtensionType> =
-        vec![spl_token_2022::extension::ExtensionType::TransferFeeConfig];
-    let space: usize = spl_token_2022::extension::ExtensionType::try_calculate_account_len::<
-        spl_token_2022::state::Mint,
+    let extension_types: Vec<spl_token_2022_interface::extension::ExtensionType> =
+        vec![spl_token_2022_interface::extension::ExtensionType::TransferFeeConfig];
+    let space: usize = spl_token_2022_interface::extension::ExtensionType::try_calculate_account_len::<
+        spl_token_2022_interface::state::Mint,
     >(&extension_types)
     .unwrap();
     // first create the mint account for the new NFT
@@ -602,10 +604,10 @@ async fn token22_deposit_transfer_fee() -> anyhow::Result<()> {
         &spl_mint_keypair.pubkey(),
         mint_rent,
         space as u64,
-        &spl_token_2022::id(),
+        &spl_token_2022_interface::id(),
     );
-    let init_mint_ix: Instruction = spl_token_2022::instruction::initialize_mint2(
-        &spl_token_2022::id(),
+    let init_mint_ix: Instruction = spl_token_2022_interface::instruction::initialize_mint2(
+        &spl_token_2022_interface::id(),
         &spl_mint_keypair.pubkey(),
         &payer,
         None,
@@ -615,8 +617,8 @@ async fn token22_deposit_transfer_fee() -> anyhow::Result<()> {
 
     // 1_000 bps =  10%
     let transfer_fee_ix: Instruction =
-        spl_token_2022::extension::transfer_fee::instruction::initialize_transfer_fee_config(
-            &spl_token_2022::id(),
+        spl_token_2022_interface::extension::transfer_fee::instruction::initialize_transfer_fee_config(
+            &spl_token_2022_interface::id(),
             &spl_mint_keypair.pubkey(),
             None,
             None,
@@ -668,12 +670,12 @@ async fn token22_deposit_transfer_fee() -> anyhow::Result<()> {
     let create_spl_token_account_ix: Instruction = create_account(
         payer,
         &spl_token_account_keypair.pubkey(),
-        rent.minimum_balance(spl_token_2022::state::Account::LEN + 13),
-        spl_token_2022::state::Account::LEN as u64 + 13,
-        &spl_token_2022::id(),
+        rent.minimum_balance(spl_token_2022_interface::state::Account::LEN + 13),
+        spl_token_2022_interface::state::Account::LEN as u64 + 13,
+        &spl_token_2022_interface::id(),
     );
-    let init_spl_token_account_ix: Instruction = spl_token_2022::instruction::initialize_account(
-        &spl_token_2022::id(),
+    let init_spl_token_account_ix: Instruction = spl_token_2022_interface::instruction::initialize_account(
+        &spl_token_2022_interface::id(),
         &spl_token_account_keypair.pubkey(),
         &spl_mint_key,
         payer,
@@ -691,8 +693,8 @@ async fn token22_deposit_transfer_fee() -> anyhow::Result<()> {
     .await?;
 
     // Add funds to token account.
-    let spl_mint_to_instruction: Instruction = spl_token_2022::instruction::mint_to(
-        &spl_token_2022::ID,
+    let spl_mint_to_instruction: Instruction = spl_token_2022_interface::instruction::mint_to(
+        &spl_token_2022_interface::ID,
         &spl_mint_key,
         &spl_token_account_keypair.pubkey(),
         &payer,
@@ -714,7 +716,7 @@ async fn token22_deposit_transfer_fee() -> anyhow::Result<()> {
         &spl_mint_key,
         1_000_000_000,
         &spl_token_account_keypair.pubkey(),
-        spl_token_2022::id(),
+        spl_token_2022_interface::id(),
         None,
     );
     send_tx_with_retry(
@@ -725,7 +727,7 @@ async fn token22_deposit_transfer_fee() -> anyhow::Result<()> {
     )
     .await?;
 
-    let market_account: solana_sdk::account::Account = context
+    let market_account: solana_account::Account = context
         .borrow_mut()
         .banks_client
         .get_account(market_keypair.pubkey())

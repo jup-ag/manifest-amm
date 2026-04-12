@@ -9,8 +9,10 @@ use std::cmp::Ordering;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum OrderType {
     // Normal limit order.
+    #[default]
     Limit = 0,
 
     // Does not rest. Take only.
@@ -33,11 +35,6 @@ pub enum OrderType {
 }
 unsafe impl bytemuck::Zeroable for OrderType {}
 unsafe impl bytemuck::Pod for OrderType {}
-impl Default for OrderType {
-    fn default() -> Self {
-        OrderType::Limit
-    }
-}
 impl OrderType {
     pub fn is_reversible(self) -> bool {
         matches!(self, OrderType::Reverse | OrderType::ReverseTight)

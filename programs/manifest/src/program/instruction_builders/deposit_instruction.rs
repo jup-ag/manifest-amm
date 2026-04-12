@@ -2,7 +2,6 @@ use crate::{
     program::{deposit::DepositParams, ManifestInstruction},
     validation::get_vault_address,
 };
-use borsh::BorshSerialize;
 use hypertree::DataIndex;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
@@ -32,8 +31,7 @@ pub fn deposit_instruction(
         ],
         data: [
             ManifestInstruction::Deposit.to_vec(),
-            DepositParams::new(amount_atoms, trader_index_hint)
-                .try_to_vec()
+            borsh::to_vec(&DepositParams::new(amount_atoms, trader_index_hint))
                 .unwrap(),
         ]
         .concat(),

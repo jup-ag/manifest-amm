@@ -5,11 +5,12 @@ use manifest::{
     quantities::WrapperU64,
     state::{BooksideReadOnly, RestingOrder},
 };
-use solana_sdk::{
-    compute_budget::ComputeBudgetInstruction, instruction::Instruction, pubkey, pubkey::Pubkey,
-    signature::Signer, signer::keypair::Keypair,
-};
-use spl_associated_token_account::get_associated_token_address;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_keypair::Keypair;
+use solana_program::instruction::Instruction;
+use solana_pubkey::{pubkey, Pubkey};
+use solana_signer::Signer;
+use spl_associated_token_account_interface::address::get_associated_token_address;
 use std::{rc::Rc, str::FromStr};
 
 #[tokio::test]
@@ -41,8 +42,8 @@ async fn reverse_coalesce() -> anyhow::Result<()> {
         0,
         false,
         true,
-        spl_token::id(),
-        spl_token::id(),
+        spl_token_interface::id(),
+        spl_token_interface::id(),
         false,
     );
     let limit_instruction = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
@@ -109,8 +110,8 @@ async fn reverse_coalesce_usdt() -> anyhow::Result<()> {
         0,
         false,
         true,
-        spl_token::id(),
-        spl_token::id(),
+        spl_token_interface::id(),
+        spl_token_interface::id(),
         false,
     );
     let limit_instruction = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);

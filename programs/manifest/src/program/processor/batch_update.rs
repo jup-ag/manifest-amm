@@ -6,7 +6,7 @@ use crate::{
     quantities::{BaseAtoms, PriceConversionError, QuoteAtomsPerBaseAtom, WrapperU64},
     require,
     state::{
-        utils::{get_now_slot, try_to_pay_all_global_gas_prepayment},
+        utils::get_now_slot,
         AddOrderToMarketArgs, AddOrderToMarketResult, MarketRefMut, OrderType, RestingOrder,
         MARKET_BLOCK_SIZE,
     },
@@ -23,6 +23,8 @@ use solana_program::{
 use super::{expand_market_if_needed, shared::get_mut_dynamic_account};
 
 use crate::validation::loaders::GlobalTradeAccounts;
+#[cfg(not(feature = "certora"))]
+use crate::state::utils::try_to_pay_all_global_gas_prepayment;
 #[cfg(feature = "certora")]
 use {
     crate::certora::mocks_batch_update::{mock_cancel_order, mock_place_order},

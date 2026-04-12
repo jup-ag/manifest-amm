@@ -84,7 +84,7 @@ pub(crate) fn process_withdraw_core(
         dynamic_account.fixed.get_quote_vault_bump()
     };
 
-    if *vault.owner == spl_token_2022::id() {
+    if *vault.owner == spl_token_2022_interface::id() {
         spl_token_2022_transfer_from_vault_to_trader_fixed(
             &token_program,
             Some(mint),
@@ -142,7 +142,7 @@ fn spl_token_transfer_from_vault_to_trader<'a, 'info>(
     mint_pubkey: &Pubkey,
 ) -> ProgramResult {
     invoke_signed(
-        &spl_token::instruction::transfer(
+        &spl_token_interface::instruction::transfer(
             token_program.key,
             vault.key,
             trader_account.key,
@@ -187,7 +187,7 @@ fn spl_token_2022_transfer_from_vault_to_trader_fixed<'a, 'info>(
     bump: u8,
 ) -> ProgramResult {
     invoke_signed(
-        &spl_token_2022::instruction::transfer_checked(
+        &spl_token_2022_interface::instruction::transfer_checked(
             token_program.key,
             vault.key,
             mint_key,

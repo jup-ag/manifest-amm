@@ -10,31 +10,43 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 
 [workspace.dependencies]
 shank = "0.4.2"
-spl-token = { version = "8.0.0", features = ["no-entrypoint"] }
-spl-token-2022 = { version = "9.0.0", features = ["no-entrypoint"] }
-solana-program = "=2.2"
-borsh = "=0.10"
+spl-token-interface = "2.0.0"
+spl-token-2022-interface = "2.1.0"
+spl-associated-token-account-interface = "2.0.0"
+solana-program = "3"
+borsh = { version = "1", features = ["derive"] }
 bytemuck = "1.7.2"
 num_enum = "=0.5.11"
 thiserror = "1.0.38"
 solana-security-txt = "1.1.0"
 static_assertions = "=1.1.0"
-solana-invoke = "0.4.0"
+solana-invoke = "0.5"
 
 anyhow = "1.0.66"
-solana-program-test = "2.2"
-solana-logger = "2.2"
-solana-sdk = "2.2"
+solana-account = "3"
+solana-account-decoder = "3"
+solana-account-info = "3"
+solana-compute-budget-interface = "3"
+solana-program-test = "3"
+solana-logger = "3"
+solana-keypair = "3"
+solana-program-pack = "3"
+solana-pubkey = { version = "3", features = ["curve25519"] }
+solana-rpc-client = "3"
+solana-rpc-client-api = "3"
+solana-signer = "3"
+solana-transaction = "3"
 tokio = "1.28.0"
 
-nondet = { git = "https://github.com/Certora/solana-cvt", branch = "solana-v2.2" }
-cvt = { git = "https://github.com/Certora/solana-cvt", branch = "solana-v2.2" }
-early-panic = { git = "https://github.com/Certora/solana-cvt", branch = "solana-v2.2" }
-cvt-macros = { git = "https://github.com/Certora/solana-cvt", branch = "solana-v2.2" }
-calltrace = { git = "https://github.com/Certora/solana-cvt", branch = "solana-v2.2" }
-solana_cvt = { git = "https://github.com/Certora/solana-cvt", branch = "solana-v2.2" }
-hook_macro = { git = "https://github.com/Certora/solana-cvt", branch = "solana-v2.2" }
-vectors = { git = "https://github.com/Certora/solana-cvt", branch = "solana-v2.2" }
+nondet = { version = "0.6.1", package = "cvlr-nondet" }
+cvt = { version = "0.6.1", package = "cvlr-asserts" }
+early-panic = { version = "0.6.1", package = "cvlr-early-panic" }
+cvt-macros = { version = "0.6.1", package = "cvlr-macros" }
+calltrace = { version = "0.6.1", package = "cvlr-log" }
+solana_cvt = { version = "0.5.0", package = "cvlr-solana" }
+hook_macro = { version = "0.6.1", package = "cvlr-hook" }
+vectors = { version = "0.4.0", package = "cvlr-vectors" }
+cvlr = "0.6.1"
 
 # https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.release]

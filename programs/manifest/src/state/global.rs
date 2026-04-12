@@ -249,7 +249,7 @@ pub type GlobalRefMut<'a> = DynamicAccount<&'a mut GlobalFixed, &'a mut [u8]>;
 impl<Fixed: DerefOrBorrow<GlobalFixed>, Dynamic: DerefOrBorrow<[u8]>>
     DynamicAccount<Fixed, Dynamic>
 {
-    fn borrow_global(&self) -> GlobalRef {
+    fn borrow_global(&self) -> GlobalRef<'_> {
         GlobalRef {
             fixed: self.fixed.deref_or_borrow(),
             dynamic: self.dynamic.deref_or_borrow(),
@@ -308,7 +308,7 @@ impl<Fixed: DerefOrBorrow<GlobalFixed>, Dynamic: DerefOrBorrow<[u8]>>
 impl<Fixed: DerefOrBorrowMut<GlobalFixed>, Dynamic: DerefOrBorrowMut<[u8]>>
     DynamicAccount<Fixed, Dynamic>
 {
-    fn borrow_mut_global(&mut self) -> GlobalRefMut {
+    fn borrow_mut_global(&mut self) -> GlobalRefMut<'_> {
         GlobalRefMut {
             fixed: self.fixed.deref_or_borrow_mut(),
             dynamic: self.dynamic.deref_or_borrow_mut(),
@@ -603,8 +603,8 @@ mod test {
     #[test]
     fn test_cmp_trader() {
         // Just use token program ids since those have known sort order.
-        let global_trader1: GlobalTrader = GlobalTrader::new_empty(&spl_token::id(), NIL);
-        let global_trader2: GlobalTrader = GlobalTrader::new_empty(&spl_token_2022::id(), NIL);
+        let global_trader1: GlobalTrader = GlobalTrader::new_empty(&spl_token_interface::id(), NIL);
+        let global_trader2: GlobalTrader = GlobalTrader::new_empty(&spl_token_2022_interface::id(), NIL);
         assert!(global_trader1 < global_trader2);
         assert!(global_trader1 != global_trader2);
     }

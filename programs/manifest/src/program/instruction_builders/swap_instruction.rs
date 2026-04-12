@@ -2,7 +2,6 @@ use crate::{
     program::{swap::SwapParams, ManifestInstruction},
     validation::{get_global_address, get_global_vault_address, get_vault_address},
 };
-use borsh::BorshSerialize;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -36,13 +35,13 @@ pub fn swap_instruction(
         AccountMeta::new(vault_quote_account, false),
         AccountMeta::new_readonly(token_program_base, false),
     ];
-    if token_program_base == spl_token_2022::id() {
+    if token_program_base == spl_token_2022_interface::id() {
         account_metas.push(AccountMeta::new_readonly(*base_mint, false))
     }
     if token_program_base != token_program_quote {
         account_metas.push(AccountMeta::new_readonly(token_program_quote, false))
     }
-    if token_program_quote == spl_token_2022::id() {
+    if token_program_quote == spl_token_2022_interface::id() {
         account_metas.push(AccountMeta::new(*quote_mint, false))
     }
     if include_global {
@@ -58,8 +57,7 @@ pub fn swap_instruction(
         accounts: account_metas,
         data: [
             ManifestInstruction::Swap.to_vec(),
-            SwapParams::new(in_atoms, out_atoms, is_base_in, is_exact_in)
-                .try_to_vec()
+            borsh::to_vec(&SwapParams::new(in_atoms, out_atoms, is_base_in, is_exact_in))
                 .unwrap(),
         ]
         .concat(),

@@ -15,8 +15,7 @@ use manifest::{
         loaders::GlobalTradeAccounts, ManifestAccountInfo,
     },
 };
-use solana_program::{account_info::AccountInfo, system_program};
-use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
+use solana_program::{account_info::AccountInfo, instruction::AccountMeta, pubkey::Pubkey, system_program};
 use std::{cell::RefCell, mem::size_of, rc::Rc};
 
 macro_rules! 
@@ -112,8 +111,8 @@ impl Amm for ManifestMarket {
             key: keyed_account.key,
             label: "Manifest".into(),
             // Gets updated on the first iter
-            base_token_program: spl_token::id(),
-            quote_token_program: spl_token::id(),
+            base_token_program: spl_token_interface::id(),
+            quote_token_program: spl_token_interface::id(),
             base_global: None,
             quote_global: None,
         })
@@ -143,7 +142,7 @@ impl Amm for ManifestMarket {
             });
         };
 
-        let market_account: &solana_sdk::account::Account = account_map.get(&self.key).unwrap();
+        let market_account: &solana_account::Account = account_map.get(&self.key).unwrap();
 
         let (header_bytes, dynamic_data) = market_account.data.split_at(size_of::<MarketFixed>());
         let market_fixed: &MarketFixed = get_helper::<MarketFixed>(header_bytes, 0_u32);
@@ -350,8 +349,10 @@ mod test {
         },
         validation::{MintAccountInfo, Signer},
     };
-    use solana_sdk::{account::Account, account_info::AccountInfo, pubkey};
-    use spl_token_2022::state::Mint;
+    use solana_account::Account;
+    use solana_program::account_info::AccountInfo;
+    use solana_pubkey::pubkey;
+    use spl_token_2022_interface::state::Mint;
     use std::{cell::RefCell, rc::Rc};
 
     const BASE_MINT_KEY: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
@@ -550,7 +551,7 @@ mod test {
                 Account {
                     lamports: 0,
                     data: Vec::new(),
-                    owner: spl_token::id(),
+                    owner: spl_token_interface::id(),
                     executable: false,
                     rent_epoch: 0,
                 },
@@ -560,7 +561,7 @@ mod test {
                 Account {
                     lamports: 0,
                     data: Vec::new(),
-                    owner: spl_token::id(),
+                    owner: spl_token_interface::id(),
                     executable: false,
                     rent_epoch: 0,
                 },

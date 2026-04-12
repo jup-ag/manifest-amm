@@ -1,6 +1,5 @@
 use std::rc::Rc;
 
-use borsh::BorshSerialize;
 use hypertree::{
     get_helper, DataIndex, HyperTreeReadOperations, HyperTreeValueIteratorTrait, RBNode, NIL,
 };
@@ -9,14 +8,14 @@ use manifest::{
     state::{constants::NO_EXPIRATION_LAST_VALID_SLOT, OrderType, RestingOrder},
     validation::{get_global_address, get_global_vault_address, get_vault_address},
 };
-use solana_program::{instruction::AccountMeta, system_program};
+use solana_account::Account;
+use solana_keypair::Keypair;
+use solana_program::{instruction::{AccountMeta, Instruction}, pubkey::Pubkey, system_instruction::transfer, system_program};
 use solana_program_test::tokio;
-use solana_sdk::{
-    account::Account, instruction::Instruction, program_pack::Pack, pubkey::Pubkey,
-    signature::Keypair, signer::Signer, system_instruction::transfer,
-};
-use spl_token;
-use spl_token_2022::extension::StateWithExtensions;
+use solana_program_pack::Pack;
+use solana_signer::Signer;
+use spl_token_interface;
+use spl_token_2022_interface::extension::StateWithExtensions;
 use ui_wrapper::{
     self,
     instruction::ManifestWrapperInstruction,
@@ -69,23 +68,23 @@ async fn wrapper_place_order_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(payer, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1,
                 1,
@@ -93,8 +92,7 @@ async fn wrapper_place_order_test() -> anyhow::Result<()> {
                 true,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -168,12 +166,12 @@ async fn wrapper_place_order_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::CancelOrder.to_vec(),
-            WrapperCancelOrderParams::new(1).try_to_vec().unwrap(),
+            borsh::to_vec(&WrapperCancelOrderParams::new(1)).unwrap(),
         ]
         .concat(),
     };
@@ -239,16 +237,15 @@ async fn wrapper_place_order_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
             AccountMeta::new(referred_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(1_000_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(1_000_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -272,7 +269,7 @@ async fn wrapper_place_order_test() -> anyhow::Result<()> {
         .unwrap();
 
     let trader_token_account_quote =
-        spl_token::state::Account::unpack(&trader_token_account_quote.data)?;
+        spl_token_interface::state::Account::unpack(&trader_token_account_quote.data)?;
     assert_eq!(trader_token_account_quote.amount, 1);
 
     Ok(())
@@ -353,23 +350,23 @@ async fn wrapper_place_order_with_broke_owner_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(payer, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1,
                 1,
@@ -377,8 +374,7 @@ async fn wrapper_place_order_with_broke_owner_test() -> anyhow::Result<()> {
                 true,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -449,12 +445,12 @@ async fn wrapper_place_order_with_broke_owner_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::CancelOrder.to_vec(),
-            WrapperCancelOrderParams::new(1).try_to_vec().unwrap(),
+            borsh::to_vec(&WrapperCancelOrderParams::new(1)).unwrap(),
         ]
         .concat(),
     };
@@ -516,16 +512,15 @@ async fn wrapper_place_order_with_broke_owner_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
             AccountMeta::new(referred_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(1_000_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(1_000_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -549,7 +544,7 @@ async fn wrapper_place_order_with_broke_owner_test() -> anyhow::Result<()> {
         .unwrap();
 
     let trader_token_account_quote =
-        spl_token::state::Account::unpack(&trader_token_account_quote.data)?;
+        spl_token_interface::state::Account::unpack(&trader_token_account_quote.data)?;
     assert_eq!(trader_token_account_quote.amount, 1);
 
     Ok(())
@@ -589,13 +584,13 @@ async fn wrapper_place_order_without_globals_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(payer, true),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1,
                 1,
@@ -603,8 +598,7 @@ async fn wrapper_place_order_without_globals_test() -> anyhow::Result<()> {
                 true,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -678,12 +672,12 @@ async fn wrapper_place_order_without_globals_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::CancelOrder.to_vec(),
-            WrapperCancelOrderParams::new(1).try_to_vec().unwrap(),
+            borsh::to_vec(&WrapperCancelOrderParams::new(1)).unwrap(),
         ]
         .concat(),
     };
@@ -749,16 +743,15 @@ async fn wrapper_place_order_without_globals_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
             AccountMeta::new(referred_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(1_000_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(1_000_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -782,7 +775,7 @@ async fn wrapper_place_order_without_globals_test() -> anyhow::Result<()> {
         .unwrap();
 
     let trader_token_account_quote =
-        spl_token::state::Account::unpack(&trader_token_account_quote.data)?;
+        spl_token_interface::state::Account::unpack(&trader_token_account_quote.data)?;
     assert_eq!(trader_token_account_quote.amount, 1);
 
     Ok(())
@@ -822,13 +815,13 @@ async fn wrapper_place_order_with_mixed_up_mint_ask() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(payer, true),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1,
                 1,
@@ -836,8 +829,7 @@ async fn wrapper_place_order_with_mixed_up_mint_ask() -> anyhow::Result<()> {
                 false,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -888,13 +880,13 @@ async fn wrapper_place_order_with_mixed_up_mint_bid() -> anyhow::Result<()> {
             AccountMeta::new(base_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(payer, true),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1,
                 1,
@@ -902,8 +894,7 @@ async fn wrapper_place_order_with_mixed_up_mint_bid() -> anyhow::Result<()> {
                 true,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -984,23 +975,23 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(maker, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1 * SOL_UNIT_SIZE,
                 1,
@@ -1008,8 +999,7 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
                 true,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -1082,23 +1072,23 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
             AccountMeta::new(base_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(taker, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1 * SOL_UNIT_SIZE,
                 1,
@@ -1106,8 +1096,7 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
                 false,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -1161,15 +1150,14 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(500_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(500_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -1193,7 +1181,7 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
         .unwrap();
 
     let taker_token_account_base =
-        spl_token::state::Account::unpack(&taker_token_account_base.data)?;
+        spl_token_interface::state::Account::unpack(&taker_token_account_base.data)?;
     assert_eq!(taker_token_account_base.amount, 0);
 
     // user has proceeds of trade in his wallet, but 50% fees were charged
@@ -1207,7 +1195,7 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
         .unwrap();
 
     let taker_token_account_quote =
-        spl_token::state::Account::unpack(&taker_token_account_quote.data)?;
+        spl_token_interface::state::Account::unpack(&taker_token_account_quote.data)?;
     assert_eq!(taker_token_account_quote.amount, USDC_UNIT_SIZE * 3 / 2);
 
     // verify the remaining 50% was paid to platform not referrer
@@ -1221,7 +1209,7 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
         .unwrap();
 
     let platform_token_account_quote =
-        spl_token::state::Account::unpack(&platform_token_account_quote.data)?;
+        spl_token_interface::state::Account::unpack(&platform_token_account_quote.data)?;
     assert_eq!(platform_token_account_quote.amount, USDC_UNIT_SIZE / 2);
 
     let referred_token_account_quote: Account = test_fixture
@@ -1234,7 +1222,7 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
         .unwrap();
 
     let referred_token_account_quote =
-        spl_token::state::Account::unpack(&referred_token_account_quote.data)?;
+        spl_token_interface::state::Account::unpack(&referred_token_account_quote.data)?;
     assert_eq!(referred_token_account_quote.amount, 0);
 
     let settle_maker_ix = Instruction {
@@ -1249,15 +1237,14 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(500_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(500_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -1282,7 +1269,7 @@ async fn wrapper_fill_order_test() -> anyhow::Result<()> {
         .unwrap();
 
     let maker_token_account_base =
-        spl_token::state::Account::unpack(&maker_token_account_base.data)?;
+        spl_token_interface::state::Account::unpack(&maker_token_account_base.data)?;
     assert_eq!(maker_token_account_base.amount, SOL_UNIT_SIZE);
 
     Ok(())
@@ -1352,23 +1339,23 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(maker, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1 * SOL_UNIT_SIZE,
                 1,
@@ -1376,8 +1363,7 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
                 true,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -1450,23 +1436,23 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
             AccountMeta::new(base_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(taker, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1 * SOL_UNIT_SIZE,
                 1,
@@ -1474,8 +1460,7 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
                 false,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -1529,16 +1514,15 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
             AccountMeta::new(referred_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(500_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(500_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -1562,7 +1546,7 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
         .unwrap();
 
     let taker_token_account_base =
-        spl_token::state::Account::unpack(&taker_token_account_base.data)?;
+        spl_token_interface::state::Account::unpack(&taker_token_account_base.data)?;
     assert_eq!(taker_token_account_base.amount, 0);
 
     // user has proceeds of trade in his wallet, but 50% fees were charged
@@ -1576,7 +1560,7 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
         .unwrap();
 
     let taker_token_account_quote =
-        spl_token::state::Account::unpack(&taker_token_account_quote.data)?;
+        spl_token_interface::state::Account::unpack(&taker_token_account_quote.data)?;
     assert_eq!(taker_token_account_quote.amount, USDC_UNIT_SIZE * 3 / 2);
 
     // verify the remaining 50% was split 50/50 between platform & referrer
@@ -1590,7 +1574,7 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
         .unwrap();
 
     let platform_token_account_quote =
-        spl_token::state::Account::unpack(&platform_token_account_quote.data)?;
+        spl_token_interface::state::Account::unpack(&platform_token_account_quote.data)?;
     assert_eq!(platform_token_account_quote.amount, USDC_UNIT_SIZE / 4);
 
     let referred_token_account_quote: Account = test_fixture
@@ -1603,7 +1587,7 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
         .unwrap();
 
     let referred_token_account_quote =
-        spl_token::state::Account::unpack(&referred_token_account_quote.data)?;
+        spl_token_interface::state::Account::unpack(&referred_token_account_quote.data)?;
     assert_eq!(referred_token_account_quote.amount, USDC_UNIT_SIZE / 4);
 
     let settle_maker_ix = Instruction {
@@ -1618,16 +1602,15 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
             AccountMeta::new(referred_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(500_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(500_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -1652,7 +1635,7 @@ async fn wrapper_fill_order_without_referral_test() -> anyhow::Result<()> {
         .unwrap();
 
     let maker_token_account_base =
-        spl_token::state::Account::unpack(&maker_token_account_base.data)?;
+        spl_token_interface::state::Account::unpack(&maker_token_account_base.data)?;
     assert_eq!(maker_token_account_base.amount, SOL_UNIT_SIZE);
 
     Ok(())
@@ -1726,23 +1709,23 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(maker, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1 * SOL_UNIT_SIZE,
                 1,
@@ -1750,8 +1733,7 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
                 true,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -1824,23 +1806,23 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
             AccountMeta::new(base_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(taker, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1 * SOL_UNIT_SIZE,
                 1,
@@ -1848,8 +1830,7 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
                 false,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -1903,16 +1884,15 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
             AccountMeta::new(referred_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(500_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(500_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -1936,7 +1916,7 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
         .unwrap();
 
     let taker_token_account_base =
-        spl_token::state::Account::unpack(&taker_token_account_base.data)?;
+        spl_token_interface::state::Account::unpack(&taker_token_account_base.data)?;
     assert_eq!(taker_token_account_base.amount, 0);
 
     // user has proceeds of trade in his wallet, but 50% fees were charged
@@ -1949,7 +1929,7 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
         .unwrap()
         .unwrap();
 
-    let taker_token_account_quote = StateWithExtensions::<spl_token_2022::state::Account>::unpack(
+    let taker_token_account_quote = StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(
         &taker_token_account_quote.data,
     )?;
     assert_eq!(
@@ -1969,7 +1949,7 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
         .unwrap();
 
     let platform_token_account_quote =
-        StateWithExtensions::<spl_token_2022::state::Account>::unpack(
+        StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(
             &platform_token_account_quote.data,
         )?;
     assert_eq!(
@@ -1987,7 +1967,7 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
         .unwrap();
 
     let referred_token_account_quote =
-        StateWithExtensions::<spl_token_2022::state::Account>::unpack(
+        StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(
             &referred_token_account_quote.data,
         )?;
     assert_eq!(
@@ -2007,16 +1987,15 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
             AccountMeta::new(referred_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(500_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(500_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -2041,7 +2020,7 @@ async fn wrapper_fill_order_with_transfer_fees_test() -> anyhow::Result<()> {
         .unwrap();
 
     let maker_token_account_base =
-        spl_token::state::Account::unpack(&maker_token_account_base.data)?;
+        spl_token_interface::state::Account::unpack(&maker_token_account_base.data)?;
     assert_eq!(maker_token_account_base.amount, SOL_UNIT_SIZE);
 
     Ok(())
@@ -2112,23 +2091,23 @@ async fn wrapper_fill_order_with_transfer_fees_without_referral_test() -> anyhow
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(maker, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1 * SOL_UNIT_SIZE,
                 1,
@@ -2136,8 +2115,7 @@ async fn wrapper_fill_order_with_transfer_fees_without_referral_test() -> anyhow
                 true,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -2210,23 +2188,23 @@ async fn wrapper_fill_order_with_transfer_fees_without_referral_test() -> anyhow
             AccountMeta::new(base_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(taker, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1 * SOL_UNIT_SIZE,
                 1,
@@ -2234,8 +2212,7 @@ async fn wrapper_fill_order_with_transfer_fees_without_referral_test() -> anyhow
                 false,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -2289,15 +2266,14 @@ async fn wrapper_fill_order_with_transfer_fees_without_referral_test() -> anyhow
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(500_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(500_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -2321,7 +2297,7 @@ async fn wrapper_fill_order_with_transfer_fees_without_referral_test() -> anyhow
         .unwrap();
 
     let taker_token_account_base =
-        spl_token::state::Account::unpack(&taker_token_account_base.data)?;
+        spl_token_interface::state::Account::unpack(&taker_token_account_base.data)?;
     assert_eq!(taker_token_account_base.amount, 0);
 
     // user has proceeds of trade in his wallet, but 50% fees were charged
@@ -2334,7 +2310,7 @@ async fn wrapper_fill_order_with_transfer_fees_without_referral_test() -> anyhow
         .unwrap()
         .unwrap();
 
-    let taker_token_account_quote = StateWithExtensions::<spl_token_2022::state::Account>::unpack(
+    let taker_token_account_quote = StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(
         &taker_token_account_quote.data,
     )?;
     assert_eq!(
@@ -2354,7 +2330,7 @@ async fn wrapper_fill_order_with_transfer_fees_without_referral_test() -> anyhow
         .unwrap();
 
     let platform_token_account_quote =
-        StateWithExtensions::<spl_token_2022::state::Account>::unpack(
+        StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(
             &platform_token_account_quote.data,
         )?;
     assert_eq!(
@@ -2374,15 +2350,14 @@ async fn wrapper_fill_order_with_transfer_fees_without_referral_test() -> anyhow
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token_2022::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(500_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(500_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -2407,7 +2382,7 @@ async fn wrapper_fill_order_with_transfer_fees_without_referral_test() -> anyhow
         .unwrap();
 
     let maker_token_account_base =
-        spl_token::state::Account::unpack(&maker_token_account_base.data)?;
+        spl_token_interface::state::Account::unpack(&maker_token_account_base.data)?;
     assert_eq!(maker_token_account_base.amount, SOL_UNIT_SIZE);
 
     Ok(())
@@ -2447,23 +2422,23 @@ async fn wrapper_self_trade_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(payer, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 1,
                 1,
                 1,
@@ -2471,8 +2446,7 @@ async fn wrapper_self_trade_test() -> anyhow::Result<()> {
                 true,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -2487,23 +2461,23 @@ async fn wrapper_self_trade_test() -> anyhow::Result<()> {
             AccountMeta::new(base_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(payer, true),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(global_base, false),
             AccountMeta::new(global_base_vault, false),
             AccountMeta::new(base_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(quote_mint, false),
             AccountMeta::new(global_quote, false),
             AccountMeta::new(global_quote_vault, false),
             AccountMeta::new(quote_vault, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestWrapperInstruction::PlaceOrder.to_vec(),
-            WrapperPlaceOrderParams::new(
+            borsh::to_vec(&WrapperPlaceOrderParams::new(
                 2,
                 1,
                 1,
@@ -2511,8 +2485,7 @@ async fn wrapper_self_trade_test() -> anyhow::Result<()> {
                 false,
                 NO_EXPIRATION_LAST_VALID_SLOT,
                 OrderType::Limit,
-            )
-            .try_to_vec()
+            ))
             .unwrap(),
         ]
         .concat(),
@@ -2570,16 +2543,15 @@ async fn wrapper_self_trade_test() -> anyhow::Result<()> {
             AccountMeta::new(quote_vault, false),
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(manifest::id(), false),
             AccountMeta::new(platform_token_account, false),
             AccountMeta::new(referred_token_account, false),
         ],
         data: [
             ManifestWrapperInstruction::SettleFunds.to_vec(),
-            WrapperSettleFundsParams::new(500_000_000, 50)
-                .try_to_vec()
+            borsh::to_vec(&WrapperSettleFundsParams::new(500_000_000, 50))
                 .unwrap(),
         ]
         .concat(),
@@ -2603,7 +2575,7 @@ async fn wrapper_self_trade_test() -> anyhow::Result<()> {
         .unwrap();
 
     let trader_token_account_quote =
-        spl_token::state::Account::unpack(&trader_token_account_quote.data)?;
+        spl_token_interface::state::Account::unpack(&trader_token_account_quote.data)?;
     assert_eq!(trader_token_account_quote.amount, 0);
 
     // verify base token was received back
@@ -2617,7 +2589,7 @@ async fn wrapper_self_trade_test() -> anyhow::Result<()> {
         .unwrap();
 
     let trader_token_account_base =
-        spl_token::state::Account::unpack(&trader_token_account_base.data)?;
+        spl_token_interface::state::Account::unpack(&trader_token_account_base.data)?;
     assert_eq!(trader_token_account_base.amount, 1);
 
     Ok(())

@@ -60,7 +60,7 @@ impl From<ManifestError> for ProgramError {
 #[macro_export]
 macro_rules! require {
     ($test:expr, $err:expr, $($arg:tt)*) => {{
-        ::cvt::cvt_assume!($test);
+        ::cvt::cvt::cvt_assume!($test);
         Ok::<(), crate::ProgramError>(())
     }};
 }

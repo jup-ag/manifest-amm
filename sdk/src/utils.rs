@@ -44,7 +44,7 @@ pub(crate) fn can_back_order<'a, 'info>(
 
     let num_deposited_atoms: GlobalAtoms =
         global_dynamic_account.get_balance_atoms(resting_order_trader);
-    return desired_global_atoms <= num_deposited_atoms;
+    desired_global_atoms <= num_deposited_atoms
 }
 
 /// Generic get mutable dynamic account from the data bytes of the account.

@@ -692,8 +692,8 @@ struct AlignmentTest {
 fn test_alignment() -> Result<(), ProgramError> {
     let mut t = AlignmentTest::default();
     t.price = QuoteAtomsPerBaseAtom::from_mantissa_and_exponent_(u32::MAX, 0);
-    let mut s = t.clone();
-    t.price = s.price.clone();
+    let mut s = t;
+    t.price = s.price;
     let q = t
         .price
         .checked_base_for_quote(QuoteAtoms::new(u32::MAX as u64), true)

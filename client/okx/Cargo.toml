@@ -14,13 +14,13 @@ test = []
 anyhow = { workspace = true }
 manifest-dex = { path = "../../programs/manifest" }
 hypertree = { path = "../../lib" }
-solana-sdk = { workspace = true }
 solana-program = { workspace = true }
-spl-token = { workspace = true }
-spl-token-2022 = { workspace = true }
+spl-token-interface = { workspace = true }
+spl-token-2022-interface = { workspace = true }
 tokio = { workspace = true }
-solana-client = "2.2"
-solana-account-decoder = "2.2"
+solana-rpc-client = { workspace = true }
+solana-rpc-client-api = { workspace = true }
+solana-account-decoder = { workspace = true }
 async-trait = "0.1.88"
 serde_json = "1.0.140"
 log = "0.4.27"

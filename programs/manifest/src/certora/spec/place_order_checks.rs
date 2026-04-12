@@ -1,5 +1,5 @@
 use crate::*;
-use cvt::cvt_assume;
+use cvt::cvt::{cvt_assume, cvt_vacuity_check};
 use cvt_macros::rule;
 use nondet::*;
 
@@ -40,7 +40,7 @@ pub fn place_single_order_nondet_inputs<const IS_BID: bool>(
 pub fn place_single_order_canceled_check<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader: &AccountInfo = &acc_infos[0];
     let market_info: &AccountInfo = &acc_infos[1];
     let maker_trader: &AccountInfo = &acc_infos[7];
@@ -112,7 +112,7 @@ pub fn rule_place_single_order_canceled_ask() {
 pub fn place_single_order_unmatched_check<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader: &AccountInfo = &acc_infos[0];
     let market_info: &AccountInfo = &acc_infos[1];
 
@@ -186,7 +186,7 @@ pub fn rule_place_single_order_unmatched_ask() {
 pub fn place_single_order_full_match_check<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader: &AccountInfo = &acc_infos[0];
     let market_info: &AccountInfo = &acc_infos[1];
 
@@ -267,7 +267,7 @@ pub fn rule_place_single_order_full_match_ask() {
 pub fn place_single_order_partial_match_check<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader: &AccountInfo = &acc_infos[0];
     let market_info: &AccountInfo = &acc_infos[1];
 

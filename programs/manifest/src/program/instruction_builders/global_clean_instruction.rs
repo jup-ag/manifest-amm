@@ -1,5 +1,4 @@
 use crate::program::{global_clean::GlobalCleanParams, ManifestInstruction};
-use borsh::BorshSerialize;
 use hypertree::DataIndex;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
@@ -23,7 +22,7 @@ pub fn global_clean_instruction(
         ],
         data: [
             ManifestInstruction::GlobalClean.to_vec(),
-            GlobalCleanParams::new(order_index).try_to_vec().unwrap(),
+            borsh::to_vec(&GlobalCleanParams::new(order_index)).unwrap(),
         ]
         .concat(),
     }

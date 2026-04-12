@@ -1,14 +1,14 @@
 use std::rc::Rc;
 
-use borsh::BorshSerialize;
 use manifest::program::{withdraw::WithdrawParams, withdraw_instruction, ManifestInstruction};
-use solana_program_test::{tokio, ProgramTestContext};
-use solana_sdk::{
+use solana_keypair::Keypair;
+use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    transaction::Transaction,
 };
+use solana_program_test::{tokio, ProgramTestContext};
+use solana_signer::Signer;
+use solana_transaction::Transaction;
 
 use crate::{MintFixture, TestFixture, Token, TokenAccountFixture, SOL_UNIT_SIZE};
 
@@ -58,7 +58,7 @@ async fn withdraw_user_insufficient_funds_test() -> anyhow::Result<()> {
 
     // Deposit is on a different keypair, so the out of funds is not from token
     // program.
-    let second_keypair: solana_sdk::signature::Keypair =
+    let second_keypair: solana_keypair::Keypair =
         test_fixture.second_keypair.insecure_clone();
     test_fixture.claim_seat_for_keypair(&second_keypair).await?;
     test_fixture
@@ -105,7 +105,7 @@ async fn withdraw_fail_incorrect_mint_test() -> anyhow::Result<()> {
         mint,
         SOL_UNIT_SIZE,
         &user_token_account,
-        spl_token::id(),
+        spl_token_interface::id(),
         None,
     );
     let mut context: std::cell::RefMut<ProgramTestContext> = test_fixture.context.borrow_mut();
@@ -144,12 +144,11 @@ async fn withdraw_fail_incorrect_vault_test() -> anyhow::Result<()> {
             AccountMeta::new(test_fixture.market_fixture.key, false),
             AccountMeta::new(user_token_account, false),
             AccountMeta::new(user_token_account, false),
-            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
         ],
         data: [
             ManifestInstruction::Withdraw.to_vec(),
-            WithdrawParams::new(SOL_UNIT_SIZE, None)
-                .try_to_vec()
+            borsh::to_vec(&WithdrawParams::new(SOL_UNIT_SIZE, None))
                 .unwrap(),
         ]
         .concat(),

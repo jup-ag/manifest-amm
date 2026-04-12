@@ -14,11 +14,10 @@ use manifest::{
         NO_EXPIRATION_LAST_VALID_SLOT,
     },
 };
+use solana_keypair::Keypair;
+use solana_program::{instruction::Instruction, pubkey::Pubkey, system_instruction::transfer};
 use solana_program_test::tokio;
-use solana_sdk::{
-    instruction::Instruction, pubkey::Pubkey, signature::Keypair, signer::Signer,
-    system_instruction::transfer,
-};
+use solana_signer::Signer;
 
 use crate::{
     send_tx_with_retry, GlobalFixture, MarketFixture, MintFixture, TestFixture, Token,
@@ -433,7 +432,7 @@ async fn global_deposit_withdraw_22() -> anyhow::Result<()> {
     let mut global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
         Rc::clone(&test_fixture.context),
         &usdc_mint_fixture.key,
-        &spl_token_2022::id(),
+        &spl_token_2022_interface::id(),
     )
     .await;
 
@@ -463,7 +462,7 @@ async fn global_deposit_withdraw_22() -> anyhow::Result<()> {
             &global_fixture.mint_key,
             &payer,
             &token_account_fixture.key,
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
             1_000_000,
         )],
         Some(&payer),
@@ -484,7 +483,7 @@ async fn global_deposit_withdraw_22() -> anyhow::Result<()> {
             &global_fixture.mint_key,
             &payer,
             &token_account_fixture.key,
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
             1_000_000,
         )],
         Some(&payer),
@@ -510,7 +509,7 @@ async fn global_match_22() -> anyhow::Result<()> {
     let mut global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
         Rc::clone(&test_fixture.context),
         &usdc_mint_fixture.key,
-        &spl_token_2022::id(),
+        &spl_token_2022_interface::id(),
     )
     .await;
 
@@ -541,7 +540,7 @@ async fn global_match_22() -> anyhow::Result<()> {
             &global_fixture.mint_key,
             &payer,
             &token_account_fixture.key,
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
             1_000_000,
         )],
         Some(&payer),
@@ -581,9 +580,9 @@ async fn global_match_22() -> anyhow::Result<()> {
             NO_EXPIRATION_LAST_VALID_SLOT,
         )],
         Some(*market_fixture.market.get_base_mint()),
-        Some(spl_token::id()),
+        Some(spl_token_interface::id()),
         Some(*market_fixture.market.get_quote_mint()),
-        Some(spl_token_2022::id()),
+        Some(spl_token_2022_interface::id()),
     );
 
     send_tx_with_retry(
@@ -611,8 +610,8 @@ async fn global_match_22() -> anyhow::Result<()> {
         0,
         true,
         true,
-        spl_token::id(),
-        spl_token_2022::id(),
+        spl_token_interface::id(),
+        spl_token_2022_interface::id(),
         true,
     );
 
@@ -793,7 +792,7 @@ async fn global_evict() -> anyhow::Result<()> {
                     &test_fixture.global_fixture.mint_key,
                     &new_keypair.pubkey(),
                     &token_account_fixture.key,
-                    &spl_token::id(),
+                    &spl_token_interface::id(),
                     1_000_000,
                 ),
             ],
@@ -856,7 +855,7 @@ async fn global_evict() -> anyhow::Result<()> {
             &test_fixture.second_keypair.pubkey(),
             &evictor_account_fixture.key,
             &evictee_account_fixture.key,
-            &spl_token::id(),
+            &spl_token_interface::id(),
             1_000_000,
         )],
         Some(&test_fixture.second_keypair.pubkey()),
@@ -934,7 +933,7 @@ async fn global_evict_22() -> anyhow::Result<()> {
     let mut global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
         Rc::clone(&test_fixture.context),
         &usdc_mint_fixture.key,
-        &spl_token_2022::id(),
+        &spl_token_2022_interface::id(),
     )
     .await;
 
@@ -964,7 +963,7 @@ async fn global_evict_22() -> anyhow::Result<()> {
                     &global_fixture.mint_key,
                     &new_keypair.pubkey(),
                     &token_account_fixture.key,
-                    &spl_token_2022::id(),
+                    &spl_token_2022_interface::id(),
                     1_000_000,
                 ),
             ],
@@ -994,7 +993,7 @@ async fn global_evict_22() -> anyhow::Result<()> {
                 &global_fixture.mint_key,
                 &payer,
                 &evictee_account_fixture.key,
-                &spl_token_2022::id(),
+                &spl_token_2022_interface::id(),
                 1_000,
             ),
         ],
@@ -1023,7 +1022,7 @@ async fn global_evict_22() -> anyhow::Result<()> {
             &test_fixture.second_keypair.pubkey(),
             &evictor_account_fixture.key,
             &evictee_account_fixture.key,
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
             1_000_000,
         )],
         Some(&test_fixture.second_keypair.pubkey()),

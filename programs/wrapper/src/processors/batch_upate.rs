@@ -321,7 +321,7 @@ fn execute_cpi(
         accounts: acc_metas,
         data: [
             ManifestInstruction::BatchUpdate.to_vec(),
-            BatchUpdateParams::new(trader_index_hint, core_cancels, core_orders).try_to_vec()?,
+            borsh::to_vec(&BatchUpdateParams::new(trader_index_hint, core_cancels, core_orders))?,
         ]
         .concat(),
     };

@@ -6,12 +6,12 @@ use manifest::{
     state::{MarketValue, RestingOrder, MARKET_FIXED_DISCRIMINANT},
 };
 use solana_account_decoder::UiAccountEncoding;
-use solana_client::{
-    rpc_client::RpcClient,
-    rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
-    rpc_filter::{Memcmp, RpcFilterType},
+use solana_program::pubkey::Pubkey;
+use solana_rpc_client::rpc_client::RpcClient;
+use solana_rpc_client_api::{
+    config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
+    filter::{Memcmp, RpcFilterType},
 };
-use solana_sdk::pubkey::Pubkey;
 use std::{collections::HashMap, error::Error, str::FromStr};
 use tokio::sync::mpsc::Sender;
 

@@ -2,7 +2,6 @@ use crate::{
     program::{withdraw::WithdrawParams, ManifestInstruction},
     validation::get_vault_address,
 };
-use borsh::BorshSerialize;
 use hypertree::DataIndex;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
@@ -32,8 +31,7 @@ pub fn withdraw_instruction(
         ],
         data: [
             ManifestInstruction::Withdraw.to_vec(),
-            WithdrawParams::new(amount_atoms, trader_index_hint)
-                .try_to_vec()
+            borsh::to_vec(&WithdrawParams::new(amount_atoms, trader_index_hint))
                 .unwrap(),
         ]
         .concat(),

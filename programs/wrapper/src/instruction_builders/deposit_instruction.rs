@@ -1,5 +1,4 @@
 use crate::{processors::deposit::WrapperDepositParams, ManifestWrapperInstruction};
-use borsh::BorshSerialize;
 use manifest::validation::get_vault_address;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
@@ -30,8 +29,7 @@ pub fn deposit_instruction(
         ],
         data: [
             ManifestWrapperInstruction::Deposit.to_vec(),
-            WrapperDepositParams::new(amount_atoms)
-                .try_to_vec()
+            borsh::to_vec(&WrapperDepositParams::new(amount_atoms))
                 .unwrap(),
         ]
         .concat(),

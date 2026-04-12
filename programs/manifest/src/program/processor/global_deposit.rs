@@ -52,10 +52,10 @@ pub(crate) fn process_global_deposit(
     global_dynamic_account.deposit_global(payer.key, GlobalAtoms::new(amount_atoms))?;
 
     // Do the token transfer
-    if *global_vault.owner == spl_token_2022::id() {
+    if *global_vault.owner == spl_token_2022_interface::id() {
         let before_vault_balance_atoms: u64 = global_vault.get_balance_atoms();
         invoke(
-            &spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022_interface::instruction::transfer_checked(
                 token_program.key,
                 trader_token_account.key,
                 mint.info.key,
@@ -80,7 +80,7 @@ pub(crate) fn process_global_deposit(
             .unwrap();
     } else {
         invoke(
-            &spl_token::instruction::transfer(
+            &spl_token_interface::instruction::transfer(
                 token_program.key,
                 trader_token_account.key,
                 global_vault.key,

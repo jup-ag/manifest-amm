@@ -1,5 +1,5 @@
 use crate::certora::hooks::*;
-use hook_macro::cvt_hook_end;
+use hook_macro::cvlr_hook_on_exit as cvt_hook_end;
 use nondet::nondet;
 
 use crate::{

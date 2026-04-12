@@ -53,9 +53,9 @@ pub(crate) fn process_global_withdraw(
     let (_, bump) = get_global_vault_address(mint.info.key);
 
     // Do the token transfer
-    if *global_vault.owner == spl_token_2022::id() {
+    if *global_vault.owner == spl_token_2022_interface::id() {
         invoke_signed(
-            &spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022_interface::instruction::transfer_checked(
                 token_program.key,
                 global_vault.key,
                 mint.info.key,
@@ -75,7 +75,7 @@ pub(crate) fn process_global_withdraw(
         )?;
     } else {
         invoke_signed(
-            &spl_token::instruction::transfer(
+            &spl_token_interface::instruction::transfer(
                 token_program.key,
                 global_vault.key,
                 trader_token.key,

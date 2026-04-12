@@ -1,5 +1,5 @@
 use crate::*;
-use cvt::cvt_assume;
+use cvt::cvt::{cvt_assume, cvt_vacuity_check};
 use cvt_macros::rule;
 use nondet::*;
 
@@ -22,7 +22,7 @@ use state::{main_trader_index, second_trader_index};
 fn rule_deposit_check<const IS_BASE: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let used_acc_infos: &[AccountInfo] = &acc_infos[..6];
     let trader: &AccountInfo = &used_acc_infos[0];
     let market_info: &AccountInfo = &used_acc_infos[1];
@@ -132,7 +132,7 @@ pub fn rule_deposit_quote() {
 fn rule_withdraw_check<const IS_BASE: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let used_acc_infos: &[AccountInfo] = &acc_infos[..6];
     let trader: &AccountInfo = &used_acc_infos[0];
     let market_info: &AccountInfo = &used_acc_infos[1];
@@ -242,7 +242,7 @@ pub fn rule_withdraw_quote() {
 fn rest_remaining_check<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader: &AccountInfo = &acc_infos[0];
     let market_info: &AccountInfo = &acc_infos[1];
     let maker_trader: &AccountInfo = &acc_infos[7];
@@ -327,7 +327,7 @@ pub fn cancel_order_by_index_check<const IS_BID: bool>() {
 
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader: &AccountInfo = &acc_infos[0];
     let market_info: &AccountInfo = &acc_infos[1];
     let maker_trader: &AccountInfo = &acc_infos[2];
@@ -392,7 +392,7 @@ pub fn cancel_order_check<const IS_BID: bool>() {
 
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader: &AccountInfo = &acc_infos[0];
     let market_info: &AccountInfo = &acc_infos[1];
     let maker_trader: &AccountInfo = &acc_infos[2];

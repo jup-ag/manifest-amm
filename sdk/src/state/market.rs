@@ -158,7 +158,7 @@ pub type MarketRefMut<'a> = DynamicAccount<&'a mut MarketFixed, &'a mut [u8]>;
 impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
     DynamicAccount<Fixed, Dynamic>
 {
-    fn borrow_market(&self) -> MarketRef {
+    fn borrow_market(&self) -> MarketRef<'_> {
         MarketRef {
             fixed: self.fixed.deref_or_borrow(),
             dynamic: self.dynamic.deref_or_borrow(),
@@ -178,7 +178,7 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
     pub fn has_free_block(&self) -> bool {
         let DynamicAccount { fixed, .. } = self.borrow_market();
         let free_list_head_index: DataIndex = fixed.free_list_head_index;
-        return free_list_head_index != NIL;
+        free_list_head_index != NIL
     }
 
     pub fn has_two_free_blocks(&self) -> bool {
@@ -239,7 +239,7 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
 
             // Skip unbacked global orders.
             if self.is_unbacked_global_order(
-                &resting_order,
+                resting_order,
                 is_bid,
                 required_global_opt,
                 matched_base_atoms,
@@ -263,10 +263,10 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         // to receive the desired number of base atoms, this returns just the
         // full amount on the bookside without differentiating that return.
 
-        return Ok(total_matched_quote_atoms);
+        Ok(total_matched_quote_atoms)
     }
 
-    pub fn get_bids(&self) -> BooksideReadOnly {
+    pub fn get_bids(&self) -> BooksideReadOnly<'_> {
         let DynamicAccount { dynamic, fixed } = self.borrow_market();
         BooksideReadOnly::new(
             dynamic,
@@ -275,7 +275,7 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         )
     }
 
-    pub fn get_asks(&self) -> BooksideReadOnly {
+    pub fn get_asks(&self) -> BooksideReadOnly<'_> {
         let DynamicAccount { dynamic, fixed } = self.borrow_market();
         BooksideReadOnly::new(
             dynamic,
@@ -310,7 +310,7 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
                 return true;
             }
         }
-        return false;
+        false
     }
 
     pub fn get_trader_key_by_index(&self, index: DataIndex) -> &Pubkey {
@@ -376,7 +376,7 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
 
             // Skip unbacked global orders.
             if self.is_unbacked_global_order(
-                &resting_order,
+                resting_order,
                 is_bid,
                 required_global_opt,
                 matched_base_atoms,
@@ -404,7 +404,7 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         // to receive the desired number of quote atoms, this returns just the
         // full amount on the bookside without differentiating that return.
 
-        return Ok(total_matched_base_atoms);
+        Ok(total_matched_base_atoms)
     }
 }
 

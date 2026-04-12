@@ -4,7 +4,6 @@ use crate::{
         WrapperBatchUpdateParams, WrapperCancelOrderParams, WrapperPlaceOrderParams,
     },
 };
-use borsh::BorshSerialize;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -30,8 +29,7 @@ pub fn batch_update_instruction(
         ],
         data: [
             ManifestWrapperInstruction::BatchUpdate.to_vec(),
-            WrapperBatchUpdateParams::new(cancels, cancel_all, orders)
-                .try_to_vec()
+            borsh::to_vec(&WrapperBatchUpdateParams::new(cancels, cancel_all, orders))
                 .unwrap(),
         ]
         .concat(),

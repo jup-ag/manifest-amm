@@ -277,7 +277,7 @@ pub(crate) fn process_swap_core(
         // unused amount.
         let initial_credit_base_atoms: BaseAtoms = BaseAtoms::new(in_atoms);
 
-        if *token_program_base.key == spl_token_2022::id() {
+        if *token_program_base.key == spl_token_2022_interface::id() {
             spl_token_2022_transfer_from_trader_to_vault(
                 &token_program_base,
                 &trader_base_account,
@@ -300,7 +300,7 @@ pub(crate) fn process_swap_core(
 
         // Give all but what started there.
         let quote_vault_bump: u8 = dynamic_account.fixed.get_quote_vault_bump();
-        if *token_program_quote.key == spl_token_2022::id() {
+        if *token_program_quote.key == spl_token_2022_interface::id() {
             spl_token_2022_transfer_from_vault_to_trader(
                 &token_program_quote,
                 quote_mint,
@@ -331,7 +331,7 @@ pub(crate) fn process_swap_core(
         // The amount to take from them is repaying the full credit, minus the
         // unused amount.
         let initial_credit_quote_atoms: QuoteAtoms = QuoteAtoms::new(in_atoms);
-        if *token_program_quote.key == spl_token_2022::id() {
+        if *token_program_quote.key == spl_token_2022_interface::id() {
             spl_token_2022_transfer_from_trader_to_vault(
                 &token_program_quote,
                 &trader_quote_account,
@@ -354,7 +354,7 @@ pub(crate) fn process_swap_core(
 
         // Give all but what started there.
         let base_vault_bump: u8 = dynamic_account.fixed.get_base_vault_bump();
-        if *token_program_base.key == spl_token_2022::id() {
+        if *token_program_base.key == spl_token_2022_interface::id() {
             spl_token_2022_transfer_from_vault_to_trader(
                 &token_program_base,
                 base_mint,
@@ -438,7 +438,7 @@ fn spl_token_transfer_from_trader_to_vault<'a, 'info>(
     amount: u64,
 ) -> ProgramResult {
     invoke(
-        &spl_token::instruction::transfer(
+        &spl_token_interface::instruction::transfer(
             token_program.key,
             trader_account.key,
             vault.key,
@@ -479,7 +479,7 @@ fn spl_token_2022_transfer_from_trader_to_vault<'a, 'info>(
     decimals: u8,
 ) -> ProgramResult {
     invoke(
-        &spl_token_2022::instruction::transfer_checked(
+        &spl_token_2022_interface::instruction::transfer_checked(
             token_program.key,
             trader_account.key,
             mint_pubkey,
@@ -526,7 +526,7 @@ fn spl_token_transfer_from_vault_to_trader<'a, 'info>(
     mint_pubkey: &Pubkey,
 ) -> ProgramResult {
     solana_program::program::invoke_signed(
-        &spl_token::instruction::transfer(
+        &spl_token_interface::instruction::transfer(
             token_program.key,
             vault.key,
             trader_account.key,
@@ -571,7 +571,7 @@ fn spl_token_2022_transfer_from_vault_to_trader<'a, 'info>(
     vault_bump: u8,
 ) -> ProgramResult {
     solana_program::program::invoke_signed(
-        &spl_token_2022::instruction::transfer_checked(
+        &spl_token_2022_interface::instruction::transfer_checked(
             token_program.key,
             vault.key,
             mint_pubkey,

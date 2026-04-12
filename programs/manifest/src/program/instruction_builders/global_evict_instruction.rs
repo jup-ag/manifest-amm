@@ -2,7 +2,6 @@ use crate::{
     program::{global_deposit::GlobalDepositParams, ManifestInstruction},
     validation::{get_global_address, get_global_vault_address},
 };
-use borsh::BorshSerialize;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -31,7 +30,7 @@ pub fn global_evict_instruction(
         ],
         data: [
             ManifestInstruction::GlobalEvict.to_vec(),
-            GlobalDepositParams::new(num_atoms).try_to_vec().unwrap(),
+            borsh::to_vec(&GlobalDepositParams::new(num_atoms)).unwrap(),
         ]
         .concat(),
     }

@@ -9,14 +9,17 @@ use manifest::{
     state::{MarketFixed, MarketValue},
     validation::MintAccountInfo,
 };
+use solana_account::Account;
 use solana_program::{hash::Hash, pubkey::Pubkey, rent::Rent};
 use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
-use solana_sdk::{
-    account::Account, account_info::AccountInfo, instruction::Instruction, program_pack::Pack,
-    signature::Keypair, signer::Signer, system_instruction::create_account,
-    transaction::Transaction,
+use solana_keypair::Keypair;
+use solana_program::{
+    account_info::AccountInfo, instruction::Instruction, system_instruction::create_account,
 };
-use spl_token_2022::state::Mint;
+use solana_program_pack::Pack;
+use solana_signer::Signer;
+use solana_transaction::Transaction;
+use spl_token_2022_interface::state::Mint;
 use std::rc::Rc;
 use wrapper::instruction_builders::{
     claim_seat_instruction, create_wrapper_instructions, deposit_instruction, withdraw_instruction,
@@ -72,10 +75,10 @@ impl TestFixture {
         let second_keypair: Keypair = Keypair::new();
         program.add_account(
             second_keypair.pubkey(),
-            solana_sdk::account::Account::new(
+            solana_account::Account::new(
                 u32::MAX as u64,
                 0,
-                &solana_sdk::system_program::id(),
+                &solana_program::system_program::id(),
             ),
         );
 
@@ -275,7 +278,7 @@ impl TestFixture {
             amount_atoms,
             &trader_token_account,
             wrapper_state,
-            spl_token::id(),
+            spl_token_interface::id(),
         );
 
         send_tx_with_retry(
@@ -350,7 +353,7 @@ impl TestFixture {
             amount_atoms,
             &trader_token_account,
             &self.wrapper.key,
-            spl_token::id(),
+            spl_token_interface::id(),
         );
 
         send_tx_with_retry(
@@ -492,12 +495,12 @@ impl MintFixture {
         let init_account_ix: Instruction = create_account(
             &context.borrow().payer.pubkey(),
             &mint_keypair.pubkey(),
-            rent.minimum_balance(spl_token::state::Mint::LEN),
-            spl_token::state::Mint::LEN as u64,
-            &spl_token::id(),
+            rent.minimum_balance(spl_token_interface::state::Mint::LEN),
+            spl_token_interface::state::Mint::LEN as u64,
+            &spl_token_interface::id(),
         );
-        let init_mint_ix: Instruction = spl_token::instruction::initialize_mint(
-            &spl_token::id(),
+        let init_mint_ix: Instruction = spl_token_interface::instruction::initialize_mint(
+            &spl_token_interface::id(),
             &mint_keypair.pubkey(),
             &context.borrow().payer.pubkey(),
             None,
@@ -536,8 +539,8 @@ impl MintFixture {
 
     fn make_mint_to_ix(&self, dest: &Pubkey, amount: u64) -> Instruction {
         let context: Ref<ProgramTestContext> = self.context.borrow();
-        let mint_to_instruction: Instruction = spl_token::instruction::mint_to(
-            &spl_token::ID,
+        let mint_to_instruction: Instruction = spl_token_interface::instruction::mint_to(
+            &spl_token_interface::ID,
             &self.key,
             dest,
             &context.payer.pubkey(),
@@ -564,13 +567,13 @@ impl TokenAccountFixture {
         let init_account_ix: Instruction = create_account(
             payer_pk,
             &keypair.pubkey(),
-            rent.minimum_balance(spl_token::state::Account::LEN),
-            spl_token::state::Account::LEN as u64,
-            &spl_token::id(),
+            rent.minimum_balance(spl_token_interface::state::Account::LEN),
+            spl_token_interface::state::Account::LEN as u64,
+            &spl_token_interface::id(),
         );
 
-        let init_token_ix: Instruction = spl_token::instruction::initialize_account(
-            &spl_token::id(),
+        let init_token_ix: Instruction = spl_token_interface::instruction::initialize_account(
+            &spl_token_interface::id(),
             &keypair.pubkey(),
             mint_pk,
             owner_pk,

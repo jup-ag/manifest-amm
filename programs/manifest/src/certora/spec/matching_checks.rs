@@ -1,5 +1,5 @@
 use crate::*;
-use cvt::{cvt_assert, cvt_assume};
+use cvt::cvt::{cvt_assert, cvt_assume, cvt_vacuity_check};
 use cvt_macros::rule;
 use nondet::*;
 
@@ -25,7 +25,7 @@ use hypertree::DataIndex;
 pub fn matching_if_maker_order_exists<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader = &acc_infos[0];
     let market_info = &acc_infos[1];
 
@@ -87,7 +87,7 @@ pub fn rule_matching_if_maker_order_exists_ask() {
 pub fn crossed_prices_if_matched<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader = &acc_infos[0];
     let market_info = &acc_infos[1];
 
@@ -148,7 +148,7 @@ pub fn rule_crossed_prices_if_matched_ask() {
 pub fn place_single_order_full_match_balances<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader = &acc_infos[0];
     let market_info = &acc_infos[1];
 
@@ -228,7 +228,7 @@ pub fn rule_place_single_order_full_match_balances_ask() {
 pub fn place_single_order_partial_match_balances<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader = &acc_infos[0];
     let market_info = &acc_infos[1];
 
@@ -311,7 +311,7 @@ pub fn rule_place_single_order_partial_match_balances_ask() {
 pub fn matching_order_removed_if_fully_matched<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader = &acc_infos[0];
     let market_info = &acc_infos[1];
 
@@ -363,7 +363,7 @@ pub fn rule_matching_order_removed_if_fully_matched_ask() {
 pub fn matching_fully_matched_if_order_removed<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader = &acc_infos[0];
     let market_info = &acc_infos[1];
 
@@ -422,7 +422,7 @@ pub fn rule_matching_fully_matched_if_order_removed_ask() {
 pub fn matching_decrease_maker_order_atoms<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader = &acc_infos[0];
     let market_info = &acc_infos[1];
 

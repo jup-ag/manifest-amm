@@ -28,6 +28,7 @@ use super::{constants::NO_EXPIRATION_LAST_VALID_SLOT, RESTING_ORDER_SIZE};
     TryFromPrimitive,
 )]
 #[repr(u8)]
+#[borsh(use_discriminant = true)]
 pub enum OrderType {
     // Normal limit order.
     Limit = 0,

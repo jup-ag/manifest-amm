@@ -88,7 +88,7 @@ mod free_addr_helpers {
         } else if is_second_seat_free() {
             second_trader_index()
         } else {
-            cvt::cvt_assert!(false);
+            cvt::cvt::cvt_assert!(false);
             crate::state::market::NIL
         }
     }
@@ -100,7 +100,7 @@ mod free_addr_helpers {
         if super::is_bid_order_free() {
             super::main_bid_order_index()
         } else {
-            cvt::cvt_assert!(false);
+            cvt::cvt::cvt_assert!(false);
             super::NIL
         }
     }
@@ -112,7 +112,7 @@ mod free_addr_helpers {
         if super::is_ask_order_free() {
             super::main_ask_order_index()
         } else {
-            cvt::cvt_assert!(false);
+            cvt::cvt::cvt_assert!(false);
             super::NIL
         }
     }

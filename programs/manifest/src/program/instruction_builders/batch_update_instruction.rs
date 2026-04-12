@@ -9,7 +9,6 @@ use crate::{
     validation::{get_global_address, get_global_vault_address, get_vault_address},
 };
 #[cfg(not(feature = "certora"))]
-use borsh::BorshSerialize;
 use hypertree::DataIndex;
 #[cfg(feature = "certora")]
 use solana_program::{instruction::Instruction, pubkey::Pubkey};
@@ -54,11 +53,11 @@ pub fn batch_update_instruction(
                 AccountMeta::new(market_vault, false),
             ];
             if token_program_opt.is_none()
-                || token_program_opt.is_some_and(|f| f == spl_token::id())
+                || token_program_opt.is_some_and(|f| f == spl_token_interface::id())
             {
-                global_account_metas.push(AccountMeta::new_readonly(spl_token::id(), false));
+                global_account_metas.push(AccountMeta::new_readonly(spl_token_interface::id(), false));
             } else {
-                global_account_metas.push(AccountMeta::new_readonly(spl_token_2022::id(), false));
+                global_account_metas.push(AccountMeta::new_readonly(spl_token_2022_interface::id(), false));
             }
             account_metas.extend(global_account_metas);
         }
@@ -69,8 +68,7 @@ pub fn batch_update_instruction(
         accounts: account_metas,
         data: [
             ManifestInstruction::BatchUpdate.to_vec(),
-            BatchUpdateParams::new(trader_index_hint, cancels, orders)
-                .try_to_vec()
+            borsh::to_vec(&BatchUpdateParams::new(trader_index_hint, cancels, orders))
                 .unwrap(),
         ]
         .concat(),

@@ -29,7 +29,7 @@ use solana_program::{
     system_program,
     sysvar::{clock::Clock, Sysvar},
 };
-use spl_token_2022::{
+use spl_token_2022_interface::{
     extension::{
         transfer_fee::TransferFeeConfig, transfer_hook::TransferHook, BaseStateWithExtensions,
         StateWithExtensions,
@@ -284,7 +284,7 @@ pub(crate) fn process_place_order(
     };
 
     // Adjust deposited amount for TransferFee if possible.
-    let deposit_amount_atoms = if *mint.owner == spl_token_2022::id() {
+    let deposit_amount_atoms = if *mint.owner == spl_token_2022_interface::id() {
         let mint_data: Ref<'_, &mut [u8]> = mint.data.borrow();
         let deposit_mint: StateWithExtensions<'_, Mint> =
             StateWithExtensions::<Mint>::unpack(&mint_data)?;
@@ -362,8 +362,7 @@ pub(crate) fn process_place_order(
             accounts: account_metas,
             data: [
                 ManifestInstruction::BatchUpdate.to_vec(),
-                BatchUpdateParams::new(Some(trader_index), vec![], vec![core_place])
-                    .try_to_vec()?,
+                borsh::to_vec(&BatchUpdateParams::new(Some(trader_index), vec![], vec![core_place]))?,
             ]
             .concat(),
         };

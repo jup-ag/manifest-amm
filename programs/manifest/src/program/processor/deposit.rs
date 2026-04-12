@@ -72,7 +72,7 @@ pub(crate) fn process_deposit_core(
     let is_base: bool =
         &trader_token.try_borrow_data()?[0..32] == dynamic_account.get_base_mint().as_ref();
 
-    if *vault.owner == spl_token_2022::id() {
+    if *vault.owner == spl_token_2022_interface::id() {
         let before_vault_balance_atoms: u64 = vault.get_balance_atoms();
         spl_token_2022_transfer_from_trader_to_vault(
             &token_program,
@@ -135,7 +135,7 @@ fn spl_token_transfer_from_trader_to_vault<'a, 'info>(
     amount: u64,
 ) -> ProgramResult {
     crate::program::invoke(
-        &spl_token::instruction::transfer(
+        &spl_token_interface::instruction::transfer(
             token_program.key,
             trader_account.key,
             vault.key,
@@ -176,7 +176,7 @@ fn spl_token_2022_transfer_from_trader_to_vault<'a, 'info>(
     decimals: u8,
 ) -> ProgramResult {
     crate::program::invoke(
-        &spl_token_2022::instruction::transfer_checked(
+        &spl_token_2022_interface::instruction::transfer_checked(
             token_program.key,
             trader_account.key,
             mint_pubkey,

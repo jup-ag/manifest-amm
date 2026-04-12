@@ -1,7 +1,7 @@
 use crate::{get_trader_balance, get_trader_index};
-use cvt::{cvt_assert, cvt_assume};
+use cvt::cvt::{cvt_assert, cvt_assume, cvt_vacuity_check};
 use cvt_macros::rule;
-use nondet::{acc_infos_with_mem_layout, nondet};
+use nondet::nondet;
 
 use crate::*;
 use solana_program::account_info::AccountInfo;
@@ -22,7 +22,7 @@ use state::cvt_assume_main_trader_has_seat;
 pub fn rule_update_balance() {
     crate::certora::spec::verification_utils::init_static();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let trader: &AccountInfo = &acc_infos[0];
     let market: &AccountInfo = &acc_infos[1];
 
@@ -46,7 +46,7 @@ pub fn rule_update_balance() {
 pub fn rule_deposit_deposits() {
     use state::{cvt_assume_main_trader_has_seat, is_second_seat_taken, second_trader_pk};
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let used_acc_infos: &[AccountInfo] = &acc_infos[..6];
     let trader: &AccountInfo = &used_acc_infos[0];
     let market: &AccountInfo = &used_acc_infos[1];

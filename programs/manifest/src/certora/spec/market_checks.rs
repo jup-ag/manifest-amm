@@ -3,8 +3,7 @@ use crate::{
     claim_seat, create_empty_market, cvt_assert_is_nil, cvt_vacuity_check, deposit,
     get_trader_balance, get_trader_index,
 };
-use calltrace::cvt_cex_print_u64;
-use cvt::{cvt_assert, cvt_assume};
+use cvt::cvt::{cvt_assert, cvt_assume};
 use cvt_macros::rule;
 use nondet::nondet;
 
@@ -22,7 +21,7 @@ use solana_program::{account_info::AccountInfo, pubkey::Pubkey};
 pub fn rule_market_empty() {
     init_static();
 
-    let market_info: AccountInfo = nondet();
+    let market_info: AccountInfo = solana_cvt::cvlr_nondet_account_info();
 
     // Create an empty market
     create_empty_market!(market_info);
@@ -38,7 +37,7 @@ pub fn rule_market_empty() {
 pub fn rule_market_claim_seat_once() {
     init_static();
 
-    let market_info: AccountInfo = nondet();
+    let market_info: AccountInfo = solana_cvt::cvlr_nondet_account_info();
 
     // Create an empty market
     create_empty_market!(market_info);
@@ -56,7 +55,7 @@ pub fn rule_market_claim_seat_once() {
 pub fn rule_market_claim_seat_twice_same_trader() {
     init_static();
 
-    let market_info: AccountInfo = nondet();
+    let market_info: AccountInfo = solana_cvt::cvlr_nondet_account_info();
 
     // Create an empty market
     create_empty_market!(market_info);
@@ -79,7 +78,7 @@ pub fn rule_market_claim_seat_twice_same_trader() {
 pub fn rule_market_claim_seat_twice_different_trader() {
     init_static();
 
-    let market_info: AccountInfo = nondet();
+    let market_info: AccountInfo = solana_cvt::cvlr_nondet_account_info();
 
     // Create an empty market
     create_empty_market!(market_info);
@@ -106,7 +105,7 @@ pub fn rule_market_claim_seat_twice_different_trader() {
 pub fn rule_market_deposit() {
     init_static();
 
-    let market_info: AccountInfo = nondet();
+    let market_info: AccountInfo = solana_cvt::cvlr_nondet_account_info();
 
     // Create an empty market
     create_empty_market!(market_info);
@@ -121,7 +120,7 @@ pub fn rule_market_deposit() {
 
     deposit!(market_info, trader_index, 100, true);
     let (base_atoms, quote_atoms) = get_trader_balance!(market_info, &trader_key);
-    cvt_cex_print_u64!(1, u64::from(base_atoms), u64::from(quote_atoms));
+    cvlr::clog!(base_atoms, quote_atoms);
     cvt_assert!(u64::from(base_atoms) == 100);
     cvt_vacuity_check!();
 }
@@ -130,7 +129,7 @@ pub fn rule_market_deposit() {
 pub fn rule_market_release_seat() {
     init_static();
 
-    let market_info: AccountInfo = nondet();
+    let market_info: AccountInfo = solana_cvt::cvlr_nondet_account_info();
 
     // Create an empty market
     create_empty_market!(market_info);

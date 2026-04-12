@@ -1,6 +1,6 @@
 use crate::require;
 use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
-use spl_token_2022::{
+use spl_token_2022_interface::{
     check_spl_token_program_account, extension::StateWithExtensions, state::Mint,
 };
 use std::ops::Deref;
@@ -38,7 +38,7 @@ impl<'a, 'info> TokenAccountInfo<'a, 'info> {
         mint: &Pubkey,
     ) -> Result<TokenAccountInfo<'a, 'info>, ProgramError> {
         require!(
-            info.owner == &spl_token::id() || info.owner == &spl_token_2022::id(),
+            info.owner == &spl_token_interface::id() || info.owner == &spl_token_2022_interface::id(),
             ProgramError::IllegalOwner,
             "Token account must be owned by the Token Program",
         )?;

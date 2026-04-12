@@ -1,5 +1,5 @@
 #[cfg(feature = "certora")]
-use {crate::certora::hooks::*, hook_macro::cvt_hook_end, nondet::nondet};
+use {crate::certora::hooks::*, hook_macro::cvlr_hook_on_exit as cvt_hook_end, nondet::nondet};
 
 use bytemuck::{Pod, Zeroable};
 use hypertree::{
@@ -286,7 +286,7 @@ impl MarketFixed {
     /** All fields are set to nondeterministic values except indexes to the tree **/
     pub fn new_nondet() -> Self {
         let claimed_seats_root_index = nondet();
-        cvt::cvt_assume!(claimed_seats_root_index == NIL);
+        cvt::cvt::cvt_assume!(claimed_seats_root_index == NIL);
         MarketFixed {
             discriminant: MARKET_FIXED_DISCRIMINANT,
             version: 0,
@@ -295,10 +295,10 @@ impl MarketFixed {
             base_vault_bump: nondet(),
             quote_vault_bump: nondet(),
             _padding1: [0; 3],
-            base_mint: nondet(),
-            quote_mint: nondet(),
-            base_vault: nondet(),
-            quote_vault: nondet(),
+            base_mint: solana_cvt::cvlr_nondet_pubkey(),
+            quote_mint: solana_cvt::cvlr_nondet_pubkey(),
+            base_vault: solana_cvt::cvlr_nondet_pubkey(),
+            quote_vault: solana_cvt::cvlr_nondet_pubkey(),
             order_sequence_number: nondet(),
             num_bytes_allocated: nondet(),
             bids_root_index: NIL,
@@ -429,7 +429,7 @@ pub use cvt_mock_types::*;
 impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
     DynamicAccount<Fixed, Dynamic>
 {
-    fn borrow_market(&self) -> MarketRef {
+    fn borrow_market(&self) -> MarketRef<'_> {
         MarketRef {
             fixed: self.fixed.deref_or_borrow(),
             dynamic: self.dynamic.deref_or_borrow(),
@@ -737,7 +737,7 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         claimed_seat.quote_volume
     }
 
-    pub fn get_bids(&self) -> BooksideReadOnly {
+    pub fn get_bids(&self) -> BooksideReadOnly<'_> {
         let DynamicAccount { dynamic, fixed } = self.borrow_market();
         BooksideReadOnly::new(
             dynamic,
@@ -746,7 +746,7 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         )
     }
 
-    pub fn get_asks(&self) -> BooksideReadOnly {
+    pub fn get_asks(&self) -> BooksideReadOnly<'_> {
         let DynamicAccount { dynamic, fixed } = self.borrow_market();
         BooksideReadOnly::new(
             dynamic,
@@ -832,7 +832,7 @@ impl<
         Dynamic: DerefOrBorrowMut<[u8]> + DerefOrBorrow<[u8]>,
     > DynamicAccount<Fixed, Dynamic>
 {
-    fn borrow_mut(&mut self) -> MarketRefMut {
+    fn borrow_mut(&mut self) -> MarketRefMut<'_> {
         MarketRefMut {
             fixed: self.fixed.deref_or_borrow_mut(),
             dynamic: self.dynamic.deref_or_borrow_mut(),
@@ -881,8 +881,8 @@ impl<
         // but let's check here that the assumption holds.
         #[cfg(feature = "certora")]
         {
-            cvt::cvt_assert!(claimed_seat.base_withdrawable_balance == BaseAtoms::new(0));
-            cvt::cvt_assert!(claimed_seat.quote_withdrawable_balance == QuoteAtoms::new(0));
+            cvt::cvt::cvt_assert!(claimed_seat.base_withdrawable_balance == BaseAtoms::new(0));
+            cvt::cvt::cvt_assert!(claimed_seat.quote_withdrawable_balance == QuoteAtoms::new(0));
         }
         fixed.claimed_seats_root_index = claimed_seats_tree.get_root_index();
 
@@ -1906,7 +1906,7 @@ pub fn create_empty_market(
 ) -> MarketFixed {
     // Values on the mints are not important.
     use solana_program::account_info::AccountInfo;
-    use spl_token_2022::state::Mint;
+    use spl_token_2022_interface::state::Mint;
     use std::{cell::RefCell, rc::Rc, str::FromStr};
     let mut lamports: u64 = 0;
     let base_mint: MintAccountInfo = MintAccountInfo {

@@ -39,7 +39,7 @@ pub struct TokenProgram<'a, 'info> {
 impl<'a, 'info> TokenProgram<'a, 'info> {
     pub fn new(info: &'a AccountInfo<'info>) -> Result<TokenProgram<'a, 'info>, ProgramError> {
         require!(
-            *info.key == spl_token::id() || *info.key == spl_token_2022::id(),
+            *info.key == spl_token_interface::id() || *info.key == spl_token_2022_interface::id(),
             ProgramError::IncorrectProgramId,
             "Incorrect token program id: {:?}",
             info.key

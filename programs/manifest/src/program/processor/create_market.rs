@@ -13,7 +13,7 @@ use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program_pack::Pack, pubkey::Pubkey,
     rent::Rent, sysvar::Sysvar,
 };
-use spl_token_2022::{
+use spl_token_2022_interface::{
     extension::{
         mint_close_authority::MintCloseAuthority, permanent_delegate::PermanentDelegate,
         BaseStateWithExtensions, ExtensionType, PodStateWithExtensions, StateWithExtensions,
@@ -49,7 +49,7 @@ pub(crate) fn process_create_market(
     )?;
 
     for mint in [base_mint.as_ref(), quote_mint.as_ref()] {
-        if *mint.owner == spl_token_2022::id() {
+        if *mint.owner == spl_token_2022_interface::id() {
             let mint_data: Ref<'_, &mut [u8]> = mint.data.borrow();
             let pool_mint: StateWithExtensions<'_, Mint> =
                 StateWithExtensions::<Mint>::unpack(&mint_data)?;
@@ -84,11 +84,11 @@ pub(crate) fn process_create_market(
             (quote_vault.as_ref(), quote_mint.as_ref()),
         ] {
             // We dont have to deserialize the mint, just check the owner.
-            let is_mint_22: bool = *mint.owner == spl_token_2022::id();
+            let is_mint_22: bool = *mint.owner == spl_token_2022_interface::id();
             let token_program_for_mint: Pubkey = if is_mint_22 {
-                spl_token_2022::id()
+                spl_token_2022_interface::id()
             } else {
-                spl_token::id()
+                spl_token_interface::id()
             };
 
             let (_vault_key, bump) = get_vault_address(market.key, mint.key);
@@ -119,7 +119,7 @@ pub(crate) fn process_create_market(
                     seeds,
                 )?;
                 invoke(
-                    &spl_token_2022::instruction::initialize_account3(
+                    &spl_token_2022_interface::instruction::initialize_account3(
                         &token_program_for_mint,
                         token_account.key,
                         mint.key,
@@ -133,7 +133,7 @@ pub(crate) fn process_create_market(
                     ],
                 )?;
             } else {
-                let space: usize = spl_token::state::Account::LEN;
+                let space: usize = spl_token_interface::state::Account::LEN;
                 create_account(
                     payer.as_ref(),
                     token_account,
@@ -144,7 +144,7 @@ pub(crate) fn process_create_market(
                     seeds,
                 )?;
                 invoke(
-                    &spl_token::instruction::initialize_account3(
+                    &spl_token_interface::instruction::initialize_account3(
                         &token_program_for_mint,
                         token_account.key,
                         mint.key,

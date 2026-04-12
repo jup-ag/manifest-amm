@@ -1,4 +1,4 @@
-use cvt::{cvt_assert, cvt_assume};
+use cvt::cvt::{cvt_assert, cvt_assume};
 use nondet::*;
 
 use crate::{

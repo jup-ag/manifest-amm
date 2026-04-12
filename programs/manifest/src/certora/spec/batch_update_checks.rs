@@ -1,7 +1,7 @@
 use certora::hooks::*;
-use cvt::{cvt_assert, cvt_assume};
+use cvt::cvt::{cvt_assert, cvt_assume, cvt_vacuity_check};
 use cvt_macros::rule;
-use nondet::{acc_infos_with_mem_layout, nondet};
+use nondet::nondet;
 use state::{main_ask_order_index, main_bid_order_index, main_trader_index};
 use std::cell::RefMut;
 use vectors::{cvt_no_resizable_vec, no_resizable_vec::NoResizableVec};
@@ -67,7 +67,7 @@ fn prepare_place_order<const IS_BID: bool>() -> PlaceOrderParams {
 pub fn rule_integrity_of_batch_update_cancel<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let used_acc_infos: &[AccountInfo] = &acc_infos[..3];
 
     // one cancel order without hint
@@ -100,7 +100,7 @@ macro_rules! get_order {
 pub fn rule_integrity_of_batch_update_cancel_hint<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let used_acc_infos: &[AccountInfo] = &acc_infos[..3];
     let market_info: &AccountInfo = &used_acc_infos[1];
 
@@ -135,7 +135,7 @@ pub fn rule_integrity_of_batch_update_cancel_hint<const IS_BID: bool>() {
 pub fn rule_integrity_of_batch_update_place_order<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = acc_infos_with_mem_layout!();
+    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
     let used_acc_infos: &[AccountInfo] = &acc_infos[..3];
 
     // no cancel orders
@@ -156,31 +156,31 @@ pub fn rule_integrity_of_batch_update_place_order<const IS_BID: bool>() {
 
 #[rule]
 pub fn rule_integrity_of_batch_update_cancel_bid() {
-    rule_integrity_of_batch_update_cancel::<true>()
+    rule_integrity_of_batch_update_cancel::<true>();
 }
 
 #[rule]
 #[inline(never)]
 pub fn rule_integrity_of_batch_update_cancel_ask() {
-    rule_integrity_of_batch_update_cancel::<false>()
+    rule_integrity_of_batch_update_cancel::<false>();
 }
 
 #[rule]
 fn rule_integrity_of_batch_update_cancel_hint_bid() {
-    rule_integrity_of_batch_update_cancel_hint::<true>()
+    rule_integrity_of_batch_update_cancel_hint::<true>();
 }
 
 #[rule]
 fn rule_integrity_of_batch_update_cancel_hint_ask() {
-    rule_integrity_of_batch_update_cancel_hint::<false>()
+    rule_integrity_of_batch_update_cancel_hint::<false>();
 }
 
 #[rule]
 fn rule_integrity_of_batch_update_place_order_bid() {
-    rule_integrity_of_batch_update_place_order::<true>()
+    rule_integrity_of_batch_update_place_order::<true>();
 }
 
 #[rule]
 fn rule_integrity_of_batch_update_place_order_ask() {
-    rule_integrity_of_batch_update_place_order::<false>()
+    rule_integrity_of_batch_update_place_order::<false>();
 }

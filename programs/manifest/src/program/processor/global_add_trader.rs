@@ -5,7 +5,7 @@ use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program_pack::Pack, pubkey::Pubkey,
     rent::Rent, sysvar::Sysvar,
 };
-use spl_token::state::Account;
+use spl_token_interface::state::Account;
 
 use crate::{
     logs::{emit_stack, GlobalAddTraderLog},

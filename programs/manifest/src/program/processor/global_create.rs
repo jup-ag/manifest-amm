@@ -13,7 +13,7 @@ use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, program_pack::Pack, pubkey::Pubkey,
     rent::Rent, system_instruction, sysvar::Sysvar,
 };
-use spl_token_2022::{
+use spl_token_2022_interface::{
     extension::{BaseStateWithExtensions, ExtensionType, PodStateWithExtensions},
     pod::PodMint,
     state::Account,
@@ -84,11 +84,11 @@ pub(crate) fn process_global_create(
         // Make the global vault.
         {
             // We dont have to deserialize the mint, just check the owner.
-            let is_mint_22: bool = *global_mint.info.owner == spl_token_2022::id();
+            let is_mint_22: bool = *global_mint.info.owner == spl_token_2022_interface::id();
             let token_program_for_mint: Pubkey = if is_mint_22 {
-                spl_token_2022::id()
+                spl_token_2022_interface::id()
             } else {
-                spl_token::id()
+                spl_token_interface::id()
             };
 
             let (expected_global_vault_key, global_vault_bump) =
@@ -121,8 +121,8 @@ pub(crate) fn process_global_create(
                     global_vault_seeds,
                 )?;
                 invoke(
-                    &spl_token_2022::instruction::initialize_account3(
-                        &spl_token_2022::id(),
+                    &spl_token_2022_interface::instruction::initialize_account3(
+                        &spl_token_2022_interface::id(),
                         global_vault.as_ref().key,
                         global_mint.info.key,
                         global_vault.as_ref().key,
@@ -135,7 +135,7 @@ pub(crate) fn process_global_create(
                     ],
                 )?;
             } else {
-                let space: usize = spl_token::state::Account::LEN;
+                let space: usize = spl_token_interface::state::Account::LEN;
                 create_account(
                     payer.as_ref(),
                     global_vault.info,
@@ -146,8 +146,8 @@ pub(crate) fn process_global_create(
                     global_vault_seeds,
                 )?;
                 invoke(
-                    &spl_token::instruction::initialize_account3(
-                        &spl_token::id(),
+                    &spl_token_interface::instruction::initialize_account3(
+                        &spl_token_interface::id(),
                         global_vault.as_ref().key,
                         global_mint.info.key,
                         global_vault.as_ref().key,

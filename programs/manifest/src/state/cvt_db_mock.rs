@@ -5,7 +5,7 @@ use hypertree::{get_helper, get_mut_helper, DataIndex, RBNode, NIL};
 use solana_program::pubkey::Pubkey;
 
 use crate::certora::utils::alloc_havoced;
-use cvt::{cvt_assert, cvt_assume};
+use cvt::cvt::{cvt_assert, cvt_assume};
 use nondet::nondet;
 
 const NUM_BLOCKS: usize = 10;

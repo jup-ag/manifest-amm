@@ -11,13 +11,13 @@ test = []
 hypertree = { path = "../lib" }
 bytemuck.workspace = true
 const-crypto = "0.3.0"
-solana-pubkey = { version = "2.3", features = ["curve25519"] }
-solana-program-error = "2.2"
+solana-pubkey = { version = ">=3", features = ["curve25519"] }
+solana-program-error = "3"
 thiserror = "2.0"
-spl-token-2022-interface = "1.0"
-spl-token-interface = "1.0"
-solana-account-info = "2.3"
-solana-sdk-ids = "2.2"
+spl-token-2022-interface = "2"
+spl-token-interface = "2"
+solana-account-info = "3"
+solana-sdk-ids = "3"
 
 [lints]
 workspace = true

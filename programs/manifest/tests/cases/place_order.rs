@@ -9,8 +9,9 @@ use manifest::{
     },
     validation::get_vault_address,
 };
+use solana_keypair::Keypair;
 use solana_program_test::tokio;
-use solana_sdk::signature::{Keypair, Signer};
+use solana_signer::Signer;
 
 use crate::{Side, TestFixture, Token, SOL_UNIT_SIZE, USDC_UNIT_SIZE};
 
@@ -598,7 +599,7 @@ async fn match_limit_orders_with_large_deposits_test() -> anyhow::Result<()> {
         .context
         .borrow_mut()
         .banks_client
-        .get_packed_account_data::<spl_token::state::Account>(vault_address_base)
+        .get_packed_account_data::<spl_token_interface::state::Account>(vault_address_base)
         .await
         .expect("base vault")
         .amount;
@@ -606,7 +607,7 @@ async fn match_limit_orders_with_large_deposits_test() -> anyhow::Result<()> {
         .context
         .borrow_mut()
         .banks_client
-        .get_packed_account_data::<spl_token::state::Account>(vault_address_quote)
+        .get_packed_account_data::<spl_token_interface::state::Account>(vault_address_quote)
         .await
         .expect("quote vault")
         .amount;

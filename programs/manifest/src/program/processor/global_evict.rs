@@ -79,9 +79,9 @@ pub(crate) fn process_global_evict(
         let (_, bump) = get_global_vault_address(mint.info.key);
 
         // Do the token transfer
-        if *global_vault.owner == spl_token_2022::id() {
+        if *global_vault.owner == spl_token_2022_interface::id() {
             invoke_signed(
-                &spl_token_2022::instruction::transfer_checked(
+                &spl_token_2022_interface::instruction::transfer_checked(
                     token_program.key,
                     global_vault.key,
                     mint.info.key,
@@ -101,7 +101,7 @@ pub(crate) fn process_global_evict(
             )?;
         } else {
             invoke_signed(
-                &spl_token::instruction::transfer(
+                &spl_token_interface::instruction::transfer(
                     token_program.key,
                     global_vault.key,
                     evictee_token.key,
@@ -143,9 +143,9 @@ pub(crate) fn process_global_evict(
         global_dynamic_account.deposit_global(payer.key, GlobalAtoms::new(amount_atoms))?;
 
         // Do the token transfer
-        if *global_vault.owner == spl_token_2022::id() {
+        if *global_vault.owner == spl_token_2022_interface::id() {
             invoke(
-                &spl_token_2022::instruction::transfer_checked(
+                &spl_token_2022_interface::instruction::transfer_checked(
                     token_program.key,
                     trader_token.key,
                     mint.info.key,
@@ -165,7 +165,7 @@ pub(crate) fn process_global_evict(
             )?;
         } else {
             invoke(
-                &spl_token::instruction::transfer(
+                &spl_token_interface::instruction::transfer(
                     token_program.key,
                     trader_token.key,
                     global_vault.key,

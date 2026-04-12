@@ -3,18 +3,20 @@ use std::cell::RefMut;
 use crate::{
     global_vault_seeds_with_bump,
     logs::{emit_stack, GlobalCleanupLog},
-    program::{batch_update::PlaceOrderParams, get_mut_dynamic_account, invoke},
+    program::get_mut_dynamic_account,
     quantities::{GlobalAtoms, WrapperU64},
     require,
     validation::{loaders::GlobalTradeAccounts, MintAccountInfo, TokenAccountInfo, TokenProgram},
 };
+#[cfg(not(feature = "certora"))]
+use crate::program::{batch_update::PlaceOrderParams, invoke};
 use hypertree::{DataIndex, NIL};
 #[cfg(not(feature = "no-clock"))]
 use solana_program::sysvar::Sysvar;
 use solana_program::{
     entrypoint::ProgramResult, program::invoke_signed, program_error::ProgramError, pubkey::Pubkey,
 };
-use spl_token_2022::{
+use spl_token_2022_interface::{
     extension::{
         transfer_fee::TransferFeeConfig, transfer_hook::TransferHook, BaseStateWithExtensions,
         StateWithExtensions,
@@ -134,6 +136,7 @@ pub(crate) fn try_to_add_to_global(
     global_dynamic_account.add_order(resting_order, gas_payer_opt.as_ref().unwrap().key)
 }
 
+#[cfg(not(feature = "certora"))]
 pub(crate) fn try_to_pay_all_global_gas_prepayment(
     orders: &Vec<PlaceOrderParams>,
     global_trade_accounts_opts: &[Option<GlobalTradeAccounts>; 2],
@@ -153,6 +156,7 @@ pub(crate) fn try_to_pay_all_global_gas_prepayment(
     Ok(())
 }
 
+#[cfg(not(feature = "certora"))]
 fn pay_global_gas_prepayment(
     global_trade_accounts: &GlobalTradeAccounts,
     num_gas_prepayments: u64,
@@ -287,7 +291,7 @@ pub(crate) fn try_to_move_global_tokens<'a, 'info>(
     let market_vault: &TokenAccountInfo<'a, 'info> = market_vault_opt.as_ref().unwrap();
     let token_program: &TokenProgram<'a, 'info> = token_program_opt.as_ref().unwrap();
 
-    if *token_program.key == spl_token_2022::id() {
+    if *token_program.key == spl_token_2022_interface::id() {
         require!(
             mint_opt.is_some(),
             crate::program::ManifestError::MissingGlobal,
@@ -314,7 +318,7 @@ pub(crate) fn try_to_move_global_tokens<'a, 'info>(
         }
 
         invoke_signed(
-            &spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022_interface::instruction::transfer_checked(
                 token_program.key,
                 global_vault.key,
                 mint_account_info.info.key,
@@ -334,7 +338,7 @@ pub(crate) fn try_to_move_global_tokens<'a, 'info>(
         )?;
     } else {
         invoke_signed(
-            &spl_token::instruction::transfer(
+            &spl_token_interface::instruction::transfer(
                 token_program.key,
                 global_vault.key,
                 market_vault.key,

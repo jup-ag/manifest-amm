@@ -459,7 +459,7 @@ mod test {
         tree.insert(TEST_BLOCK_WIDTH * 7, TestOrderBid::new(800));
     }
 
-    fn init_simple_tree(data: &mut [u8]) -> LLRB<TestOrderBid> {
+    fn init_simple_tree(data: &mut [u8]) -> LLRB<'_, TestOrderBid> {
         let mut tree: LLRB<TestOrderBid> = LLRB::new(data, NIL, NIL);
 
         for i in 1..12 {
@@ -702,8 +702,8 @@ mod test {
         let _tree1: LLRB<TestOrderBid> = init_simple_tree(&mut data1);
         let _tree2: LLRB<TestOrderBid> = init_simple_tree(&mut data2);
         assert_ne!(
-            get_helper::<RBNode<TestOrderBid>>(&mut data1, 1 * TEST_BLOCK_WIDTH),
-            get_helper::<RBNode<TestOrderBid>>(&mut data2, 2 * TEST_BLOCK_WIDTH)
+            get_helper::<RBNode<TestOrderBid>>(&data1, TEST_BLOCK_WIDTH),
+            get_helper::<RBNode<TestOrderBid>>(&data2, 2 * TEST_BLOCK_WIDTH)
         );
     }
 
@@ -725,7 +725,7 @@ mod test {
         let mut tree: LLRB<TestOrderBid> = LLRB::new(&mut data, NIL, NIL);
 
         tree.insert(TEST_BLOCK_WIDTH * 0, TestOrderBid::new(0));
-        tree.insert(TEST_BLOCK_WIDTH * 1, TestOrderBid::new(1064));
+        tree.insert(TEST_BLOCK_WIDTH, TestOrderBid::new(1064));
         tree.insert(TEST_BLOCK_WIDTH * 2, TestOrderBid::new(4128));
         tree.insert(TEST_BLOCK_WIDTH * 3, TestOrderBid::new(2192));
         tree.insert(TEST_BLOCK_WIDTH * 4, TestOrderBid::new(5256));
@@ -761,7 +761,7 @@ mod test {
     #[test]
     fn test_regression_1() {
         let mut data: [u8; 100000] = [0; 100000];
-        *get_mut_helper(&mut data, 1 * TEST_BLOCK_WIDTH) = RBNode {
+        *get_mut_helper(&mut data, TEST_BLOCK_WIDTH) = RBNode {
             left: NIL,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
@@ -771,7 +771,7 @@ mod test {
             value: TestOrderBid::new(1),
         };
         *get_mut_helper(&mut data, 2 * TEST_BLOCK_WIDTH) = RBNode {
-            left: 1 * TEST_BLOCK_WIDTH,
+            left: TEST_BLOCK_WIDTH,
             right: 4 * TEST_BLOCK_WIDTH,
             parent: 5 * TEST_BLOCK_WIDTH,
             color: Color::Red,
@@ -861,7 +861,7 @@ mod test {
     #[test]
     fn test_regression_2() {
         let mut data: [u8; 100000] = [0; 100000];
-        *get_mut_helper(&mut data, 1 * TEST_BLOCK_WIDTH) = RBNode {
+        *get_mut_helper(&mut data, TEST_BLOCK_WIDTH) = RBNode {
             left: NIL,
             right: NIL,
             parent: 2 * TEST_BLOCK_WIDTH,
@@ -871,7 +871,7 @@ mod test {
             value: TestOrderBid::new(1),
         };
         *get_mut_helper(&mut data, 2 * TEST_BLOCK_WIDTH) = RBNode {
-            left: 1 * TEST_BLOCK_WIDTH,
+            left: TEST_BLOCK_WIDTH,
             right: 4 * TEST_BLOCK_WIDTH,
             parent: 6 * TEST_BLOCK_WIDTH,
             color: Color::Red,
@@ -987,14 +987,14 @@ mod test {
         let mut data: [u8; 100000] = [0; 100000];
         *get_mut_helper(&mut data, 0 * TEST_BLOCK_WIDTH) = RBNode {
             left: 2 * TEST_BLOCK_WIDTH,
-            right: 1 * TEST_BLOCK_WIDTH,
+            right: TEST_BLOCK_WIDTH,
             parent: NIL,
             color: Color::Red,
             value: TestOrderAsk::new(0),
             payload_type: 0,
             _unused_padding: 0,
         };
-        *get_mut_helper(&mut data, 1 * TEST_BLOCK_WIDTH) = RBNode {
+        *get_mut_helper(&mut data, TEST_BLOCK_WIDTH) = RBNode {
             left: NIL,
             right: NIL,
             parent: 0 * TEST_BLOCK_WIDTH,
@@ -1031,7 +1031,7 @@ mod test {
             _unused_padding: 0,
         };
         let mut tree: LLRB<TestOrderAsk> =
-            LLRB::new(&mut data, 0 * TEST_BLOCK_WIDTH, 1 * TEST_BLOCK_WIDTH);
+            LLRB::new(&mut data, 0 * TEST_BLOCK_WIDTH, TEST_BLOCK_WIDTH);
         tree.verify_rb_tree::<TestOrderBid>();
 
         tree.insert(5 * TEST_BLOCK_WIDTH, TestOrderAsk::new(0));

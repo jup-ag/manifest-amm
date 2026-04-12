@@ -337,7 +337,7 @@ impl<'a, 'info> SwapContext<'a, 'info> {
         // Possibly includes base mint.
         if current_account_info_or
             .as_ref()
-            .is_ok_and(|f| *f.owner == spl_token::id() || *f.owner == spl_token_2022::id())
+            .is_ok_and(|f| *f.owner == spl_token_interface::id() || *f.owner == spl_token_2022_interface::id())
         {
             let current_account_info: &AccountInfo<'info> = current_account_info_or?;
             base_mint = Some(MintAccountInfo::new(current_account_info)?);
@@ -354,7 +354,7 @@ impl<'a, 'info> SwapContext<'a, 'info> {
         // Possibly includes quote token program.
         if current_account_info_or
             .as_ref()
-            .is_ok_and(|f| *f.key == spl_token::id() || *f.key == spl_token_2022::id())
+            .is_ok_and(|f| *f.key == spl_token_interface::id() || *f.key == spl_token_2022_interface::id())
         {
             let current_account_info: &AccountInfo<'info> = current_account_info_or?;
             token_program_quote = TokenProgram::new(current_account_info)?;
@@ -363,7 +363,7 @@ impl<'a, 'info> SwapContext<'a, 'info> {
         // Possibly includes quote mint if the quote token program was token22.
         if current_account_info_or
             .as_ref()
-            .is_ok_and(|f| *f.owner == spl_token::id() || *f.owner == spl_token_2022::id())
+            .is_ok_and(|f| *f.owner == spl_token_interface::id() || *f.owner == spl_token_2022_interface::id())
         {
             let current_account_info: &AccountInfo<'info> = current_account_info_or?;
             quote_mint = Some(MintAccountInfo::new(current_account_info)?);

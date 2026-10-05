@@ -27,4 +27,8 @@ pub struct GlobalTradeAccounts<'a, 'info> {
     pub gas_payer_opt: Option<Signer<'a, 'info>>,
     pub gas_receiver_opt: Option<Signer<'a, 'info>>,
     pub market: Pubkey,
+
+    /// The program refuses global -> market vault transfers for this mint (transfer fee or hook),
+    /// so its global orders are treated as unbacked.
+    pub global_transfer_blocked: bool,
 }

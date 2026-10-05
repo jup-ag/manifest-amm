@@ -33,7 +33,14 @@ pub(crate) fn can_back_order<'a, 'info>(
     let Some(global_trade_accounts) = global_trade_accounts_opt.as_ref() else {
         return false;
     };
-    let GlobalTradeAccounts { global, .. } = global_trade_accounts;
+    let GlobalTradeAccounts {
+        global,
+        global_transfer_blocked,
+        ..
+    } = global_trade_accounts;
+    if *global_transfer_blocked {
+        return false;
+    }
 
     let Ok(mut global_data_ref) = global.try_borrow_mut_data() else {
         // If the account data is already borrowed, conservatively disallow the back order.

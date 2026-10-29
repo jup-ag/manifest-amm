@@ -14,7 +14,7 @@ const-crypto = "0.3.0"
 solana-pubkey = { version = "4.2", features = ["curve25519"] }
 solana-program-error = "3"
 thiserror = "2.0"
-spl-token-2022-interface = "2.1.0"
+spl-token-2022-interface = "3.1.1"
 spl-token-interface = "2.0.0"
 solana-account-info = "3"
 solana-sdk-ids = "3"

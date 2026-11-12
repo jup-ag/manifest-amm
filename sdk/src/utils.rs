@@ -25,9 +25,13 @@ pub const fn get_discriminant<T: TypeName>() -> u64 {
     u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
 }
 
+/// Whether `resting_order_trader`'s global deposit can cover
+/// `desired_global_atoms` on top of `already_used_global_atoms`, the amount
+/// earlier fills in the same walk have already taken from it.
 pub(crate) fn can_back_order<'a, 'info>(
     global_trade_accounts_opt: &'a Option<GlobalTradeAccounts<'a, 'info>>,
     resting_order_trader: &Pubkey,
+    already_used_global_atoms: GlobalAtoms,
     desired_global_atoms: GlobalAtoms,
 ) -> bool {
     let Some(global_trade_accounts) = global_trade_accounts_opt.as_ref() else {
@@ -51,7 +55,9 @@ pub(crate) fn can_back_order<'a, 'info>(
 
     let num_deposited_atoms: GlobalAtoms =
         global_dynamic_account.get_balance_atoms(resting_order_trader);
-    desired_global_atoms <= num_deposited_atoms
+    already_used_global_atoms
+        .checked_add(desired_global_atoms)
+        .is_ok_and(|total_global_atoms| total_global_atoms <= num_deposited_atoms)
 }
 
 /// Generic get mutable dynamic account from the data bytes of the account.

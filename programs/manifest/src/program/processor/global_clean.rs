@@ -1,14 +1,19 @@
-use std::cell::RefMut;
+use crate::validation::{io_to_program_error, AccountViewExt};
+use pinocchio::{account::RefMut, ProgramResult};
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use hypertree::{get_helper, trace, DataIndex, RBNode};
-use solana_program::{account_info::AccountInfo, entrypoint::ProgramResult, pubkey::Pubkey};
+use pinocchio::account::AccountView;
+use solana_program::pubkey::Pubkey;
 
 use crate::{
     program::{batch_update::MarketDataTreeNodeType, get_mut_dynamic_account},
     quantities::{GlobalAtoms, WrapperU64},
     require,
-    state::{utils::get_now_slot, GlobalRefMut, MarketRefMut, RestingOrder, MARKET_BLOCK_SIZE},
+    state::{
+        utils::{get_now_slot, settle_global_gas_refunds},
+        GlobalRefMut, MarketRefMut, RestingOrder, MARKET_BLOCK_SIZE,
+    },
     validation::loaders::{GlobalCleanContext, GlobalTradeAccounts},
 };
 
@@ -25,10 +30,10 @@ impl GlobalCleanParams {
 
 pub(crate) fn process_global_clean(
     _program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
-    trace!("process_global_clean accs={accounts:?}");
+    trace!("process_global_clean accs={}", accounts.len());
     let global_clean_context: GlobalCleanContext = GlobalCleanContext::load(accounts)?;
 
     let GlobalCleanContext {
@@ -38,6 +43,17 @@ pub(crate) fn process_global_clean(
         system_program,
     } = global_clean_context;
 
+    // Collector only, the same key defrag requires. Cleaning an unbacked
+    // global order pays that order's gas deposit to whoever calls, so leaving
+    // it permissionless made book maintenance a race for that deposit. The
+    // collector now owns this the way it owns defrag, and the deposit funds
+    // the same operator doing the work.
+    require!(
+        *payer.pubkey() == super::defrag::DEFRAG_COLLECTOR,
+        pinocchio::error::ProgramError::InvalidArgument,
+        "Invalid collector"
+    )?;
+
     let global_trade_accounts: GlobalTradeAccounts = GlobalTradeAccounts {
         mint_opt: None,
         global: global.clone(),
@@ -45,17 +61,20 @@ pub(crate) fn process_global_clean(
         market_vault_opt: None,
         token_program_opt: None,
         system_program: Some(system_program),
-        market: *market.key,
+        market: *market.pubkey(),
         gas_payer_opt: None,
         gas_receiver_opt: Some(payer),
+        gas_refund_market_opt: None,
+        num_deferred_gas_refunds: std::cell::Cell::new(0),
     };
 
-    let GlobalCleanParams { order_index } = GlobalCleanParams::try_from_slice(data)?;
+    let GlobalCleanParams { order_index } =
+        GlobalCleanParams::try_from_slice(data).map_err(io_to_program_error)?;
 
-    let market_data: &mut RefMut<&mut [u8]> = &mut market.try_borrow_mut_data()?;
+    let market_data: &mut RefMut<[u8]> = &mut market.try_borrow_mut()?;
     let mut market_dynamic_account: MarketRefMut = get_mut_dynamic_account(market_data);
 
-    let global_data: &mut RefMut<&mut [u8]> = &mut global.try_borrow_mut_data()?;
+    let global_data: &mut RefMut<[u8]> = &mut global.try_borrow_mut()?;
     let global_dynamic_account: GlobalRefMut = get_mut_dynamic_account(global_data);
 
     // Get the resting order and do some checks to make sure the order index is
@@ -66,6 +85,17 @@ pub(crate) fn process_global_clean(
             order_index % (MARKET_BLOCK_SIZE as DataIndex) == 0,
             crate::program::ManifestError::WrongIndexHintParams,
             "Invalid order index {}",
+            order_index,
+        )?;
+        // Defrag can shrink the market, so an index from before it can point
+        // past the end of the account. Reject it rather than panic on the
+        // slice.
+        require!(
+            (order_index as usize)
+                .checked_add(MARKET_BLOCK_SIZE)
+                .is_some_and(|end| end <= market_dynamic_account.dynamic.len()),
+            crate::program::ManifestError::WrongIndexHintParams,
+            "Invalid order index {} is out of bounds",
             order_index,
         )?;
         let resting_order_node: &RBNode<RestingOrder> =
@@ -104,18 +134,13 @@ pub(crate) fn process_global_clean(
     let is_expired: bool = resting_order.is_expired(get_now_slot());
     // Balance is zero when evicted.
     let maker_global_balance: GlobalAtoms = global_dynamic_account.get_balance_atoms(maker);
-    let required_global_atoms: u64 = if resting_order.get_is_bid() {
-        resting_order
-            .get_num_base_atoms()
-            .checked_mul(resting_order.get_price(), false)
-            .unwrap()
-            .as_u64()
-    } else {
-        resting_order.get_num_base_atoms().as_u64()
-    };
+    let required_global_atoms: Option<u64> = required_global_atoms(&resting_order);
 
     require!(
-        is_expired || maker_global_balance.as_u64() < required_global_atoms,
+        is_expired
+            || (resting_order.is_global()
+                && required_global_atoms
+                    .map_or(true, |required| maker_global_balance.as_u64() < required)),
         crate::program::ManifestError::InvalidClean,
         "Ineligible clean order index {}",
         order_index,
@@ -137,5 +162,45 @@ pub(crate) fn process_global_clean(
     // tracks unclaimed gas deposits for informational purposes and this is
     // claiming anyways.
 
+    // Pay the gas prepayment refund to the cleaner.
+    settle_global_gas_refunds(&global_trade_accounts)?;
+
     Ok(())
+}
+
+fn required_global_atoms(resting_order: &RestingOrder) -> Option<u64> {
+    if resting_order.get_is_bid() {
+        resting_order
+            .get_num_base_atoms()
+            .checked_mul(resting_order.get_price(), true)
+            .ok()
+            .map(|atoms| atoms.as_u64())
+    } else {
+        Some(resting_order.get_num_base_atoms().as_u64())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        quantities::{BaseAtoms, QuoteAtomsPerBaseAtom},
+        state::{OrderType, NO_EXPIRATION_LAST_VALID_SLOT},
+    };
+
+    #[test]
+    fn historical_oversized_global_bid_is_clean_eligible_without_panicking() {
+        let order = RestingOrder::new(
+            0,
+            BaseAtoms::new(u64::MAX),
+            QuoteAtomsPerBaseAtom::MAX,
+            0,
+            NO_EXPIRATION_LAST_VALID_SLOT,
+            true,
+            OrderType::Global,
+        )
+        .unwrap();
+
+        assert_eq!(required_global_atoms(&order), None);
+    }
 }

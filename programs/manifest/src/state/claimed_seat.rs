@@ -49,7 +49,7 @@ impl ClaimedSeat {
 impl nondet::Nondet for ClaimedSeat {
     fn nondet() -> Self {
         ClaimedSeat {
-            trader: solana_cvt::cvlr_nondet_pubkey(),
+            trader: Pubkey::new_from_array(nondet::nondet()),
             base_withdrawable_balance: BaseAtoms::new(nondet::nondet()),
             quote_withdrawable_balance: QuoteAtoms::new(nondet::nondet()),
             quote_volume: QuoteAtoms::new(nondet::nondet()),
@@ -60,7 +60,7 @@ impl nondet::Nondet for ClaimedSeat {
 
 impl Ord for ClaimedSeat {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.trader).cmp(&(other.trader))
+        super::utils::compare_trader_keys(&self.trader, &other.trader)
     }
 }
 
@@ -87,5 +87,5 @@ impl std::fmt::Display for ClaimedSeat {
 #[test]
 fn test_display() {
     let claimed_seat: ClaimedSeat = ClaimedSeat::new_empty(Pubkey::default());
-    format!("{}", claimed_seat);
+    let _ = format!("{}", claimed_seat);
 }

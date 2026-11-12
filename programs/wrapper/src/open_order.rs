@@ -77,6 +77,10 @@ impl WrapperOpenOrder {
     }
 
     /// Get the DataIndex for the order in the core program.
+    pub fn set_market_data_index(&mut self, index: DataIndex) {
+        self.market_data_index = index;
+    }
+
     pub fn get_market_data_index(&self) -> DataIndex {
         self.market_data_index
     }
@@ -87,6 +91,9 @@ impl WrapperOpenOrder {
     }
 
     /// Get client defined order id for the order.
+    pub fn get_order_type(&self) -> OrderType {
+        self.order_type
+    }
     pub fn get_client_order_id(&self) -> u64 {
         self.client_order_id
     }
@@ -145,7 +152,7 @@ fn test_display() {
         false,
         OrderType::Limit,
     );
-    format!("{}", open_order);
+    let _ = format!("{}", open_order);
 }
 
 #[test]

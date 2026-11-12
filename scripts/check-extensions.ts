@@ -1,0 +1,707 @@
+import { AccountInfo, Connection, PublicKey } from '@solana/web3.js';
+import { ManifestClient } from '../client/ts/src/client';
+import { Market } from '../client/ts/src/market';
+
+const TOKEN_2022_PROGRAM_ID = new PublicKey(
+  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+);
+
+// Extension type discriminators (first byte of each extension in the TLV data)
+enum ExtensionType {
+  TransferFeeConfig = 1,
+  TransferFeeAmount = 2,
+  MintCloseAuthority = 3,
+  ConfidentialTransferMint = 4,
+  ConfidentialTransferAccount = 5,
+  DefaultAccountState = 6,
+  ImmutableOwner = 7,
+  MemoTransfer = 8,
+  NonTransferable = 9,
+  InterestBearingConfig = 10,
+  CpiGuard = 11,
+  PermanentDelegate = 12,
+  NonTransferableAccount = 13,
+  TransferHook = 14,
+  TransferHookAccount = 15,
+  MetadataPointer = 18,
+  TokenMetadata = 19,
+  GroupPointer = 20,
+  GroupMemberPointer = 22,
+  ConfidentialTransferFee = 24,
+  ScaledUiAmountConfig = 29,
+}
+
+interface MarketMintInfo {
+  marketAddress: string;
+  baseMint: string;
+  quoteMint: string;
+}
+
+interface ExtensionInfo {
+  mint: string;
+  isToken2022: boolean;
+  hasTransferFee: boolean;
+  hasNonZeroTransferFee: boolean;
+  hasMutableTransferFee: boolean;
+  hasPermanentDelegate: boolean;
+  hasTransferHook: boolean;
+  hasCpiGuard: boolean;
+  hasMintCloseAuthority: boolean;
+  hasNonTransferable: boolean;
+  hasInterestBearing: boolean;
+  hasConfidentialTransfer: boolean;
+  hasDefaultAccountState: boolean;
+  hasMetadataPointer: boolean;
+  hasTokenMetadata: boolean;
+  hasGroupPointer: boolean;
+  hasGroupMemberPointer: boolean;
+  hasScaledUiAmount: boolean;
+  transferFeeBps: number | null;
+  maxTransferFeeBps: number | null;
+  transferFeeAuthority: string | null;
+  permanentDelegate: string | null;
+  transferHookProgramId: string | null;
+}
+
+function parseExtensionsFromAccountData(data: Buffer): {
+  extensions: Set<number>;
+  transferFeeBps: number | null;
+  maxFee: bigint | null;
+  transferFeeAuthority: string | null;
+  permanentDelegate: string | null;
+  transferHookProgramId: string | null;
+} {
+  const extensions = new Set<number>();
+  let transferFeeBps: number | null = null;
+  let maxFee: bigint | null = null;
+  let transferFeeAuthority: string | null = null;
+  let permanentDelegate: string | null = null;
+  let transferHookProgramId: string | null = null;
+
+  // Token-2022 mint layout:
+  //   Bytes 0-81:   Base Mint data (82 bytes)
+  //   Bytes 82-164: Padding (83 zero bytes to match Account struct size)
+  //   Byte 165:     AccountType (1 = Mint)
+  //   Bytes 166+:   TLV extension entries
+  //
+  // Each TLV entry: 2 bytes type (u16 LE) + 2 bytes length (u16 LE) + N bytes data
+
+  if (data.length <= 166) {
+    return {
+      extensions,
+      transferFeeBps,
+      maxFee,
+      transferFeeAuthority,
+      permanentDelegate,
+      transferHookProgramId,
+    };
+  }
+
+  let offset = 166; // Skip base mint (82) + padding (83) + account type (1)
+
+  while (offset + 4 <= data.length) {
+    const extType = data.readUInt16LE(offset);
+    const extLen = data.readUInt16LE(offset + 2);
+    offset += 4;
+
+    if (extType === 0 && extLen === 0) break; // End sentinel
+    if (offset + extLen > data.length) break; // Malformed
+
+    extensions.add(extType);
+
+    // Parse TransferFeeConfig details
+    if (extType === ExtensionType.TransferFeeConfig && extLen >= 108) {
+      // TransferFeeConfig layout (108 bytes):
+      //   transfer_fee_config_authority: OptionalNonZeroPubkey (32 bytes)
+      //   withdraw_withheld_authority:   OptionalNonZeroPubkey (32 bytes)
+      //   withheld_amount:               u64 (8 bytes)
+      //   older_transfer_fee:            TransferFee (18 bytes)
+      //     epoch: u64 (8), maximum_fee: u64 (8), transfer_fee_basis_points: u16 (2)
+      //   newer_transfer_fee:            TransferFee (18 bytes)
+
+      const extData = data.subarray(offset, offset + extLen);
+
+      // transfer_fee_config_authority at offset 0 (32 bytes, zeros = None)
+      const authorityPk = new PublicKey(extData.subarray(0, 32));
+      if (!authorityPk.equals(PublicKey.default)) {
+        transferFeeAuthority = authorityPk.toBase58();
+      }
+
+      // newer_transfer_fee starts at offset 90 (32+32+8+18 = 90)
+      const newerOffset = 90;
+      if (extData.length >= newerOffset + 18) {
+        // epoch at +0, maximum_fee at +8, basis_points at +16
+        maxFee = extData.readBigUInt64LE(newerOffset + 8);
+        transferFeeBps = extData.readUInt16LE(newerOffset + 16);
+      } else {
+        // Fall back to older at offset 72
+        const olderOffset = 72;
+        if (extData.length >= olderOffset + 18) {
+          maxFee = extData.readBigUInt64LE(olderOffset + 8);
+          transferFeeBps = extData.readUInt16LE(olderOffset + 16);
+        }
+      }
+    }
+
+    // Parse PermanentDelegate
+    if (extType === ExtensionType.PermanentDelegate && extLen >= 32) {
+      const delegate = new PublicKey(data.subarray(offset, offset + 32));
+      if (!delegate.equals(PublicKey.default)) {
+        permanentDelegate = delegate.toBase58();
+      }
+    }
+
+    // Parse TransferHook
+    if (extType === ExtensionType.TransferHook && extLen >= 64) {
+      // TransferHook layout (64 bytes):
+      //   authority:   OptionalNonZeroPubkey (32 bytes)
+      //   program_id:  Pubkey (32 bytes)
+      const hookProgramId = new PublicKey(
+        data.subarray(offset + 32, offset + 64),
+      );
+      if (!hookProgramId.equals(PublicKey.default)) {
+        transferHookProgramId = hookProgramId.toBase58();
+      }
+    }
+
+    offset += extLen;
+  }
+
+  return {
+    extensions,
+    transferFeeBps,
+    maxFee,
+    transferFeeAuthority,
+    permanentDelegate,
+    transferHookProgramId,
+  };
+}
+
+// Discord rejects any webhook payload whose content exceeds 2000 characters
+// with a bare 400, so long reports have to be split before sending.
+const DISCORD_CONTENT_LIMIT: number = 2000;
+const DISCORD_MAX_ATTEMPTS: number = 3;
+
+function splitDiscordMessage(content: string): string[] {
+  const chunks: string[] = [];
+  let current: string = '';
+
+  for (const line of content.split('\n')) {
+    // A single line longer than the limit cannot be kept intact; hard split it.
+    if (line.length > DISCORD_CONTENT_LIMIT) {
+      if (current.length > 0) {
+        chunks.push(current);
+        current = '';
+      }
+      for (let i = 0; i < line.length; i += DISCORD_CONTENT_LIMIT) {
+        chunks.push(line.slice(i, i + DISCORD_CONTENT_LIMIT));
+      }
+      continue;
+    }
+
+    const candidate: string =
+      current.length === 0 ? line : `${current}\n${line}`;
+    if (candidate.length > DISCORD_CONTENT_LIMIT) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = candidate;
+    }
+  }
+
+  if (current.trim().length > 0) {
+    chunks.push(current);
+  }
+  return chunks;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function postDiscordChunk(
+  webhookUrl: string,
+  content: string,
+  label: string,
+): Promise<void> {
+  let lastError: string = '';
+
+  for (let attempt: number = 1; attempt <= DISCORD_MAX_ATTEMPTS; attempt++) {
+    let response: Response;
+    try {
+      response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
+      });
+    } catch (error) {
+      lastError = `network error: ${(error as Error).message}`;
+      console.error(
+        `Discord ${label} attempt ${attempt}/${DISCORD_MAX_ATTEMPTS} failed: ${lastError}`,
+      );
+      await sleep(1000 * attempt);
+      continue;
+    }
+
+    if (response.ok) {
+      return;
+    }
+
+    // The body carries Discord's actual complaint (error code, offending
+    // field); the status line alone is not enough to debug a 400.
+    let body: string = '';
+    try {
+      body = await response.text();
+    } catch (error) {
+      body = `<unreadable body: ${(error as Error).message}>`;
+    }
+
+    lastError =
+      `${response.status} ${response.statusText} ` +
+      `(${label}, ${content.length} chars) body: ${body.slice(0, 1000)}`;
+    console.error(
+      `Discord ${label} attempt ${attempt}/${DISCORD_MAX_ATTEMPTS} failed: ${lastError}`,
+    );
+
+    // 4xx other than rate limiting will not succeed on a retry.
+    if (
+      response.status !== 429 &&
+      response.status >= 400 &&
+      response.status < 500
+    ) {
+      throw new Error(`Failed to send Discord message: ${lastError}`);
+    }
+
+    let delayMs: number = 1000 * attempt;
+    if (response.status === 429) {
+      const retryAfter: number = Number(response.headers.get('retry-after'));
+      if (Number.isFinite(retryAfter) && retryAfter > 0) {
+        delayMs = retryAfter * 1000;
+      }
+    }
+    await sleep(delayMs);
+  }
+
+  throw new Error(
+    `Failed to send Discord message after ${DISCORD_MAX_ATTEMPTS} attempts: ${lastError}`,
+  );
+}
+
+async function sendDiscordMessage(
+  webhookUrl: string,
+  content: string,
+): Promise<void> {
+  const chunks: string[] = splitDiscordMessage(content);
+  for (let i = 0; i < chunks.length; i++) {
+    await postDiscordChunk(
+      webhookUrl,
+      chunks[i],
+      `chunk ${i + 1}/${chunks.length}`,
+    );
+  }
+}
+
+async function main(): Promise<void> {
+  const rpcUrl: string | undefined = process.env.RPC_URL || process.argv[2];
+  const discordWebhookUrl: string | undefined = process.env.DISCORD_WEBHOOK_URL;
+
+  if (!rpcUrl) {
+    console.error(
+      'Usage: RPC_URL=<url> npx ts-node check-extensions.ts or npx ts-node check-extensions.ts <RPC_URL>',
+    );
+    process.exit(1);
+  }
+
+  const connection = new Connection(rpcUrl, { commitment: 'confirmed' });
+
+  // Fetch all markets directly from chain
+  console.log('Fetching all market program accounts from chain...');
+  const marketAccounts =
+    await ManifestClient.getMarketProgramAccounts(connection);
+  console.log(`Found ${marketAccounts.length} markets`);
+
+  // Extract unique mints from all markets
+  const mints = new Set<string>();
+  const marketMintInfo: MarketMintInfo[] = [];
+  const unparsedMarkets: string[] = [];
+
+  for (const account of marketAccounts) {
+    try {
+      const market = Market.loadFromBuffer({
+        buffer: account.account.data,
+        address: account.pubkey,
+      });
+      const baseMint = market.baseMint().toBase58();
+      const quoteMint = market.quoteMint().toBase58();
+      mints.add(baseMint);
+      mints.add(quoteMint);
+      marketMintInfo.push({
+        marketAddress: account.pubkey.toBase58(),
+        baseMint,
+        quoteMint,
+      });
+    } catch (e) {
+      console.error(`Failed to parse market ${account.pubkey.toBase58()}`);
+      unparsedMarkets.push(account.pubkey.toBase58());
+    }
+  }
+  console.log(
+    `Found ${mints.size} unique mints across ${marketMintInfo.length} markets`,
+  );
+
+  // Batch using getMultipleAccountsInfo for efficiency
+  const mintList = [...mints];
+  const BATCH_SIZE: number = 100;
+  const accountMap: Map<string, AccountInfo<Buffer> | null> = new Map();
+
+  console.log(`Fetching account data in batches of ${BATCH_SIZE}...`);
+  for (let i = 0; i < mintList.length; i += BATCH_SIZE) {
+    const batch = mintList.slice(i, i + BATCH_SIZE);
+    const pubkeys = batch.map((m) => new PublicKey(m));
+    const accounts = await connection.getMultipleAccountsInfo(pubkeys);
+    for (let j = 0; j < batch.length; j++) {
+      accountMap.set(batch[j], accounts[j]);
+    }
+    const progress = Math.min(i + BATCH_SIZE, mintList.length);
+    process.stderr.write(`\r  ${progress}/${mintList.length} mints fetched`);
+  }
+  process.stderr.write('\n');
+
+  // A null from getMultipleAccountsInfo means the account does not exist at
+  // the queried slot, not that the RPC call failed (failures throw). Mints
+  // closed by their issuer via the Token-2022 mint close authority (e.g.
+  // EmE2GsWHXivLZTqVosJkx9BPmisDtMmzYmtnAZpEb7Wn, base mint of market
+  // 9idCkxF7BZsQuSK6TURYbMK3xh6z9DTdQAmzSBESG2wd) stay null forever, so they
+  // are reported separately and must not fail the run. Each null is
+  // re-checked individually so a transient RPC gap still counts as missing.
+  const closedMints: string[] = [];
+  const missingMints: string[] = [];
+  for (const mint of mintList) {
+    if (accountMap.get(mint)) {
+      continue;
+    }
+    try {
+      const recheck: AccountInfo<Buffer> | null =
+        await connection.getAccountInfo(new PublicKey(mint));
+      if (recheck) {
+        accountMap.set(mint, recheck);
+      } else {
+        console.error(
+          `Mint ${mint} does not exist on chain; it was likely closed by its issuer`,
+        );
+        closedMints.push(mint);
+      }
+    } catch (error) {
+      console.error(
+        `Mint ${mint} could not be fetched: ${(error as Error).message}`,
+      );
+      missingMints.push(mint);
+    }
+  }
+
+  // Analyze each mint
+  const results: ExtensionInfo[] = [];
+  for (const mint of mintList) {
+    const accountInfo: AccountInfo<Buffer> | null | undefined =
+      accountMap.get(mint);
+    const info: ExtensionInfo = {
+      mint,
+      isToken2022: false,
+      hasTransferFee: false,
+      hasNonZeroTransferFee: false,
+      hasMutableTransferFee: false,
+      hasPermanentDelegate: false,
+      hasTransferHook: false,
+      hasCpiGuard: false,
+      hasMintCloseAuthority: false,
+      hasNonTransferable: false,
+      hasInterestBearing: false,
+      hasConfidentialTransfer: false,
+      hasDefaultAccountState: false,
+      hasMetadataPointer: false,
+      hasTokenMetadata: false,
+      hasGroupPointer: false,
+      hasGroupMemberPointer: false,
+      hasScaledUiAmount: false,
+      transferFeeBps: null,
+      maxTransferFeeBps: null,
+      transferFeeAuthority: null,
+      permanentDelegate: null,
+      transferHookProgramId: null,
+    };
+
+    if (!accountInfo) {
+      // Already classified as closed or missing in the verification pass.
+      continue;
+    }
+
+    if (accountInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+      info.isToken2022 = true;
+      const data = Buffer.from(accountInfo.data);
+      const parsed = parseExtensionsFromAccountData(data);
+
+      info.hasTransferFee = parsed.extensions.has(
+        ExtensionType.TransferFeeConfig,
+      );
+      info.hasMintCloseAuthority = parsed.extensions.has(
+        ExtensionType.MintCloseAuthority,
+      );
+      info.hasNonTransferable = parsed.extensions.has(
+        ExtensionType.NonTransferable,
+      );
+      info.hasCpiGuard = parsed.extensions.has(ExtensionType.CpiGuard);
+      info.hasPermanentDelegate = parsed.extensions.has(
+        ExtensionType.PermanentDelegate,
+      );
+      info.hasTransferHook = parsed.extensions.has(ExtensionType.TransferHook);
+      info.hasInterestBearing = parsed.extensions.has(
+        ExtensionType.InterestBearingConfig,
+      );
+      info.hasConfidentialTransfer = parsed.extensions.has(
+        ExtensionType.ConfidentialTransferMint,
+      );
+      info.hasDefaultAccountState = parsed.extensions.has(
+        ExtensionType.DefaultAccountState,
+      );
+      info.hasMetadataPointer = parsed.extensions.has(
+        ExtensionType.MetadataPointer,
+      );
+      info.hasTokenMetadata = parsed.extensions.has(
+        ExtensionType.TokenMetadata,
+      );
+      info.hasGroupPointer = parsed.extensions.has(ExtensionType.GroupPointer);
+      info.hasGroupMemberPointer = parsed.extensions.has(
+        ExtensionType.GroupMemberPointer,
+      );
+      info.hasScaledUiAmount = parsed.extensions.has(
+        ExtensionType.ScaledUiAmountConfig,
+      );
+
+      if (info.hasTransferFee) {
+        info.transferFeeBps = parsed.transferFeeBps;
+        info.hasNonZeroTransferFee = (parsed.transferFeeBps ?? 0) > 0;
+        info.transferFeeAuthority = parsed.transferFeeAuthority;
+        info.hasMutableTransferFee = parsed.transferFeeAuthority !== null;
+        if (parsed.maxFee !== null) {
+          info.maxTransferFeeBps = Number(parsed.maxFee);
+        }
+      }
+      if (info.hasPermanentDelegate) {
+        info.permanentDelegate = parsed.permanentDelegate;
+      }
+      if (info.hasTransferHook) {
+        info.transferHookProgramId = parsed.transferHookProgramId;
+      }
+    }
+
+    results.push(info);
+  }
+
+  // Output results
+  const token2022Mints = results.filter((r) => r.isToken2022);
+  const splTokenMints = results.filter((r) => !r.isToken2022);
+
+  console.log(`\n${'='.repeat(120)}`);
+  console.log(
+    `RESULTS: ${token2022Mints.length} Token-2022 mints, ${splTokenMints.length} SPL Token mints`,
+  );
+  if (unparsedMarkets.length > 0 || missingMints.length > 0) {
+    console.error(
+      `INCOMPLETE: ${unparsedMarkets.length} unparseable market(s), ${missingMints.length} missing mint account(s)`,
+    );
+    for (const market of unparsedMarkets) {
+      console.error(`  Unparseable market: ${market}`);
+    }
+    for (const mint of missingMints) {
+      console.error(`  Missing mint: ${mint}`);
+    }
+  }
+  if (closedMints.length > 0) {
+    console.log(
+      `CLOSED MINTS (closed by their issuer, informational): ${closedMints.length}`,
+    );
+    for (const mint of closedMints) {
+      const markets: string[] = marketMintInfo
+        .filter((m) => m.baseMint === mint || m.quoteMint === mint)
+        .map((m) => m.marketAddress);
+      console.log(`  ${mint} (markets: ${markets.join(', ')})`);
+    }
+  }
+  console.log(`${'='.repeat(120)}\n`);
+
+  // Print Token-2022 mints table
+  if (token2022Mints.length > 0) {
+    console.log('TOKEN-2022 MINTS:');
+    console.log('-'.repeat(160));
+    const header = [
+      'Mint'.padEnd(46),
+      'XferFee',
+      'NonZero',
+      'Mutable',
+      'PermDlg',
+      'XferHook',
+      'CpiGrd',
+      'CloseAuth',
+      'NonXfer',
+      'Fee(bps)',
+      'Details',
+    ].join(' | ');
+    console.log(header);
+    console.log('-'.repeat(160));
+
+    for (const r of token2022Mints) {
+      const yn = (b: boolean) => (b ? '  YES ' : '  no  ');
+      const details: string[] = [];
+      if (r.transferFeeBps !== null) details.push(`fee=${r.transferFeeBps}bps`);
+      if (r.transferFeeAuthority)
+        details.push(`feeAuth=${r.transferFeeAuthority.slice(0, 8)}..`);
+      if (r.permanentDelegate)
+        details.push(`delegate=${r.permanentDelegate.slice(0, 8)}..`);
+      if (r.transferHookProgramId)
+        details.push(`hook=${r.transferHookProgramId.slice(0, 8)}..`);
+
+      const row = [
+        r.mint.padEnd(46),
+        yn(r.hasTransferFee),
+        yn(r.hasNonZeroTransferFee),
+        yn(r.hasMutableTransferFee),
+        yn(r.hasPermanentDelegate),
+        yn(r.hasTransferHook),
+        yn(r.hasCpiGuard),
+        yn(r.hasMintCloseAuthority),
+        yn(r.hasNonTransferable),
+        r.transferFeeBps !== null
+          ? String(r.transferFeeBps).padStart(8)
+          : '     n/a',
+        details.join(', '),
+      ].join(' | ');
+      console.log(row);
+    }
+    console.log('-'.repeat(160));
+  }
+
+  // Summary of concerning extensions
+  console.log('\n--- SUMMARY OF CONCERNING EXTENSIONS ---');
+  const withFees = token2022Mints.filter((r) => r.hasNonZeroTransferFee);
+  const withHooks = token2022Mints.filter(
+    (r) => r.hasTransferHook && r.transferHookProgramId,
+  );
+  const withDelegate = token2022Mints.filter(
+    (r) => r.hasPermanentDelegate && r.permanentDelegate,
+  );
+  const withNonTransferable = token2022Mints.filter(
+    (r) => r.hasNonTransferable,
+  );
+
+  console.log(`\nMints with non-zero transfer fees (${withFees.length}):`);
+  for (const r of withFees) {
+    console.log(
+      `  ${r.mint} - ${r.transferFeeBps} bps, mutable=${r.hasMutableTransferFee}`,
+    );
+  }
+
+  console.log(`\nMints with active transfer hooks (${withHooks.length}):`);
+  for (const r of withHooks) {
+    console.log(`  ${r.mint} - hook program: ${r.transferHookProgramId}`);
+  }
+
+  console.log(`\nMints with permanent delegate (${withDelegate.length}):`);
+  for (const r of withDelegate) {
+    console.log(`  ${r.mint} - delegate: ${r.permanentDelegate}`);
+  }
+
+  console.log(`\nNon-transferable mints (${withNonTransferable.length}):`);
+  for (const r of withNonTransferable) console.log(`  ${r.mint}`);
+
+  // Also output JSON for further processing
+  const jsonOut = JSON.stringify(results, null, 2);
+  const fs = await import('fs');
+  fs.writeFileSync('extension-results.json', jsonOut);
+  console.log(`\nFull results written to extension-results.json`);
+
+  // Send Discord notification if webhook URL is configured
+  if (discordWebhookUrl) {
+    let message = `**Token Extensions Check Report**\n`;
+    message += `Checked ${mints.size} unique mints across ${marketMintInfo.length} markets\n`;
+    message += `- Token-2022 mints: ${token2022Mints.length}\n`;
+    message += `- SPL Token mints: ${splTokenMints.length}\n\n`;
+
+    if (unparsedMarkets.length > 0 || missingMints.length > 0) {
+      message += `**INCOMPLETE REPORT:** ${unparsedMarkets.length} market(s) could not be parsed and ${missingMints.length} mint account(s) were unavailable.\n\n`;
+    }
+
+    if (closedMints.length > 0) {
+      message += `**Mints closed by their issuer (${closedMints.length}, informational):**\n`;
+      for (const mint of closedMints) {
+        message += `• \`${mint}\`\n`;
+      }
+      message += '\n';
+    }
+
+    if (withFees.length > 0) {
+      message += `**Mints with non-zero transfer fees (${withFees.length}):**\n`;
+      for (const r of withFees) {
+        message += `• \`${r.mint.slice(0, 8)}...\` - ${r.transferFeeBps} bps, mutable=${r.hasMutableTransferFee}\n`;
+      }
+      message += '\n';
+    }
+
+    if (withHooks.length > 0) {
+      message += `**Mints with active transfer hooks (${withHooks.length}):**\n`;
+      for (const r of withHooks) {
+        message += `• \`${r.mint.slice(0, 8)}...\` - hook: \`${r.transferHookProgramId?.slice(0, 8)}...\`\n`;
+      }
+      message += '\n';
+    }
+
+    if (withDelegate.length > 0) {
+      message += `**Mints with permanent delegate (${withDelegate.length}):**\n`;
+      for (const r of withDelegate) {
+        message += `• \`${r.mint.slice(0, 8)}...\` - delegate: \`${r.permanentDelegate?.slice(0, 8)}...\`\n`;
+      }
+      message += '\n';
+    }
+
+    if (withNonTransferable.length > 0) {
+      message += `**Non-transferable mints (${withNonTransferable.length}):**\n`;
+      for (const r of withNonTransferable) {
+        message += `• \`${r.mint.slice(0, 8)}...\`\n`;
+      }
+      message += '\n';
+    }
+
+    if (
+      withFees.length === 0 &&
+      withHooks.length === 0 &&
+      withDelegate.length === 0 &&
+      withNonTransferable.length === 0
+    ) {
+      message += `No concerning extensions found.`;
+    }
+
+    // The extension report itself already succeeded and is on disk; a failed
+    // notification should be loud but must not take down the whole run.
+    try {
+      await sendDiscordMessage(discordWebhookUrl, message);
+      console.log('Discord notification sent');
+    } catch (error) {
+      console.error(
+        `Discord notification failed, continuing anyway: ${(error as Error).message}`,
+      );
+    }
+  }
+
+  // Permissionlessly created malformed accounts must not hide findings for all
+  // healthy markets. Finish the report, then leave a failing exit status so
+  // automation cannot mistake a partial scan for a clean scan. Mints closed by
+  // their issuer are excluded: they can never be fetched again, so failing on
+  // them would make every future run red with no action to take.
+  if (unparsedMarkets.length > 0 || missingMints.length > 0) {
+    process.exitCode = 1;
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

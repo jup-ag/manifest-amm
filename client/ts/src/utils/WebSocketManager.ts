@@ -4,13 +4,24 @@ import WebSocket from 'ws';
  * Manages WebSocket server with client heartbeat functionality
  */
 export class WebSocketManager {
+  private static readonly MAX_PAYLOAD_BYTES = 64 * 1024;
   private wss: WebSocket.Server;
   private clientHeartbeats: Map<WebSocket, NodeJS.Timeout> = new Map();
   private heartbeatInterval: number;
 
-  constructor(port: number, heartbeatInterval: number = 30000) {
+  constructor(
+    port: number,
+    heartbeatInterval: number = 30000,
+    host: string = process.env.FILL_FEED_WS_HOST ?? '127.0.0.1',
+  ) {
     this.heartbeatInterval = heartbeatInterval;
-    this.wss = new WebSocket.Server({ port });
+    this.wss = new WebSocket.Server({
+      // Bind locally by default and cap frames to keep this unauthenticated
+      // broadcast endpoint from becoming a public memory sink.
+      port,
+      host,
+      maxPayload: WebSocketManager.MAX_PAYLOAD_BYTES,
+    });
 
     this.wss.on('connection', (ws: WebSocket) => {
       console.log('New client connected');

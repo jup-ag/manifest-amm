@@ -1,11 +1,122 @@
 use hypertree::DataIndex;
 use manifest::{
-    program::batch_update::{CancelOrderParams, PlaceOrderParams},
+    program::{
+        batch_update::{CancelOrderParams, PlaceOrderParams},
+        batch_update_instruction, ManifestError,
+    },
     state::{OrderType, MARKET_BLOCK_SIZE, NO_EXPIRATION_LAST_VALID_SLOT},
 };
+use solana_keypair::Keypair;
+use solana_program::instruction::Instruction;
 use solana_program_test::tokio;
+use solana_signer::Signer;
+use solana_transaction::{InstructionError, TransactionError};
 
-use crate::{TestFixture, Token, SOL_UNIT_SIZE, USDC_UNIT_SIZE};
+use crate::{send_tx_with_retry, TestFixture, Token, SOL_UNIT_SIZE, USDC_UNIT_SIZE};
+
+#[tokio::test]
+async fn global_orders_require_accounts_for_their_side() -> anyhow::Result<()> {
+    let test_fixture: TestFixture = TestFixture::new().await;
+    test_fixture.claim_seat().await?;
+    let payer = test_fixture.payer_keypair().insecure_clone();
+    let market = test_fixture.market_fixture.key;
+    let market_before = test_fixture.try_load(&market).await?.unwrap().data;
+    for is_bid in [false, true] {
+        for include_other_side in [false, true] {
+            let instruction = batch_update_instruction(
+                &market,
+                &payer.pubkey(),
+                None,
+                vec![],
+                vec![PlaceOrderParams::new(
+                    1,
+                    1,
+                    0,
+                    is_bid,
+                    OrderType::Global,
+                    NO_EXPIRATION_LAST_VALID_SLOT,
+                )],
+                (include_other_side && is_bid).then_some(test_fixture.sol_global_fixture.mint_key),
+                None,
+                (include_other_side && !is_bid).then_some(test_fixture.global_fixture.mint_key),
+                None,
+            );
+            let error = send_tx_with_retry(
+                std::rc::Rc::clone(&test_fixture.context),
+                &[instruction],
+                Some(&payer.pubkey()),
+                &[&payer],
+            )
+            .await
+            .unwrap_err()
+            .unwrap();
+            assert_eq!(
+                error,
+                TransactionError::InstructionError(
+                    0,
+                    InstructionError::Custom(ManifestError::MissingGlobal as u32),
+                ),
+                "is_bid={is_bid}, include_other_side={include_other_side}",
+            );
+            assert_eq!(
+                test_fixture.try_load(&market).await?.unwrap().data,
+                market_before
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn undefined_order_types_are_rejected_before_market_mutation() -> anyhow::Result<()> {
+    for invalid_order_type in [6_u8, u8::MAX] {
+        let mut test_fixture: TestFixture = TestFixture::new().await;
+        test_fixture.claim_seat().await?;
+        test_fixture.deposit(Token::SOL, SOL_UNIT_SIZE).await?;
+        let market_before: Vec<u8> = test_fixture
+            .try_load(&test_fixture.market_fixture.key)
+            .await?
+            .unwrap()
+            .data;
+        let payer_keypair: Keypair = test_fixture.payer_keypair().insecure_clone();
+        let mut instruction: Instruction = batch_update_instruction(
+            &test_fixture.market_fixture.key,
+            &payer_keypair.pubkey(),
+            None,
+            vec![],
+            vec![PlaceOrderParams::new(
+                SOL_UNIT_SIZE,
+                2,
+                0,
+                false,
+                OrderType::Limit,
+                NO_EXPIRATION_LAST_VALID_SLOT,
+            )],
+            None,
+            None,
+            None,
+            None,
+        );
+        let order_type_byte: &mut u8 = instruction.data.last_mut().unwrap();
+        *order_type_byte = invalid_order_type;
+
+        assert!(send_tx_with_retry(
+            std::rc::Rc::clone(&test_fixture.context),
+            &[instruction],
+            Some(&payer_keypair.pubkey()),
+            &[&payer_keypair],
+        )
+        .await
+        .is_err());
+        let market_after: Vec<u8> = test_fixture
+            .try_load(&test_fixture.market_fixture.key)
+            .await?
+            .unwrap()
+            .data;
+        assert_eq!(market_after, market_before);
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn batch_update_test() -> anyhow::Result<()> {
@@ -46,8 +157,9 @@ async fn batch_update_test() -> anyhow::Result<()> {
         )
         .await?;
 
-    // Hinted cancel wrong seq num
-    assert!(test_fixture
+    // A stale snapshot now falls back to the sequence-number lookup, so both
+    // modes report the same honest reason: that order is already gone.
+    let hinted_error = test_fixture
         .batch_update_for_keypair(
             Some(0),
             vec![CancelOrderParams::new_with_hint(
@@ -58,7 +170,32 @@ async fn batch_update_test() -> anyhow::Result<()> {
             &test_fixture.payer_keypair(),
         )
         .await
-        .is_err());
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        hinted_error,
+        TransactionError::InstructionError(
+            0,
+            InstructionError::Custom(ManifestError::InvalidCancel as u32),
+        )
+    );
+    let unhinted_error = test_fixture
+        .batch_update_for_keypair(
+            Some(0),
+            vec![CancelOrderParams::new(0)],
+            vec![],
+            &test_fixture.payer_keypair(),
+        )
+        .await
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        unhinted_error,
+        TransactionError::InstructionError(
+            0,
+            InstructionError::Custom(ManifestError::InvalidCancel as u32),
+        )
+    );
 
     // Hinted cancel
     test_fixture

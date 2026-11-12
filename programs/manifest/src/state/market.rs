@@ -1,5 +1,7 @@
+use crate::validation::AccountViewExt;
+use pinocchio::{error::ProgramError, ProgramResult};
 #[cfg(feature = "certora")]
-use {crate::certora::hooks::*, hook_macro::cvlr_hook_on_exit as cvt_hook_end, nondet::nondet};
+use {crate::certora::hooks::*, hook_macro::cvt_hook_end, nondet::nondet};
 
 use bytemuck::{Pod, Zeroable};
 use hypertree::{
@@ -12,9 +14,9 @@ use hypertree::{
     RedBlackTreeReadOnly,
 };
 use shank::ShankType;
-use solana_program::{entrypoint::ProgramResult, program_error::ProgramError, pubkey::Pubkey};
+use solana_program::pubkey::Pubkey;
 use static_assertions::const_assert_eq;
-use std::mem::size_of;
+use std::{collections::HashSet, mem::size_of};
 
 use crate::{
     logs::{emit_stack, FillLog},
@@ -22,7 +24,10 @@ use crate::{
     quantities::{BaseAtoms, GlobalAtoms, QuoteAtoms, QuoteAtomsPerBaseAtom, WrapperU64},
     require,
     state::{
-        utils::{assert_can_take, remove_from_global, try_to_move_global_tokens},
+        utils::{
+            assert_can_take, remove_from_global, transfer_global_tokens,
+            try_to_reduce_global_tokens,
+        },
         OrderType,
     },
     validation::{
@@ -96,15 +101,17 @@ mod helpers {
 pub use helpers::*;
 
 #[derive(Clone)]
-pub struct AddOrderToMarketArgs<'a, 'info> {
-    pub market: Pubkey,
+pub struct AddOrderToMarketArgs<'a> {
+    /// Only read when a fill is logged, so it is borrowed rather than copied
+    /// into the arguments of every order placed.
+    pub market: &'a Pubkey,
     pub trader_index: DataIndex,
     pub num_base_atoms: BaseAtoms,
     pub price: QuoteAtomsPerBaseAtom,
     pub is_bid: bool,
     pub last_valid_slot: u32,
     pub order_type: OrderType,
-    pub global_trade_accounts_opts: &'a [Option<GlobalTradeAccounts<'a, 'info>>; 2],
+    pub global_trade_accounts_opts: &'a [Option<GlobalTradeAccounts<'a>>; 2],
     pub current_slot: Option<u32>,
 }
 
@@ -198,11 +205,24 @@ pub struct MarketFixed {
     #[cfg(feature = "certora")]
     _padding3: [u64; 4],
 
-    // Unused padding. Saved in case a later version wants to be backwards
-    // compatible. Also, it is nice to have the fixed size be a round number,
-    // 256 bytes.
+    /// Canonical global account for the base mint, cached so that validating
+    /// the global accounts on a trade is a key compare instead of a PDA
+    /// search. All zero on markets created before this field existed (it was
+    /// padding) until their first global batch update or swap derives and
+    /// stores it.
+    ///
+    /// Neither this nor `quote_global` exists in the `certora` build. This
+    /// struct is 256 bytes either way, and that build already spends these
+    /// same 64 bytes on the informational atom totals below, which the specs
+    /// reason about. Verification therefore derives the address on every
+    /// check rather than reading a cache, which is also what lets the prover
+    /// state the property directly; see `verify_market_global`. Everything
+    /// else that touches these two fields is gated for the same reason.
     #[cfg(not(feature = "certora"))]
-    _padding3: [u64; 8],
+    base_global: Pubkey,
+    /// Canonical global account for the quote mint, see `base_global`.
+    #[cfg(not(feature = "certora"))]
+    quote_global: Pubkey,
 }
 const_assert_eq!(
     size_of::<MarketFixed>(),
@@ -227,11 +247,12 @@ const_assert_eq!(
     4 +   // claimed_seats_best_index
     4 +   // free_list_head_index
     8 +   // padding2
-    64 // padding4
+    32 +  // base_global
+    32 // quote_global
 );
 const_assert_eq!(size_of::<MarketFixed>(), MARKET_FIXED_SIZE);
 const_assert_eq!(size_of::<MarketFixed>() % 8, 0);
-impl Get for MarketFixed {}
+unsafe impl Get for MarketFixed {}
 
 impl MarketFixed {
     pub fn new_empty(
@@ -239,18 +260,66 @@ impl MarketFixed {
         quote_mint: &MintAccountInfo,
         market_key: &Pubkey,
     ) -> Self {
-        let (base_vault, base_vault_bump) = get_vault_address(market_key, base_mint.info.key);
-        let (quote_vault, quote_vault_bump) = get_vault_address(market_key, quote_mint.info.key);
+        let (base_vault, base_vault_bump) = get_vault_address(market_key, base_mint.info.pubkey());
+        let (quote_vault, quote_vault_bump) =
+            get_vault_address(market_key, quote_mint.info.pubkey());
+        Self::new_empty_with_vaults(
+            base_mint,
+            quote_mint,
+            base_vault,
+            base_vault_bump,
+            quote_vault,
+            quote_vault_bump,
+        )
+    }
+
+    /// Like `new_empty` for a caller that has already derived the vault PDAs.
+    /// The global account cache starts empty, see `set_base_global`.
+    pub fn new_empty_with_vaults(
+        base_mint: &MintAccountInfo,
+        quote_mint: &MintAccountInfo,
+        base_vault: Pubkey,
+        base_vault_bump: u8,
+        quote_vault: Pubkey,
+        quote_vault_bump: u8,
+    ) -> Self {
+        Self::new_empty_from_mint_parts(
+            base_mint.info.pubkey(),
+            base_mint.mint.decimals,
+            quote_mint.info.pubkey(),
+            quote_mint.mint.decimals,
+            base_vault,
+            base_vault_bump,
+            quote_vault,
+            quote_vault_bump,
+        )
+    }
+
+    /// The same, from what it actually reads off the mints: their addresses
+    /// and decimals. Callers holding an account for each use the wrapper
+    /// above; tests and anything else describing a market without one use
+    /// this, since the runtime's account type cannot be built off chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_empty_from_mint_parts(
+        base_mint: &Pubkey,
+        base_mint_decimals: u8,
+        quote_mint: &Pubkey,
+        quote_mint_decimals: u8,
+        base_vault: Pubkey,
+        base_vault_bump: u8,
+        quote_vault: Pubkey,
+        quote_vault_bump: u8,
+    ) -> Self {
         MarketFixed {
             discriminant: MARKET_FIXED_DISCRIMINANT,
             version: 0,
-            base_mint_decimals: base_mint.mint.decimals,
-            quote_mint_decimals: quote_mint.mint.decimals,
+            base_mint_decimals,
+            quote_mint_decimals,
             base_vault_bump,
             quote_vault_bump,
             _padding1: [0; 3],
-            base_mint: *base_mint.info.key,
-            quote_mint: *quote_mint.info.key,
+            base_mint: *base_mint,
+            quote_mint: *quote_mint,
             base_vault,
             quote_vault,
             order_sequence_number: 0,
@@ -267,8 +336,13 @@ impl MarketFixed {
             free_list_head_index: 0,
             _padding2: [0; 1],
             quote_volume: QuoteAtoms::ZERO,
+            // The global cache does not exist under certora, see the field
+            // definitions; that build fills the same bytes with the totals
+            // below instead.
             #[cfg(not(feature = "certora"))]
-            _padding3: [0; 8],
+            base_global: Pubkey::default(),
+            #[cfg(not(feature = "certora"))]
+            quote_global: Pubkey::default(),
             #[cfg(feature = "certora")]
             withdrawable_base_atoms: BaseAtoms::new(0),
             #[cfg(feature = "certora")]
@@ -286,7 +360,7 @@ impl MarketFixed {
     /** All fields are set to nondeterministic values except indexes to the tree **/
     pub fn new_nondet() -> Self {
         let claimed_seats_root_index = nondet();
-        cvt::cvt::cvt_assume!(claimed_seats_root_index == NIL);
+        cvt::cvt_assume!(claimed_seats_root_index == NIL);
         MarketFixed {
             discriminant: MARKET_FIXED_DISCRIMINANT,
             version: 0,
@@ -295,10 +369,10 @@ impl MarketFixed {
             base_vault_bump: nondet(),
             quote_vault_bump: nondet(),
             _padding1: [0; 3],
-            base_mint: solana_cvt::cvlr_nondet_pubkey(),
-            quote_mint: solana_cvt::cvlr_nondet_pubkey(),
-            base_vault: solana_cvt::cvlr_nondet_pubkey(),
-            quote_vault: solana_cvt::cvlr_nondet_pubkey(),
+            base_mint: Pubkey::new_from_array(nondet()),
+            quote_mint: Pubkey::new_from_array(nondet()),
+            base_vault: Pubkey::new_from_array(nondet()),
+            quote_vault: Pubkey::new_from_array(nondet()),
             order_sequence_number: nondet(),
             num_bytes_allocated: nondet(),
             bids_root_index: NIL,
@@ -322,6 +396,34 @@ impl MarketFixed {
     }
     pub fn get_quote_mint(&self) -> &Pubkey {
         &self.quote_mint
+    }
+    /// Cached canonical global account for the base mint, or the default
+    /// pubkey if it has not been derived for this market yet.
+    ///
+    /// These four accessors are gated only because the fields they read are:
+    /// the `certora` build has no global cache, see `base_global`.
+    #[cfg(not(feature = "certora"))]
+    pub fn get_base_global(&self) -> &Pubkey {
+        &self.base_global
+    }
+    /// Cached canonical global account for the quote mint, or the default
+    /// pubkey if it has not been derived for this market yet.
+    #[cfg(not(feature = "certora"))]
+    pub fn get_quote_global(&self) -> &Pubkey {
+        &self.quote_global
+    }
+    #[cfg(not(feature = "certora"))]
+    pub fn set_base_global(&mut self, base_global: Pubkey) {
+        self.base_global = base_global;
+    }
+    #[cfg(not(feature = "certora"))]
+    pub fn set_quote_global(&mut self, quote_global: Pubkey) {
+        self.quote_global = quote_global;
+    }
+    /// Sequence number the next placed order gets; increases with every
+    /// order placed on the market, including ones that never rest.
+    pub fn get_order_sequence_number(&self) -> u64 {
+        self.order_sequence_number
     }
     pub fn get_base_vault(&self) -> &Pubkey {
         &self.base_vault
@@ -379,6 +481,28 @@ impl MarketFixed {
     // Used in benchmark
     pub fn has_free_block(&self) -> bool {
         self.free_list_head_index != NIL
+    }
+
+    /// Validate the account-backed free list before off-chain clients follow
+    /// its indices. RPC data is untrusted outside the on-chain runtime.
+    pub fn validate_free_list(&self, dynamic: &[u8]) -> Result<(), &'static str> {
+        let mut index = self.free_list_head_index;
+        let mut seen = HashSet::new();
+        while index != NIL {
+            let offset = index as usize;
+            let end = offset
+                .checked_add(size_of::<FreeListNode<MarketUnusedFreeListPadding>>())
+                .ok_or("free list offset overflow")?;
+            if offset % 8 != 0 || end > dynamic.len() || !seen.insert(index) {
+                return Err("invalid market free list");
+            }
+            let node: FreeListNode<MarketUnusedFreeListPadding> =
+                hypertree::read_unaligned::<FreeListNode<MarketUnusedFreeListPadding>>(
+                    &dynamic[offset..end],
+                );
+            index = node.get_next_index();
+        }
+        Ok(())
     }
 }
 
@@ -552,7 +676,7 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
                 global_trade_accounts_opts,
                 matched_base_atoms,
                 matched_quote_atoms,
-            ) {
+            )? {
                 continue;
             }
 
@@ -640,8 +764,16 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
             // quote remaining against price 1.001, then the answer should be
             // 100, because the rounding is in favor of the taker. It takes 100
             // base atoms to exhaust 100 quote atoms at that price.
-            let base_atoms_limit: BaseAtoms =
-                matched_price.checked_base_for_quote(remaining_quote_atoms, !is_bid)?;
+            //
+            // A limit beyond u64::MAX base atoms (a dust-priced resting order
+            // against a large remaining quote) is capped rather than
+            // propagated: the min() below bounds the fill by the resting
+            // order's actual size either way, and failing instead would let
+            // one dust-priced resting order error every quote-denominated
+            // swap on the market.
+            let base_atoms_limit: BaseAtoms = matched_price
+                .checked_base_for_quote(remaining_quote_atoms, !is_bid)
+                .unwrap_or(BaseAtoms::new(u64::MAX));
             // Either fill the entire resting order, or only the
             // base_atoms_limit, in which case, this is the last iteration.
             let matched_base_atoms: BaseAtoms =
@@ -667,13 +799,17 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
                 global_trade_accounts_opts,
                 matched_base_atoms,
                 matched_quote_atoms,
-            ) {
+            )? {
                 continue;
             }
 
             total_matched_base_atoms = total_matched_base_atoms.checked_add(matched_base_atoms)?;
 
-            if !did_fully_match_resting_order {
+            // A complete fill can round its quote proceeds above the remaining
+            // target (one base atom at price 1.5 charges two quote atoms
+            // against a remaining target of one). The target is reached, so
+            // stop before the subtraction below underflows.
+            if !did_fully_match_resting_order || matched_quote_atoms >= remaining_quote_atoms {
                 break;
             }
 
@@ -706,12 +842,15 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
     }
 
     pub fn get_trader_balance(&self, trader: &Pubkey) -> (BaseAtoms, QuoteAtoms) {
-        let DynamicAccount { fixed, dynamic } = self.borrow_market();
+        self.get_trader_balance_by_index(self.get_trader_index(trader))
+    }
 
-        let claimed_seats_tree: ClaimedSeatTreeReadOnly =
-            ClaimedSeatTreeReadOnly::new(dynamic, fixed.claimed_seats_root_index, NIL);
-        let trader_index: DataIndex =
-            claimed_seats_tree.lookup_index(&ClaimedSeat::new_empty(*trader));
+    /// The caller must supply an existing seat index obtained from this market.
+    pub(crate) fn get_trader_balance_by_index(
+        &self,
+        trader_index: DataIndex,
+    ) -> (BaseAtoms, QuoteAtoms) {
+        let DynamicAccount { dynamic, .. } = self.borrow_market();
         let claimed_seat: &ClaimedSeat = get_helper_seat(dynamic, trader_index).get_value();
         (
             claimed_seat.base_withdrawable_balance,
@@ -735,6 +874,15 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         let claimed_seat: &ClaimedSeat = get_helper_seat(dynamic, trader_index).get_value();
 
         claimed_seat.quote_volume
+    }
+
+    /// Expose the claimed-seat index for off-chain validation of order
+    /// cross-references before quote traversal.
+    pub fn get_claimed_seats(&self) -> ClaimedSeatTreeReadOnly<'_> {
+        let market: MarketRef<'_> = self.borrow_market();
+        let dynamic: &[u8] = market.dynamic;
+        let fixed: &MarketFixed = market.fixed;
+        ClaimedSeatTreeReadOnly::new(dynamic, fixed.claimed_seats_root_index, NIL)
     }
 
     pub fn get_bids(&self) -> BooksideReadOnly<'_> {
@@ -786,7 +934,7 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
         global_trade_accounts_opts: &[Option<GlobalTradeAccounts>; 2],
         matched_base_atoms: BaseAtoms,
         matched_quote_atoms: QuoteAtoms,
-    ) -> bool {
+    ) -> Result<bool, ProgramError> {
         if resting_order.get_order_type() == OrderType::Global {
             // If global accounts are needed but not present, then this will
             // crash. This is an intentional product decision. Would be
@@ -806,12 +954,80 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
                 } else {
                     matched_quote_atoms.as_u64()
                 }),
-            );
+            )?;
             if !has_enough_tokens {
-                return true;
+                return Ok(true);
             }
         }
-        return false;
+        Ok(false)
+    }
+
+    /// Cached offsets are hints: compaction can move nodes or harvest a seat.
+    #[cfg(not(feature = "certora"))]
+    pub fn resolve_trader_index(&self, hint: DataIndex, trader: &Pubkey) -> DataIndex {
+        let DynamicAccount { dynamic, .. } = self.borrow_market();
+        if hint != NIL
+            && hint as usize % MARKET_BLOCK_SIZE == 0
+            && (hint as usize)
+                .checked_add(MARKET_BLOCK_SIZE)
+                .is_some_and(|end| end <= dynamic.len())
+        {
+            let node = get_helper::<RBNode<ClaimedSeat>>(dynamic, hint);
+            if node.get_payload_type() == MarketDataTreeNodeType::ClaimedSeat as u8
+                && node.get_value().trader == *trader
+            {
+                return hint;
+            }
+        }
+        self.get_trader_index(trader)
+    }
+
+    /// Resolve stable order identity, including when the old offset was truncated
+    /// or reused. Never substitute another trader's order at the same address.
+    /// A missing hint searches only its side and price level, so normal fills
+    /// and cancels do not require a scan of both books.
+    #[cfg(not(feature = "certora"))]
+    pub fn resolve_order_index(
+        &self,
+        hint: DataIndex,
+        sequence: u64,
+        trader: DataIndex,
+        price: QuoteAtomsPerBaseAtom,
+        is_bid: bool,
+    ) -> DataIndex {
+        if trader == NIL {
+            return NIL;
+        }
+        let DynamicAccount { fixed, dynamic } = self.borrow_market();
+        if hint != NIL
+            && hint as usize % MARKET_BLOCK_SIZE == 0
+            && (hint as usize)
+                .checked_add(MARKET_BLOCK_SIZE)
+                .is_some_and(|end| end <= dynamic.len())
+        {
+            let node = get_helper::<RBNode<RestingOrder>>(dynamic, hint);
+            if node.get_payload_type() == MarketDataTreeNodeType::RestingOrder as u8
+                && node.get_value().get_sequence_number() == sequence
+                && node.get_value().get_trader_index() == trader
+            {
+                return hint;
+            }
+        }
+        let root = if is_bid {
+            fixed.bids_root_index
+        } else {
+            fixed.asks_root_index
+        };
+        RedBlackTreeReadOnly::<RestingOrder>::new(dynamic, root, NIL).lookup_index_by(
+            &|order| {
+                if is_bid {
+                    order.get_price().cmp(&price)
+                } else {
+                    price.cmp(&order.get_price())
+                }
+            },
+            &|order| order.get_sequence_number() == sequence && order.get_trader_index() == trader,
+        )
     }
 
     pub fn get_trader_index(&self, trader: &Pubkey) -> DataIndex {
@@ -864,6 +1080,14 @@ impl<
     }
 
     pub fn claim_seat(&mut self, trader: &Pubkey) -> ProgramResult {
+        self.claim_seat_with_index(trader).map(|_| ())
+    }
+
+    /// Return the allocated index so callers do not need to look up the new seat.
+    pub(crate) fn claim_seat_with_index(
+        &mut self,
+        trader: &Pubkey,
+    ) -> Result<DataIndex, ProgramError> {
         let DynamicAccount { fixed, dynamic } = self.borrow_mut();
         let free_address: DataIndex = get_free_address_on_market_fixed_for_seat(fixed, dynamic);
 
@@ -881,14 +1105,14 @@ impl<
         // but let's check here that the assumption holds.
         #[cfg(feature = "certora")]
         {
-            cvt::cvt::cvt_assert!(claimed_seat.base_withdrawable_balance == BaseAtoms::new(0));
-            cvt::cvt::cvt_assert!(claimed_seat.quote_withdrawable_balance == QuoteAtoms::new(0));
+            cvt::cvt_assert!(claimed_seat.base_withdrawable_balance == BaseAtoms::new(0));
+            cvt::cvt_assert!(claimed_seat.quote_withdrawable_balance == QuoteAtoms::new(0));
         }
         fixed.claimed_seats_root_index = claimed_seats_tree.get_root_index();
 
         get_mut_helper::<RBNode<ClaimedSeat>>(dynamic, free_address)
             .set_payload_type(MarketDataTreeNodeType::ClaimedSeat as u8);
-        Ok(())
+        Ok(free_address)
     }
 
     // Only used when temporarily claiming for swap and we dont have the system
@@ -896,6 +1120,11 @@ impl<
     // seat.
     pub fn release_seat(&mut self, trader: &Pubkey) -> ProgramResult {
         let trader_seat_index: DataIndex = self.get_trader_index(trader);
+        self.release_seat_by_index(trader_seat_index)
+    }
+
+    /// The caller must supply the index of the temporary seat it claimed.
+    pub(crate) fn release_seat_by_index(&mut self, trader_seat_index: DataIndex) -> ProgramResult {
         let DynamicAccount { fixed, dynamic } = self.borrow_mut();
 
         let mut claimed_seats_tree: ClaimedSeatTree =
@@ -950,17 +1179,29 @@ impl<
         &mut self,
         args: AddOrderToMarketArgs,
     ) -> Result<AddOrderToMarketResult, ProgramError> {
+        if args.is_bid {
+            self.place_order_on_side::<true>(args)
+        } else {
+            self.place_order_on_side::<false>(args)
+        }
+    }
+
+    fn place_order_on_side<const IS_BID: bool>(
+        &mut self,
+        args: AddOrderToMarketArgs,
+    ) -> Result<AddOrderToMarketResult, ProgramError> {
         let AddOrderToMarketArgs {
             market,
             trader_index,
             num_base_atoms,
             price,
-            is_bid,
+            is_bid: _,
             last_valid_slot,
             order_type,
             global_trade_accounts_opts,
             current_slot,
         } = args;
+        let is_bid: bool = IS_BID;
         assert_already_has_seat(trader_index)?;
         let now_slot: u32 = current_slot.unwrap_or_else(|| get_now_slot());
 
@@ -971,35 +1212,53 @@ impl<
 
         let DynamicAccount { fixed, dynamic } = self.borrow_mut();
 
+        // The cursor is always the cached best on this side. Removing that
+        // node already finds its predecessor and updates the cache, so read
+        // the new best after removal instead of walking the tree twice.
         let mut current_maker_order_index: DataIndex = if is_bid {
             fixed.asks_best_index
         } else {
             fixed.bids_best_index
         };
 
+        // Increment the sequence number before matching so that the taker logs
+        // are correct, even if sequence numbers are consumed by reverse orders
+        // during matching. We are claiming this_order_sequence_number for the
+        // current order.
+        let this_order_sequence_number: u64 = fixed.order_sequence_number;
+        fixed.order_sequence_number = this_order_sequence_number.wrapping_add(1);
+
         let mut total_base_atoms_traded: BaseAtoms = BaseAtoms::ZERO;
         let mut total_quote_atoms_traded: QuoteAtoms = QuoteAtoms::ZERO;
+
+        // Accumulator for batched global token transfers (only one side per order)
+        let mut global_atoms_to_transfer: GlobalAtoms = GlobalAtoms::ZERO;
 
         let mut remaining_base_atoms: BaseAtoms = num_base_atoms;
         while remaining_base_atoms > BaseAtoms::ZERO && is_not_nil!(current_maker_order_index) {
             let maker_order: &RestingOrder =
                 get_helper::<RBNode<RestingOrder>>(dynamic, current_maker_order_index).get_value();
 
-            // Remove the resting order if expired or somehow a zero order got on the book.
+            // Remove the resting order if expired or somehow a zero order got
+            // on the book. This cleanup is intentionally unbounded today: an
+            // attacker must rent-fund every order/account expansion, which has
+            // kept the practical risk acceptable. If expired prefixes become
+            // a production problem, add a per-instruction cleanup quota plus
+            // a persistent cursor (or a separate cleanup instruction) so each
+            // successful call makes monotonic progress rather than rolling the
+            // entire prefix back with the taker's trade.
             if maker_order.is_expired(now_slot) || maker_order.get_num_base_atoms().as_u64() == 0 {
-                let next_maker_order_index: DataIndex = get_next_candidate_match_index(
-                    fixed,
-                    dynamic,
-                    current_maker_order_index,
-                    is_bid,
-                );
                 remove_and_update_balances(
                     fixed,
                     dynamic,
                     current_maker_order_index,
                     global_trade_accounts_opts,
                 )?;
-                current_maker_order_index = next_maker_order_index;
+                current_maker_order_index = if is_bid {
+                    fixed.asks_best_index
+                } else {
+                    fixed.bids_best_index
+                };
                 continue;
             }
 
@@ -1065,32 +1324,33 @@ impl<
                 }
                 // When is_bid, the taker is supplying quote, so the global
                 // maker needs to supply base.
-                let has_enough_tokens: bool = try_to_move_global_tokens(
+                let global_atoms_needed: GlobalAtoms = GlobalAtoms::new(if is_bid {
+                    base_atoms_traded.as_u64()
+                } else {
+                    quote_atoms_traded.as_u64()
+                });
+                let has_enough_tokens: bool = try_to_reduce_global_tokens(
                     global_trade_accounts_opt,
                     &maker,
-                    GlobalAtoms::new(if is_bid {
-                        base_atoms_traded.as_u64()
-                    } else {
-                        quote_atoms_traded.as_u64()
-                    }),
+                    global_atoms_needed,
                 )?;
 
                 if !has_enough_tokens {
-                    let next_maker_order_index: DataIndex = get_next_candidate_match_index(
-                        fixed,
-                        dynamic,
-                        current_maker_order_index,
-                        is_bid,
-                    );
                     remove_and_update_balances(
                         fixed,
                         dynamic,
                         current_maker_order_index,
                         global_trade_accounts_opts,
                     )?;
-                    current_maker_order_index = next_maker_order_index;
+                    current_maker_order_index = if is_bid {
+                        fixed.asks_best_index
+                    } else {
+                        fixed.bids_best_index
+                    };
                     continue;
                 }
+                global_atoms_to_transfer =
+                    global_atoms_to_transfer.checked_add(global_atoms_needed)?;
             }
 
             total_base_atoms_traded = total_base_atoms_traded.checked_add(base_atoms_traded)?;
@@ -1194,7 +1454,7 @@ impl<
             record_volume_by_trader_index(dynamic, trader_index, quote_atoms_traded);
 
             emit_stack(FillLog {
-                market,
+                market: *market,
                 maker,
                 taker,
                 base_mint: fixed.base_mint,
@@ -1203,7 +1463,7 @@ impl<
                 quote_atoms: quote_atoms_traded,
                 price: matched_price,
                 maker_sequence_number,
-                taker_sequence_number: fixed.order_sequence_number,
+                taker_sequence_number: this_order_sequence_number,
                 taker_is_buy: PodBool::from(is_bid),
                 is_maker_global: PodBool::from(is_global),
                 _padding: [0; 14],
@@ -1211,10 +1471,7 @@ impl<
 
             if did_fully_match_resting_order {
                 // Get paid for removing a global order.
-                if get_helper::<RBNode<RestingOrder>>(dynamic, current_maker_order_index)
-                    .get_value()
-                    .is_global()
-                {
+                if is_global {
                     if is_bid {
                         remove_from_global(&global_trade_accounts_opts[0])?;
                     } else {
@@ -1222,12 +1479,6 @@ impl<
                     }
                 }
 
-                let next_maker_order_index: DataIndex = get_next_candidate_match_index(
-                    fixed,
-                    dynamic,
-                    current_maker_order_index,
-                    is_bid,
-                );
                 remove_order_from_tree_and_free(
                     fixed,
                     dynamic,
@@ -1235,7 +1486,11 @@ impl<
                     !is_bid,
                 )?;
                 remaining_base_atoms = remaining_base_atoms.checked_sub(base_atoms_traded)?;
-                current_maker_order_index = next_maker_order_index;
+                current_maker_order_index = if is_bid {
+                    fixed.asks_best_index
+                } else {
+                    fixed.bids_best_index
+                };
             } else {
                 #[cfg(feature = "certora")]
                 remove_from_orderbook_balance(fixed, dynamic, current_maker_order_index);
@@ -1256,13 +1511,60 @@ impl<
                     let num_base_atoms_reverse: BaseAtoms = if is_bid {
                         // Maker is now buying with the exact number of quote atoms.
                         // Do not round_up because there might not be enough atoms
-                        // for that.
-                        price_reverse.checked_base_for_quote(quote_atoms_traded, false)?
+                        // for that. An exact size beyond u64::MAX base atoms is
+                        // capped rather than propagated so a resting reverse
+                        // order can never fail the taker's fill; the capped
+                        // order still rounds up to at most the received quote
+                        // when it is debited below.
+                        price_reverse
+                            .checked_base_for_quote(quote_atoms_traded, false)
+                            .unwrap_or(BaseAtoms::new(u64::MAX))
                     } else {
                         base_atoms_traded
                     };
 
                     let mut coalesced: bool = false;
+                    // Quote atoms the maker pays for the reverse bid. For a
+                    // fresh order this is the usual rounded-up product,
+                    // ceil(num_base_atoms_reverse * price_reverse), the exact
+                    // amount the new order will refund when it is canceled.
+                    //
+                    // For the coalesce case that formula is wrong. The
+                    // coalesced order's allocation is rounded as a whole, at
+                    // its own price q, which may even sit one price increment
+                    // away from price_reverse (RestingOrder::eq tolerates
+                    // that). What the maker must pay is the growth of what the
+                    // order will later refund:
+                    //
+                    //   ceil((old + X) * q) - ceil(old * q)
+                    //
+                    // which is not ceil(X * price_reverse) in general. Debiting
+                    // the product either strands the difference in the vault
+                    // forever or leaves the order under-backed, breaking
+                    // vault == withdrawable + orderbook.
+                    //
+                    // Example (reverse_order_tight_type_test): ReverseTight ask
+                    // 3 SOL at 3.0, spread 0.05%, so it comes back as a bid at
+                    // 2.9985.
+                    // Fill 1: 1 SOL trades, maker receives 3_000_000_000 quote.
+                    //   Reverse bid rests fresh:
+                    //   X1 = floor(3_000_000_000 / 2.9985) = 1_000_500_250,
+                    //   debit ceil(1_000_500_250 * 2.9985)  = 3_000_000_000.
+                    // Fill 2: 2 SOL trade, maker receives 6_000_000_000 quote.
+                    //   X2 = floor(6_000_000_000 / 2.9985) = 2_001_000_500
+                    //   coalesces into the resting bid, which grows to
+                    //   3_001_500_750 atoms and will refund
+                    //   ceil(3_001_500_750 * 2.9985) = 8_999_999_999 when
+                    //   canceled -- a growth of 5_999_999_999.
+                    //   Debiting ceil(X2 * 2.9985) = 6_000_000_000 instead
+                    //   means the maker paid 9_000_000_000 in total for an
+                    //   order that can only ever give back 8_999_999_999: one
+                    //   atom stranded in the vault, owned by nobody.
+                    let mut reverse_quote_atoms_debited: QuoteAtoms = QuoteAtoms::ZERO;
+                    // Base atoms the maker pays for the reverse ask.
+                    // Coalescing may cap this below num_base_atoms_reverse
+                    // when the combined order would overflow.
+                    let mut reverse_base_atoms_debited: BaseAtoms = num_base_atoms_reverse;
                     {
                         let other_tree: Bookside = if is_bid {
                             Bookside::new(dynamic, fixed.bids_root_index, fixed.bids_best_index)
@@ -1279,18 +1581,45 @@ impl<
                             maker_order_type,
                         )?;
 
-                        // Because there is a slight relaxation in matching reverse
-                        // orders, do not need to worry about off by one errors
-                        // causing fragmented liqudity.
                         let lookup_index: DataIndex =
                             other_tree.lookup_index(&lookup_resting_order);
                         if lookup_index != NIL {
+                            #[cfg(feature = "certora")]
+                            remove_from_orderbook_balance(fixed, dynamic, lookup_index);
                             let order_to_coalesce_into: &mut RestingOrder =
                                 get_mut_helper::<RBNode<RestingOrder>>(dynamic, lookup_index)
                                     .get_mut_value();
-                            order_to_coalesce_into.increase(num_base_atoms_reverse)?;
+                            if is_bid {
+                                let (base_atoms_to_add, quote_atoms_to_debit) =
+                                    get_reverse_bid_coalesce_amounts(
+                                        order_to_coalesce_into.get_price(),
+                                        order_to_coalesce_into.get_num_base_atoms(),
+                                        num_base_atoms_reverse,
+                                        quote_atoms_traded,
+                                    )?;
+                                order_to_coalesce_into.increase(base_atoms_to_add)?;
+                                reverse_quote_atoms_debited = quote_atoms_to_debit;
+                            } else {
+                                // Cap the growth so an oversized combined
+                                // reverse ask cannot fail the taker's fill.
+                                // The uncoalesced remainder is not debited and
+                                // stays in the maker's withdrawable balance.
+                                let base_atoms_to_add: BaseAtoms =
+                                    num_base_atoms_reverse.min(BaseAtoms::new(
+                                        u64::MAX
+                                            - order_to_coalesce_into.get_num_base_atoms().as_u64(),
+                                    ));
+                                order_to_coalesce_into.increase(base_atoms_to_add)?;
+                                reverse_base_atoms_debited = base_atoms_to_add;
+                            }
+                            #[cfg(feature = "certora")]
+                            add_to_orderbook_balance(fixed, dynamic, lookup_index);
                             coalesced = true;
                         }
+                    }
+                    if !coalesced && is_bid {
+                        reverse_quote_atoms_debited =
+                            num_base_atoms_reverse.checked_mul(price_reverse, true)?;
                     }
 
                     // If there was 1 atom and because taker rounding is in effect,
@@ -1333,6 +1662,7 @@ impl<
                             free_address,
                             &new_reverse_resting_order,
                         );
+                        #[cfg(feature = "certora")]
                         set_payload_order(dynamic, free_address);
                     }
 
@@ -1343,11 +1673,9 @@ impl<
                         !is_bid,
                         false,
                         if is_bid {
-                            num_base_atoms_reverse
-                                .checked_mul(price_reverse, true)?
-                                .into()
+                            reverse_quote_atoms_debited.into()
                         } else {
-                            num_base_atoms_reverse.into()
+                            reverse_base_atoms_debited.into()
                         },
                     )?;
                 }
@@ -1360,13 +1688,23 @@ impl<
             }
         }
 
-        // Record volume on market
-        fixed.quote_volume = fixed.quote_volume.wrapping_add(total_quote_atoms_traded);
+        // Batch transfer global tokens after all matching is complete.
+        // Doing it here allows matching through many levels which is common for
+        // destiny vaults. Without this, the CPI overhead would be massive and
+        // limit the tx size.
+        if global_atoms_to_transfer > GlobalAtoms::ZERO {
+            let global_trade_accounts_opt: &Option<GlobalTradeAccounts> = if is_bid {
+                &global_trade_accounts_opts[0]
+            } else {
+                &global_trade_accounts_opts[1]
+            };
+            transfer_global_tokens(global_trade_accounts_opt, global_atoms_to_transfer)?;
+        }
 
-        // Bump the order sequence number even for orders which do not end up
-        // resting.
-        let order_sequence_number: u64 = fixed.order_sequence_number;
-        fixed.order_sequence_number = order_sequence_number.wrapping_add(1);
+        // Orders that make no trade leave market volume unchanged.
+        if total_quote_atoms_traded != QuoteAtoms::ZERO {
+            fixed.quote_volume = fixed.quote_volume.wrapping_add(total_quote_atoms_traded);
+        }
 
         // If there is nothing left to rest, then return before resting.
         if !order_type_can_rest(order_type)
@@ -1374,17 +1712,17 @@ impl<
             || price == QuoteAtomsPerBaseAtom::ZERO
         {
             return Ok(AddOrderToMarketResult {
-                order_sequence_number,
+                order_sequence_number: this_order_sequence_number,
                 order_index: NIL,
                 base_atoms_traded: total_base_atoms_traded,
                 quote_atoms_traded: total_quote_atoms_traded,
             });
         }
 
-        self.rest_remaining(
+        self.rest_remaining_on_side::<IS_BID>(
             args,
             remaining_base_atoms,
-            order_sequence_number,
+            this_order_sequence_number,
             total_base_atoms_traded,
             total_quote_atoms_traded,
         )
@@ -1400,13 +1738,23 @@ impl<
         total_base_atoms_traded: BaseAtoms,
         total_quote_atoms_traded: QuoteAtoms,
     ) -> Result<AddOrderToMarketResult, ProgramError> {
-        self.rest_remaining(
-            args,
-            remaining_base_atoms,
-            order_sequence_number,
-            total_base_atoms_traded,
-            total_quote_atoms_traded,
-        )
+        if args.is_bid {
+            self.rest_remaining_on_side::<true>(
+                args,
+                remaining_base_atoms,
+                order_sequence_number,
+                total_base_atoms_traded,
+                total_quote_atoms_traded,
+            )
+        } else {
+            self.rest_remaining_on_side::<false>(
+                args,
+                remaining_base_atoms,
+                order_sequence_number,
+                total_base_atoms_traded,
+                total_quote_atoms_traded,
+            )
+        }
     }
 
     fn rest_remaining(
@@ -1417,15 +1765,43 @@ impl<
         total_base_atoms_traded: BaseAtoms,
         total_quote_atoms_traded: QuoteAtoms,
     ) -> Result<AddOrderToMarketResult, ProgramError> {
+        if args.is_bid {
+            self.rest_remaining_on_side::<true>(
+                args,
+                remaining_base_atoms,
+                order_sequence_number,
+                total_base_atoms_traded,
+                total_quote_atoms_traded,
+            )
+        } else {
+            self.rest_remaining_on_side::<false>(
+                args,
+                remaining_base_atoms,
+                order_sequence_number,
+                total_base_atoms_traded,
+                total_quote_atoms_traded,
+            )
+        }
+    }
+
+    fn rest_remaining_on_side<const IS_BID: bool>(
+        &mut self,
+        args: AddOrderToMarketArgs,
+        remaining_base_atoms: BaseAtoms,
+        order_sequence_number: u64,
+        total_base_atoms_traded: BaseAtoms,
+        total_quote_atoms_traded: QuoteAtoms,
+    ) -> Result<AddOrderToMarketResult, ProgramError> {
         let AddOrderToMarketArgs {
             trader_index,
             price,
-            is_bid,
+            is_bid: _,
             last_valid_slot,
             order_type,
             global_trade_accounts_opts,
             ..
         } = args;
+        let is_bid: bool = IS_BID;
         let DynamicAccount { fixed, dynamic } = self.borrow_mut();
 
         // Put the remaining in an order on the other bookside.
@@ -1454,13 +1830,19 @@ impl<
         }
 
         if resting_order.is_global() {
+            // Global cleanup and settlement represent quote quantities as u64.
+            // Reject bids whose complete notional cannot be represented before
+            // persisting them.
+            if is_bid {
+                remaining_base_atoms.checked_mul(price, true)?;
+            }
             let global_trade_account_opt = &global_trade_accounts_opts[if is_bid { 1 } else { 0 }];
             require!(
                 global_trade_account_opt.is_some(),
                 ManifestError::MissingGlobal,
                 "Missing global accounts when adding a global",
             )?;
-            try_to_add_to_global(&global_trade_account_opt.as_ref().unwrap(), &resting_order)?;
+            try_to_add_to_global(global_trade_account_opt.as_ref().unwrap(), &resting_order)?;
         } else {
             // Place the remaining.
             // Rounds up quote atoms so price can be rounded in favor of taker
@@ -1479,6 +1861,7 @@ impl<
         }
         insert_order_into_tree(is_bid, fixed, dynamic, free_address, &resting_order);
 
+        #[cfg(feature = "certora")]
         set_payload_order(dynamic, free_address);
 
         Ok(AddOrderToMarketResult {
@@ -1545,11 +1928,33 @@ impl<
         }
 
         // Do not fail silently.
-        Err(ManifestError::InvalidCancel.into())
+        require!(
+            false,
+            ManifestError::InvalidCancel,
+            "Unable to find the order for cancel. Sequence number: {}",
+            order_sequence_number
+        )?;
+        Ok(())
     }
 
     #[cfg_attr(feature = "certora", cvt_hook_end(cancel_order_by_index_was_called()))]
     pub fn cancel_order_by_index(
+        &mut self,
+        order_index: DataIndex,
+        global_trade_accounts_opts: &[Option<GlobalTradeAccounts>; 2],
+    ) -> ProgramResult {
+        let DynamicAccount { dynamic, .. } = self.borrow_market();
+        if get_helper_order(dynamic, order_index)
+            .get_value()
+            .get_is_bid()
+        {
+            self.cancel_order_on_side::<true>(order_index, global_trade_accounts_opts)
+        } else {
+            self.cancel_order_on_side::<false>(order_index, global_trade_accounts_opts)
+        }
+    }
+
+    fn cancel_order_on_side<const IS_BID: bool>(
         &mut self,
         order_index: DataIndex,
         global_trade_accounts_opts: &[Option<GlobalTradeAccounts>; 2],
@@ -1560,11 +1965,11 @@ impl<
         // because the tracking for
 
         let resting_order: &RestingOrder = get_helper_order(dynamic, order_index).get_value();
-        let is_bid: bool = resting_order.get_is_bid();
+        let is_bid: bool = IS_BID;
 
         // Important to round up because there was an extra atom taken for full
         // taker rounding when the order was placed.
-        let amount_atoms: u64 = if is_bid {
+        let amount_atoms: u64 = if is_bid && !resting_order.is_global() {
             (resting_order
                 .get_price()
                 .checked_quote_for_base(resting_order.get_num_base_atoms(), true)
@@ -1576,19 +1981,13 @@ impl<
 
         // Update the accounting for the order that was just canceled.
         if resting_order.is_global() {
+            // Global order balances live on the global account, so there is
+            // nothing to give back on the market.
             if is_bid {
                 remove_from_global(&global_trade_accounts_opts[1])?;
             } else {
                 remove_from_global(&global_trade_accounts_opts[0])?;
             }
-
-            // Certora version was equivalent except it returned early here.
-            // Thats a bug, but keeping the certora code as close to what they
-            // wrote as possible. Formal verification does not cover global, so
-            // that would explain why introducing this bug for formal
-            // verification does not cause failures.
-            #[cfg(feature = "certora")]
-            return Ok(());
         } else {
             update_balance(
                 fixed,
@@ -1605,6 +2004,7 @@ impl<
     }
 }
 
+#[cfg(feature = "certora")]
 fn set_payload_order(dynamic: &mut [u8], free_address: DataIndex) {
     get_mut_helper_order(dynamic, free_address)
         .set_payload_type(MarketDataTreeNodeType::RestingOrder as u8);
@@ -1640,6 +2040,7 @@ fn remove_from_orderbook_balance(
     fixed.orderbook_quote_atoms = fixed.orderbook_quote_atoms.saturating_sub(quote_amount);
 }
 
+#[inline(always)]
 fn remove_order_from_tree(
     fixed: &mut MarketFixed,
     dynamic: &mut [u8],
@@ -1685,6 +2086,7 @@ fn remove_order_from_tree(
     feature = "certora",
     cvt_hook_end(remove_order_from_tree_and_free_was_called())
 )]
+#[inline(always)]
 fn remove_order_from_tree_and_free(
     fixed: &mut MarketFixed,
     dynamic: &mut [u8],
@@ -1702,6 +2104,7 @@ fn remove_order_from_tree_and_free(
 }
 
 #[allow(unused_variables)]
+#[inline(always)]
 pub fn update_balance(
     fixed: &mut MarketFixed,
     dynamic: &mut [u8],
@@ -1797,6 +2200,12 @@ fn insert_order_into_tree(
     } else {
         Bookside::new(dynamic, fixed.asks_root_index, fixed.asks_best_index)
     };
+    #[cfg(not(feature = "certora"))]
+    tree.insert_with_payload_type::<{ MarketDataTreeNodeType::RestingOrder as u8 }>(
+        free_address,
+        *resting_order,
+    );
+    #[cfg(feature = "certora")]
     tree.insert(free_address, *resting_order);
 
     if is_bid {
@@ -1901,54 +2310,31 @@ pub fn create_empty_market(
     quote_mint: &str,
     base_decimals: u8,
     quote_decimals: u8,
-    mint_authority: &Pubkey,
+    // Unused since this stopped building `Mint` structs, but kept in the
+    // signature: the benchmarking harness in manifest-private calls this, and
+    // it has to compile against more than one revision of this crate.
+    _mint_authority: &Pubkey,
     market_key: &Pubkey,
 ) -> MarketFixed {
-    // Values on the mints are not important.
-    use solana_program::account_info::AccountInfo;
-    use spl_token_2022_interface::state::Mint;
-    use std::{cell::RefCell, rc::Rc, str::FromStr};
-    let mut lamports: u64 = 0;
-    let base_mint: MintAccountInfo = MintAccountInfo {
-        mint: Mint {
-            mint_authority: Some(*mint_authority).into(),
-            supply: 0,
-            decimals: base_decimals,
-            is_initialized: true,
-            freeze_authority: None.into(),
-        },
-        info: &AccountInfo {
-            key: &Pubkey::from_str(base_mint).expect("Valid base mint"),
-            lamports: Rc::new(RefCell::new(&mut lamports)),
-            data: Rc::new(RefCell::new(&mut [])),
-            owner: &Pubkey::new_unique(),
-            rent_epoch: 0,
-            is_signer: false,
-            is_writable: false,
-            executable: false,
-        },
-    };
-
-    let mut lamports: u64 = 0;
-    let quote_mint: MintAccountInfo = MintAccountInfo {
-        mint: Mint {
-            mint_authority: Some(*mint_authority).into(),
-            supply: 0,
-            decimals: quote_decimals,
-            is_initialized: true,
-            freeze_authority: None.into(),
-        },
-        info: &AccountInfo {
-            key: &Pubkey::from_str(quote_mint).expect("Valid quote mint"),
-            lamports: Rc::new(RefCell::new(&mut lamports)),
-            data: Rc::new(RefCell::new(&mut [])),
-            owner: &Pubkey::new_unique(),
-            rent_epoch: 0,
-            is_signer: false,
-            is_writable: false,
-            executable: false,
-        },
-    };
-    let market_fixed: MarketFixed = MarketFixed::new_empty(&base_mint, &quote_mint, market_key);
-    market_fixed
+    // Values on the mints are not important, and the runtime's account type
+    // cannot be built off chain, so this describes the mints by what a market
+    // records of them: their addresses and decimals.
+    use std::str::FromStr;
+    let base_mint: Pubkey = Pubkey::from_str(base_mint).expect("Valid base mint");
+    let quote_mint: Pubkey = Pubkey::from_str(quote_mint).expect("Valid quote mint");
+    let (base_vault, base_vault_bump) = get_vault_address(market_key, &base_mint);
+    let (quote_vault, quote_vault_bump) = get_vault_address(market_key, &quote_mint);
+    MarketFixed::new_empty_from_mint_parts(
+        &base_mint,
+        base_decimals,
+        &quote_mint,
+        quote_decimals,
+        base_vault,
+        base_vault_bump,
+        quote_vault,
+        quote_vault_bump,
+    )
 }
+
+#[path = "market_defrag.rs"]
+mod defrag;

@@ -7,6 +7,8 @@ import { placeOrder } from './placeOrder';
 import { OrderType } from '../src/manifest';
 import { deposit } from './deposit';
 import { areFloatsEqual } from './utils';
+import { describeIfDirectTest } from './helpers/mocha';
+import { FIXED_MANIFEST_HEADER_SIZE, NIL } from '../src/constants';
 
 async function setupMarketState(): Promise<Market> {
   const connection: Connection = new Connection(
@@ -158,7 +160,7 @@ async function testMarket(): Promise<void> {
   market.prettyPrint();
 }
 
-describe('Market test', () => {
+describeIfDirectTest(module, 'Market test', () => {
   let market: Market;
   let connection: Connection;
 
@@ -246,5 +248,25 @@ describe('Market test', () => {
 
   it('Market', async () => {
     await testMarket();
+  });
+
+  it('rejects an order whose trader index is not a claimed seat', async () => {
+    const account = await connection.getAccountInfo(market.address);
+    assert.isNotNull(account);
+    const malformed: Buffer = Buffer.from(account!.data);
+    const bidsRootIndex: number = malformed.readUInt32LE(156);
+    assert.notEqual(bidsRootIndex, NIL);
+
+    // A resting-order payload stores traderIndex after price, quantity, and
+    // sequence number: 16-byte node header + 16 + 8 + 8 payload bytes.
+    malformed.writeUInt32LE(
+      NIL,
+      FIXED_MANIFEST_HEADER_SIZE + bidsRootIndex + 48,
+    );
+
+    assert.throws(
+      () => Market.deserializeMarketBuffer(malformed, 0),
+      /unclaimed trader seat/,
+    );
   });
 });

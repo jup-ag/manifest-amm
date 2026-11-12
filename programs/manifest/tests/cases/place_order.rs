@@ -93,7 +93,7 @@ async fn place_order_fail_insufficient_funds_test() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn place_order_not_expand_if_not_needed_test() -> anyhow::Result<()> {
+async fn place_order_reserve_grows_one_node_per_batch_test() -> anyhow::Result<()> {
     let mut test_fixture: TestFixture = TestFixture::new().await;
     test_fixture.claim_seat().await?;
     test_fixture.deposit(Token::SOL, 1 * SOL_UNIT_SIZE).await?;
@@ -124,10 +124,11 @@ async fn place_order_not_expand_if_not_needed_test() -> anyhow::Result<()> {
         .try_load(&test_fixture.market_fixture.key)
         .await?
         .unwrap();
-    // Always 1 more than needed.
+    // One seat, one order and two spare nodes: each placement batch adds
+    // just one block, and cancel-only batches never expand the account.
     assert_eq!(
         loaded_account.data.len(),
-        MARKET_FIXED_SIZE + (3 * MARKET_BLOCK_SIZE)
+        MARKET_FIXED_SIZE + (4 * MARKET_BLOCK_SIZE)
     );
 
     Ok(())
@@ -296,6 +297,102 @@ async fn match_limit_orders_basic_test_reverse() -> anyhow::Result<()> {
             .get_base_balance_atoms(&test_fixture.payer())
             .await,
         0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_price_asks_match_fifo_in_program_test() -> anyhow::Result<()> {
+    let mut test_fixture: TestFixture = TestFixture::new().await;
+    test_fixture.claim_seat().await?;
+    test_fixture.deposit(Token::SOL, 3 * SOL_UNIT_SIZE).await?;
+
+    for num_base_atoms in [SOL_UNIT_SIZE, 2 * SOL_UNIT_SIZE] {
+        let num_base_atoms: u64 = num_base_atoms;
+        test_fixture
+            .place_order(
+                Side::Ask,
+                num_base_atoms,
+                1,
+                0,
+                NO_EXPIRATION_LAST_VALID_SLOT,
+                OrderType::Limit,
+            )
+            .await?;
+    }
+
+    let second_keypair: Keypair = test_fixture.second_keypair.insecure_clone();
+    test_fixture.claim_seat_for_keypair(&second_keypair).await?;
+    test_fixture
+        .deposit_for_keypair(Token::USDC, 1_000 * USDC_UNIT_SIZE, &second_keypair)
+        .await?;
+    test_fixture
+        .place_order_for_keypair(
+            Side::Bid,
+            SOL_UNIT_SIZE,
+            1,
+            0,
+            NO_EXPIRATION_LAST_VALID_SLOT,
+            OrderType::ImmediateOrCancel,
+            &second_keypair,
+        )
+        .await?;
+
+    let resting_orders: Vec<RestingOrder> = test_fixture.market_fixture.get_resting_orders().await;
+    assert_eq!(resting_orders.len(), 1);
+    assert_eq!(resting_orders[0].get_sequence_number(), 1);
+    assert_eq!(
+        resting_orders[0].get_num_base_atoms().as_u64(),
+        2 * SOL_UNIT_SIZE
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_price_bids_match_fifo_in_program_test() -> anyhow::Result<()> {
+    let mut test_fixture: TestFixture = TestFixture::new().await;
+    test_fixture.claim_seat().await?;
+    test_fixture
+        .deposit(Token::USDC, 3_000 * USDC_UNIT_SIZE)
+        .await?;
+
+    for num_base_atoms in [SOL_UNIT_SIZE, 2 * SOL_UNIT_SIZE] {
+        let num_base_atoms: u64 = num_base_atoms;
+        test_fixture
+            .place_order(
+                Side::Bid,
+                num_base_atoms,
+                1,
+                0,
+                NO_EXPIRATION_LAST_VALID_SLOT,
+                OrderType::Limit,
+            )
+            .await?;
+    }
+
+    let second_keypair: Keypair = test_fixture.second_keypair.insecure_clone();
+    test_fixture.claim_seat_for_keypair(&second_keypair).await?;
+    test_fixture
+        .deposit_for_keypair(Token::SOL, SOL_UNIT_SIZE, &second_keypair)
+        .await?;
+    test_fixture
+        .place_order_for_keypair(
+            Side::Ask,
+            SOL_UNIT_SIZE,
+            1,
+            0,
+            NO_EXPIRATION_LAST_VALID_SLOT,
+            OrderType::ImmediateOrCancel,
+            &second_keypair,
+        )
+        .await?;
+
+    let resting_orders: Vec<RestingOrder> = test_fixture.market_fixture.get_resting_orders().await;
+    assert_eq!(resting_orders.len(), 1);
+    assert_eq!(resting_orders[0].get_sequence_number(), 1);
+    assert_eq!(
+        resting_orders[0].get_num_base_atoms().as_u64(),
+        2 * SOL_UNIT_SIZE
     );
     Ok(())
 }
@@ -979,6 +1076,16 @@ async fn reverse_order_type_test() -> anyhow::Result<()> {
         7 * SOL_UNIT_SIZE
     );
 
+    // Independent exact reconciliation of the real vaults against seats plus
+    // amounts locked in resting orders.
+    crate::verify_vault_balance(
+        std::rc::Rc::clone(&test_fixture.context),
+        &test_fixture.market_fixture.key,
+        &[test_fixture.payer(), second_keypair.pubkey()],
+        true,
+    )
+    .await;
+
     Ok(())
 }
 
@@ -1085,13 +1192,19 @@ async fn reverse_order_tight_type_test() -> anyhow::Result<()> {
         first_bid.get_price(),
         QuoteAtomsPerBaseAtom::try_from_mantissa_and_exponent(29_985, -4).unwrap()
     );
-    // Balance is same.
+    // Balance is the same, plus one atom. The maker received 6_000_000_000
+    // quote for the fill and is debited the exact growth of the coalesced
+    // order's allocation: ceil(3_001_500_750 * 2.9985) -
+    // ceil(1_000_500_250 * 2.9985) = 8_999_999_999 - 3_000_000_000 =
+    // 5_999_999_999. The coalesced order can only ever refund
+    // 8_999_999_999, so debiting the full 6_000_000_000 would strand the
+    // extra atom in the vault; the maker keeps it instead.
     assert_eq!(
         test_fixture
             .market_fixture
             .get_quote_balance_atoms(&test_fixture.payer())
             .await,
-        10_000_000_000
+        10_000_000_001
     );
     assert_eq!(
         test_fixture
@@ -1132,13 +1245,14 @@ async fn reverse_order_tight_type_test() -> anyhow::Result<()> {
         QuoteAtomsPerBaseAtom::try_from_mantissa_and_exponent(3, 0).unwrap()
     );
 
-    // Maker's balances are unchanged.
+    // Maker's balances are unchanged, still carrying the rounding atom kept
+    // at the coalesce above.
     assert_eq!(
         test_fixture
             .market_fixture
             .get_quote_balance_atoms(&test_fixture.payer())
             .await,
-        10_000_000_000
+        10_000_000_001
     );
     assert_eq!(
         test_fixture
@@ -1147,6 +1261,128 @@ async fn reverse_order_tight_type_test() -> anyhow::Result<()> {
             .await,
         7 * SOL_UNIT_SIZE
     );
+
+    // Independent exact reconciliation of the real vaults against seats plus
+    // amounts locked in resting orders. The extra quote atom the maker keeps
+    // from the coalesce rounding is a seat balance, so it must still balance.
+    crate::verify_vault_balance(
+        std::rc::Rc::clone(&test_fixture.context),
+        &test_fixture.market_fixture.key,
+        &[test_fixture.payer(), second_keypair.pubkey()],
+        true,
+    )
+    .await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn reverse_order_coalesce_at_higher_price_does_not_overdraw_proceeds_test(
+) -> anyhow::Result<()> {
+    let mut test_fixture: TestFixture = TestFixture::new().await;
+    test_fixture.claim_seat().await?;
+    test_fixture
+        .deposit(Token::SOL, 2_000_000_000_000_000_000)
+        .await?;
+
+    // The lower ask is filled first and reverses to a bid at 3e-18. The
+    // higher ask has the maximum Reverse spread and reverses to 2e-18. Those
+    // reverse prices differ by one internal increment, so the second reverse
+    // bid coalesces into the existing, higher-priced bid.
+    test_fixture
+        .place_order(
+            Side::Ask,
+            1_000_000_000_000_000_000,
+            3,
+            -18,
+            0,
+            OrderType::Reverse,
+        )
+        .await?;
+    test_fixture
+        .place_order(
+            Side::Ask,
+            1_000_000_000_000_000_000,
+            4,
+            -18,
+            u16::MAX as u32,
+            OrderType::Reverse,
+        )
+        .await?;
+
+    let second_keypair: Keypair = test_fixture.second_keypair.insecure_clone();
+    test_fixture.claim_seat_for_keypair(&second_keypair).await?;
+    test_fixture
+        .deposit_for_keypair(Token::USDC, 7, &second_keypair)
+        .await?;
+
+    test_fixture
+        .place_order_for_keypair(
+            Side::Bid,
+            1_000_000_000_000_000_000,
+            3,
+            -18,
+            NO_EXPIRATION_LAST_VALID_SLOT,
+            OrderType::ImmediateOrCancel,
+            &second_keypair,
+        )
+        .await?;
+
+    // The maker has no spare quote balance after the first reverse bid rests.
+    assert_eq!(
+        test_fixture
+            .market_fixture
+            .get_quote_balance_atoms(&test_fixture.payer())
+            .await,
+        0
+    );
+
+    // Before the fix this fill reverted: growing the existing bid by the full
+    // requested amount cost 6 quote atoms at its 3e-18 price, while this fill
+    // only credited 4. The coalesced size is now capped at what those proceeds
+    // can back.
+    test_fixture
+        .place_order_for_keypair(
+            Side::Bid,
+            1_000_000_000_000_000_000,
+            4,
+            -18,
+            NO_EXPIRATION_LAST_VALID_SLOT,
+            OrderType::ImmediateOrCancel,
+            &second_keypair,
+        )
+        .await?;
+
+    let resting_orders: Vec<RestingOrder> = test_fixture.market_fixture.get_resting_orders().await;
+    assert_eq!(resting_orders.len(), 1);
+    assert!(resting_orders[0].get_is_bid());
+    assert_eq!(
+        resting_orders[0].get_price(),
+        QuoteAtomsPerBaseAtom::try_from_mantissa_and_exponent(3, -18).unwrap()
+    );
+    assert_eq!(
+        resting_orders[0].get_num_base_atoms().as_u64(),
+        2_333_333_333_333_333_333
+    );
+    assert_eq!(
+        test_fixture
+            .market_fixture
+            .get_quote_balance_atoms(&test_fixture.payer())
+            .await,
+        0
+    );
+
+    // Independent of the hand-computed balances above: reconcile the real vault
+    // token balances against the sum of seat balances and amounts locked in
+    // resting orders, exactly. A single atom stranded in the vault or missing
+    // from it (over- or under-backing the coalesced order) fails this.
+    crate::verify_vault_balance(
+        std::rc::Rc::clone(&test_fixture.context),
+        &test_fixture.market_fixture.key,
+        &[test_fixture.payer(), second_keypair.pubkey()],
+        true,
+    )
+    .await;
 
     Ok(())
 }

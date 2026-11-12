@@ -1,6 +1,7 @@
 const { Solita } = require('@metaplex-foundation/solita');
 const { spawnSync } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 const idlDir = __dirname;
 
 async function main() {
@@ -22,6 +23,63 @@ async function main() {
     const gen = new Solita(idl, { formatCode: true });
 
     gen.renderAndWriteTo(sdkDir).then(() => {
+      if (programName === 'manifest') {
+        for (const accountName of [
+          'BaseAtoms',
+          'QuoteAtoms',
+          'GlobalAtoms',
+          'QuoteAtomsPerBaseAtom',
+        ]) {
+          const accountFile = path.join(
+            sdkDir,
+            'accounts',
+            `${accountName}.ts`,
+          );
+          const beetName = `${accountName[0].toLowerCase()}${accountName.slice(1)}Beet`;
+          const source = fs.readFileSync(accountFile, 'utf8');
+          const deserialize = `    return ${beetName}.deserialize(buf, offset);`;
+          const checked =
+            `    if (offset < 0 || buf.length - offset < ${beetName}.byteSize) {\n` +
+            `      throw new RangeError('${accountName} buffer is truncated');\n` +
+            `    }\n${deserialize}`;
+          if (!source.includes(deserialize)) {
+            throw new Error(`Unable to harden ${accountFile}`);
+          }
+          fs.writeFileSync(accountFile, source.replace(deserialize, checked));
+        }
+      }
+      if (programName === 'manifest') {
+        // These two events are no longer emitted, see logs.rs. Solita does not
+        // carry documentation from the IDL, so the note that says so is put
+        // back here every time the client is regenerated.
+        const historicalBanner =
+          '/**\n' +
+          ' * Historical. The program stopped emitting this event when batch update\n' +
+          ' * stopped logging the orders it places and cancels; it is kept so that\n' +
+          ' * transactions from before that can still be decoded. Nothing emits it on new\n' +
+          ' * transactions.\n' +
+          ' *\n' +
+          ' * To learn which orders rested, read the `Program return:` line of the batch\n' +
+          ' * update instruction rather than watching for this event. Fills are still\n' +
+          ' * emitted as `FillLog`, and swap still emits `PlaceOrderLogV2`, which is a\n' +
+          ' * different event.\n' +
+          ' *\n' +
+          ' * @deprecated No longer emitted by the program.\n' +
+          ' */\n';
+        for (const accountName of ['PlaceOrderLog', 'CancelOrderLog']) {
+          const accountFile = path.join(sdkDir, 'accounts', `${accountName}.ts`);
+          const source = fs.readFileSync(accountFile, 'utf8');
+          const firstImport = source.indexOf('import ');
+          if (firstImport < 0) {
+            throw new Error(`Unable to annotate ${accountFile}`);
+          }
+          fs.writeFileSync(
+            accountFile,
+            source.slice(0, firstImport) + historicalBanner + source.slice(firstImport),
+          );
+        }
+      }
+
       console.log('Running prettier on generated files...');
       spawnSync('prettier', ['--write', sdkDir, '--trailing-comma all'], {
         stdio: 'inherit',

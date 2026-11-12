@@ -1,0 +1,28 @@
+name: Trade Verification
+on:
+  schedule:
+    - cron: "0 4,10,16,22 * * *"
+  workflow_dispatch:
+
+jobs:
+  trade-verification:
+    name: Trade Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Run the trade verification
+        run: yarn tsx scripts/verify-trades.ts
+        env:
+          RPC_URL: ${{ secrets.RPC_URL }}
+          STATS_SERVER_URL: ${{ secrets.STATS_SERVER_URL }}

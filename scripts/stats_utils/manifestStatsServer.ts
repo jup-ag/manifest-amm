@@ -1,0 +1,3583 @@
+import { FeeCollectionIndexer, feeRpc } from './feeCollections';
+import { Mutex } from 'async-mutex';
+import * as promClient from 'prom-client';
+import {
+  AccountInfo,
+  Connection,
+  GetProgramAccountsResponse,
+  PublicKey,
+} from '@solana/web3.js';
+
+const WRAPPER_PROGRAM_ID = new PublicKey(
+  'wMNFSTkir3HgyZTsB7uqu3i7FA73grFCptPXgrZjksL',
+);
+import {
+  FillLogResult,
+  ManifestClient,
+  Market,
+  RestingOrder,
+} from '../../client/ts/src';
+import { SLOTS_PER_DAY } from '../../client/ts/src/constants';
+import { Pool, PoolClient, QueryResult } from 'pg';
+import {
+  VOLUME_CHECKPOINT_DURATION_SEC,
+  ONE_DAY_SEC,
+  DEPTHS_BPS,
+  SOL_USDC_MARKET,
+  CBBTC_USDC_MARKET,
+  WBTC_USDC_MARKET,
+  USDC_MINT,
+  SOL_MINT,
+  CBBTC_MINT,
+  WBTC_MINT,
+  STABLECOIN_MINTS,
+} from './constants';
+import {
+  resolveActualTrader,
+  chunks,
+  fetchBtcPriceFromCoinGecko,
+  getLifetimeVolumeForMarkets,
+  sendDiscordNotification,
+} from './utils';
+import { safeAtomsToNumber } from './safeAtoms';
+import * as queries from './queries';
+import { lookupMintTicker } from './mint';
+import {
+  fetchMarketProgramAccounts,
+  MARKET_EVICTION_HIGH_WATER,
+  MARKET_EVICTION_LOW_WATER,
+  MAX_TRACKED_MARKETS,
+} from './marketFetcher';
+import { calculateTraderPnL } from './pnl';
+import { TraderVolumeIndex } from './traderVolumeIndex';
+import { CompleteFillsQueryOptions, CompleteFillsQueryResult } from './types';
+import { positiveIntFromEnv } from './httpValidation';
+import { withRetry } from './utils';
+import { WebSocketManager } from './websocketManager';
+import { parseTransactionForFills } from './backfill';
+import { VolumeMonitor } from './volumeMonitor';
+import { MarketMakerMonitor } from './marketMakerMonitor';
+import { appendUniqueFill } from './fillRetention';
+import { aggregateTickers, MarketTicker } from './tickers';
+
+// Memory management constants
+const MAX_TRADERS = 50000; // Maximum number of traders to track in memory
+const MAX_FILL_LOG_MARKETS = 500; // Maximum number of markets to track fills for
+const MAX_GECKO_EVENTS_PER_BLOCK: number = 4_096;
+
+export class ManifestStatsServer {
+  private connection: Connection;
+  private wsManager: WebSocketManager | null = null;
+  // Base and quote volume
+  private baseVolumeAtomsSinceLastCheckpoint: Map<string, number> = new Map();
+  private quoteVolumeAtomsSinceLastCheckpoint: Map<string, number> = new Map();
+
+  // Hourly checkpoints
+  private baseVolumeAtomsCheckpoints: Map<string, number[]> = new Map();
+  private quoteVolumeAtomsCheckpoints: Map<string, number[]> = new Map();
+
+  // Unix timestamps for each checkpoint (in seconds)
+  private checkpointTimestamps: Map<string, number[]> = new Map();
+
+  // Last price by market. Price is in atoms per atom.
+  private lastPriceByMarket: Map<string, number> = new Map();
+
+  // Pubkey to the number of taker & maker trades.
+  private traderNumTakerTrades: Map<string, number> = new Map();
+  private traderNumMakerTrades: Map<string, number> = new Map();
+
+  private traderPositions: Map<string, Map<string, number>> = new Map();
+  private traderAcquisitionValue: Map<string, Map<string, number>> = new Map();
+
+  // Market objects used for mints and decimals.
+  private markets: Map<string, Market> = new Map();
+
+  // PnL lookup index: base mint -> market pubkeys whose quote mint is a
+  // stablecoin. Lets calculateTraderPnL find the stablecoin market for a
+  // position by direct lookup instead of scanning (and base58-encoding) every
+  // market on every request. Kept in sync via indexMarketForPnL whenever a
+  // market is added to `markets`. Insertion order within each list mirrors the
+  // `markets` map, preserving the original "first matching market" behavior.
+  private baseMintToStablecoinMarkets: Map<string, string[]> = new Map();
+
+  // Tickers. Ticker from metaplex metadata with a fallback to spl token
+  // registry for old stuff like wsol.
+  private tickers: Map<string, [string, string]> = new Map();
+
+  // Cached, pre-serialized pair and per-market JSON for /tickers. Rebuilt on each
+  // checkpoint advance (every VOLUME_CHECKPOINT_DURATION_SEC, ~5 min) so the
+  // endpoint serves a string verbatim instead of looping over every market,
+  // base58-encoding mints, and running JSON.stringify on every request.
+  //
+  // NOTE: the `last_price` in this snapshot is only as fresh as the last
+  // checkpoint advance, so it can be up to ~5 minutes stale. `lastPriceByMarket`
+  // updates on every fill, but this snapshot is only rebuilt on advance (the 24h
+  // volume figures it also contains only change on advance, which is why caching
+  // here is otherwise lossless).
+  //
+  // If up-to-the-fill `last_price` is required, switch to "Option B": instead of
+  // caching the fully-rendered string, cache only the price-independent parts
+  // per market (ticker_id, base/target currency, base/target volume, and the
+  // baseDecimals-quoteDecimals factor) on each advance, then in the /tickers
+  // handler map over that cached array applying the current
+  // `lastPriceByMarket.get(marketPk)` value and JSON.stringify per request. That
+  // keeps prices live at the cost of a light per-request loop + serialization,
+  // while still avoiding the 24h-volume summation and base58 work.
+  private cachedTickersJson: string | null = null;
+  private cachedAggregatedTickersJson: string | null = null;
+  private cachedVolumeJson: string = '{}';
+  private cachedNotionalJson: string = '{}';
+  private cachedCheckpointsJson: string = '{}';
+  private cachedWrappersJson: string = '{}';
+
+  // Cached lifetime (total) volume in USDC equivalent for the /volume endpoint.
+  // Computing this requires a getProgramAccounts RPC call (see
+  // ManifestClient.getMarketProgramAccounts - "expensive RPC load"), which is
+  // far too slow to run on the request path: it scans every account owned by
+  // the program, is heavily rate-limited by RPC providers, and previously fired
+  // once per /volume request (a thundering herd under concurrent load), causing
+  // multi-second latency spikes. Instead we refresh this value in the
+  // background on each checkpoint advance (~5 min) and serve it verbatim.
+  // null until the first refresh completes (lazily triggered on first request).
+  private cachedLifetimeVolume: number | null = null;
+  // Guards against overlapping background refreshes (the RPC call can take
+  // several seconds; advances/requests must not stack up concurrent calls).
+  private lifetimeVolumeRefreshInFlight: boolean = false;
+
+  // Wall-clock ms of the last time each market's on-chain account (and thus its
+  // orderbook order state) was loaded from RPC for the /orderbook endpoint.
+  // Previously /orderbook did a fresh Market.loadFromAddress RPC call on every
+  // request (no caching, no dedup), which dominated its latency and amplified
+  // RPC load under concurrent requests for the same market. We now assume a
+  // market's order state is good for at least ORDERBOOK_MARKET_TTL_MS and serve
+  // the cached Market object within that window, reloading from RPC only when
+  // the cached copy is stale (or the market has never been loaded).
+  //
+  // The reload is lazy: it happens on the request path when a market is found
+  // to be stale, NOT on checkpoint advance. Idle markets are never refreshed,
+  // so this costs nothing for markets nobody is querying.
+  private orderbookMarketLastLoadMs: Map<string, number> = new Map();
+  private orderbookMarketRefreshes: Map<string, Promise<Market | undefined>> =
+    new Map();
+  // Markets are assumed fresh for at least this long. Matches the ~5 min
+  // checkpoint cadence (VOLUME_CHECKPOINT_DURATION_SEC) used elsewhere.
+  private readonly ORDERBOOK_MARKET_TTL_MS: number = 5 * 60 * 1000;
+
+  private lastFillSlot: number = 0;
+
+  // Recent fill log results. This is not saved to database. So on a refresh,
+  // the recentFills is not complete. The completeFills query will be correct
+  // however.
+  private fillLogResults: Map<string, FillLogResult[]> = new Map();
+
+  // Mutex to guard all the recent fills, volume, ... Most important for recent
+  // fills when a fill spills over to multiple maker orders and bursts in fill
+  // logs.
+  private fillMutex: Mutex = new Mutex();
+
+  private traderTakerNotionalVolume: Map<string, number> = new Map();
+  private traderMakerNotionalVolume: Map<string, number> = new Map();
+  // Traders kept sorted by total notional volume so /traders can read the
+  // top-N without re-sorting every trader per request. Updated in lockstep
+  // with the two volume maps above via addTraderNotionalVolume / ensure.
+  private traderVolumeIndex: TraderVolumeIndex = new TraderVolumeIndex();
+  private pool: Pool;
+  private isReadOnly: boolean;
+  private startTime: number;
+
+  // Prometheus metrics
+  private fills: promClient.Counter<'market'>;
+  private reconnects: promClient.Counter<string>;
+  private volume: promClient.Gauge<'market' | 'mint' | 'side'>;
+  private lastPrice: promClient.Gauge<'market'>;
+  private depth: promClient.Gauge<'depth_bps' | 'market' | 'trader'>;
+  private aggregatorQuoteVolume: promClient.Counter<'aggregator' | 'quote'>;
+  private originatingProtocolQuoteVolume: promClient.Counter<
+    'protocol' | 'quote'
+  >;
+  private dbQueryCount: promClient.Counter<'query_type' | 'status'>;
+  private dbQueryDuration: promClient.Histogram<'query_type'>;
+
+  // Discord alerting
+  private discordWebhookUrl: string | undefined;
+  private lastErrorAlertSentTimeMs: number = Date.now();
+
+  // Some database errors (e.g. DNS resolution failures like ENOTFOUND) are
+  // transient and self-resolve. We only alert on them if they persist, i.e.
+  // keep occurring for at least TRANSIENT_ERROR_PERSIST_MS with no successful
+  // query in between. firstTransientErrorTimeMs tracks when the current run of
+  // transient errors began, and is cleared on any successful query.
+  private static readonly TRANSIENT_ERROR_CODES: ReadonlySet<string> = new Set([
+    'ENOTFOUND',
+    'EAI_AGAIN',
+  ]);
+  private static readonly TRANSIENT_ERROR_PERSIST_MS: number = 5 * 60 * 1_000;
+  private firstTransientErrorTimeMs: number | null = null;
+
+  // Allquiet alerting
+  private allquietWebhookUrl: string | undefined;
+
+  // Wrapper cache: owner pubkey -> wrapper pubkey
+  private wrapperCache: Map<string, string> = new Map();
+
+  // Ticker lookup backoff: global throttle to avoid spamming RPC
+  private tickerLookupLastAttempt: number = 0;
+  private readonly TICKER_LOOKUP_BACKOFF_MS: number = 5_000; // 5 seconds between attempts
+  // Delay between RPC lookups of distinct mints during the startup pass.
+  private readonly TICKER_LOOKUP_DELAY_MS: number = 500;
+
+  // GeckoTerminal integration: block-indexed event storage
+  // Map<slot, { blockTime: number, events: FillLogResult[] }>
+  private geckoBlockEvents: Map<
+    number,
+    { blockTime: number; events: FillLogResult[] }
+  > = new Map();
+  // Track ordered list of slots for efficient cleanup
+  private geckoBlockSlots: number[] = [];
+  // Maximum blocks to keep
+  private readonly GECKO_MAX_BLOCKS = 1000;
+  // Token metadata derived from markets: Map<mintAddress, { symbol: string, decimals: number }>
+  private tokenMetadata: Map<string, { symbol: string; decimals: number }> =
+    new Map();
+  // Track latest block timestamp
+  private latestBlockTime: number = 0;
+
+  // Track when each market was created (block timestamp of first fill)
+  // Defaults to 0 until backfilled from database
+  private createdAtBlockTimestamp: Map<string, number> = new Map();
+
+  // Checkpoint protection: track how many checkpoint advances have occurred since startup
+  // to prevent overwriting good database data before new data has accumulated
+  private checkpointAdvancesSinceStartup: number = 0;
+  // Minimum number of checkpoint advances required before allowing database save
+  // With 5-minute checkpoint intervals, 12 advances = 1 hour of accumulated data
+  private readonly MIN_CHECKPOINT_ADVANCES_BEFORE_SAVE: number = 12;
+
+  // Volume monitoring for alerts
+  private volumeMonitor: VolumeMonitor;
+
+  // Market maker monitoring for alerts
+  private marketMakerMonitor: MarketMakerMonitor;
+
+  // Backfill runs arrive as a burst of per-signature requests (e.g. from
+  // trade verification). Stats accumulate here and a single summary Discord
+  // alert is sent once the burst has been quiet for the debounce interval,
+  // instead of one alert per truncated transaction.
+  private backfillRunStats: {
+    transactions: number;
+    backfilled: number;
+    alreadyExisted: number;
+    truncatedSignatures: string[];
+  } = {
+    transactions: 0,
+    backfilled: 0,
+    alreadyExisted: 0,
+    truncatedSignatures: [],
+  };
+  private backfillSummaryTimer: NodeJS.Timeout | null = null;
+  private readonly BACKFILL_SUMMARY_DEBOUNCE_MS: number = 120_000;
+  private readonly BACKFILL_SUMMARY_MAX_SIGNATURES: number = 15;
+
+  readonly feeCollections: FeeCollectionIndexer;
+
+  constructor(
+    rpcUrl: string,
+    isReadOnly: boolean,
+    databaseUrl: string | undefined,
+    metrics: {
+      fills: promClient.Counter<'market'>;
+      reconnects: promClient.Counter<string>;
+      volume: promClient.Gauge<'market' | 'mint' | 'side'>;
+      lastPrice: promClient.Gauge<'market'>;
+      depth: promClient.Gauge<'depth_bps' | 'market' | 'trader'>;
+      aggregatorQuoteVolume: promClient.Counter<'aggregator' | 'quote'>;
+      originatingProtocolQuoteVolume: promClient.Counter<'protocol' | 'quote'>;
+      dbQueryCount: promClient.Counter<'query_type' | 'status'>;
+      dbQueryDuration: promClient.Histogram<'query_type'>;
+    },
+  ) {
+    this.isReadOnly = isReadOnly;
+    this.startTime = Date.now();
+    this.connection = new Connection(rpcUrl);
+    this.fills = metrics.fills;
+    this.reconnects = metrics.reconnects;
+    this.volume = metrics.volume;
+    this.lastPrice = metrics.lastPrice;
+    this.depth = metrics.depth;
+    this.aggregatorQuoteVolume = metrics.aggregatorQuoteVolume;
+    this.originatingProtocolQuoteVolume =
+      metrics.originatingProtocolQuoteVolume;
+    this.dbQueryCount = metrics.dbQueryCount;
+    this.dbQueryDuration = metrics.dbQueryDuration;
+    this.discordWebhookUrl = process.env.TVL_DISCORD_WEBHOOK_URL;
+    this.allquietWebhookUrl = process.env.ALLQUIET_WEBHOOK_URL;
+
+    this.pool = new Pool({
+      connectionString: databaseUrl,
+      // Never silently accept a forged database certificate.
+      ssl: { rejectUnauthorized: true },
+      statement_timeout: 15_000,
+      // pg defaults to 10, which is below what the read API alone wants and is
+      // shared with fill ingestion, so reads could starve writes. Sized so the
+      // /completeFills concurrency limit (STATS_MAX_CONCURRENT_QUERIES) leaves
+      // headroom for the writers; raise both together.
+      max: positiveIntFromEnv('STATS_DB_POOL_MAX', 40),
+    });
+
+    this.feeCollections = new FeeCollectionIndexer(
+      feeRpc(process.env.FEES_RPC_URL || rpcUrl),
+    );
+
+    this.pool.on('error', (err) => {
+      console.error('Unexpected database pool error:', err);
+      // Continue operation - don't let DB errors crash the server
+    });
+
+    // Only initialize database schema if not in read-only mode
+    if (!this.isReadOnly) {
+      this.initDatabase();
+    }
+
+    // Initialize volume monitor for alerts
+    this.volumeMonitor = new VolumeMonitor(
+      process.env.TVL_DISCORD_WEBHOOK_URL,
+      (): number => this.getSolPrice(),
+      (marketPk: string): Market | undefined => this.markets.get(marketPk),
+      (marketPk: string): [string, string] | undefined =>
+        this.tickers.get(marketPk),
+    );
+
+    // Initialize market maker monitor
+    this.marketMakerMonitor = new MarketMakerMonitor(
+      process.env.TVL_DISCORD_WEBHOOK_URL,
+      (): Map<string, number> => this.traderMakerNotionalVolume,
+    );
+  }
+
+  /**
+   * Get SOL price in USDC from the SOL/USDC market
+   */
+  private getSolPrice(): number {
+    const solPriceAtoms: number | undefined =
+      this.lastPriceByMarket.get(SOL_USDC_MARKET);
+    const solUsdcMarket: Market | undefined = this.markets.get(SOL_USDC_MARKET);
+    if (solPriceAtoms && solUsdcMarket) {
+      return (
+        solPriceAtoms *
+        10 ** (solUsdcMarket.baseDecimals() - solUsdcMarket.quoteDecimals())
+      );
+    }
+    return 0;
+  }
+
+  /**
+   * Check hourly volume change - should be called every hour
+   */
+  async checkHourlyVolumeChange(): Promise<void> {
+    await this.volumeMonitor.checkHourlyVolumeChange();
+  }
+
+  /**
+   * Check for new market makers and large maker volume changes.
+   * Should be called every hour.
+   */
+  async checkHourlyMarketMakerChanges(): Promise<void> {
+    await this.marketMakerMonitor.checkHourlyChanges();
+  }
+
+  private initTraderPositionTracking(trader: string): void {
+    if (!this.traderPositions.has(trader)) {
+      this.traderPositions.set(trader, new Map<string, number>());
+    }
+    if (!this.traderAcquisitionValue.has(trader)) {
+      this.traderAcquisitionValue.set(trader, new Map<string, number>());
+    }
+  }
+
+  private updateTraderPosition(
+    trader: string,
+    baseMint: string,
+    baseAtomsDelta: number,
+    quoteAtoms: number,
+    market: Market,
+  ): void {
+    const positions = this.traderPositions.get(trader)!;
+    const acquisitionValues = this.traderAcquisitionValue.get(trader)!;
+
+    // Get current position
+    const currentPosition = positions.get(baseMint) || 0;
+    const newPosition = currentPosition + baseAtomsDelta;
+
+    // Update position
+    positions.set(baseMint, newPosition);
+
+    // Get current acquisition value
+    const currentValue = acquisitionValues.get(baseMint) || 0;
+    // quoteAtoms was already converted via safeAtomsToNumber by the caller.
+    const usdcValue = quoteAtoms / 10 ** market.quoteDecimals();
+
+    if (baseAtomsDelta > 0) {
+      acquisitionValues.set(baseMint, currentValue + usdcValue);
+    } else {
+      acquisitionValues.set(baseMint, currentValue - usdcValue);
+    }
+  }
+
+  /**
+   * Send alert to allquiet.app for database error
+   */
+  private async sendAllquietAlert(error: any): Promise<void> {
+    if (!this.allquietWebhookUrl) {
+      return;
+    }
+
+    try {
+      const response = await fetch(this.allquietWebhookUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          alertName: 'Manifest Stats Server Database Error',
+          alertStatus: 'firing',
+          description: `Database error occurred: ${error.code || 'unknown'} - ${error.message || 'No message'}`,
+        }),
+      });
+
+      if (!response.ok) {
+        console.error(
+          `Failed to send allquiet alert: ${response.status} ${response.statusText}`,
+        );
+      } else {
+        console.log('Allquiet alert sent for database error');
+      }
+    } catch (alertError) {
+      console.error('Error sending allquiet alert:', alertError);
+    }
+  }
+
+  /**
+   * Send alerts for database error (allquiet.app and Discord)
+   * Rate limited to at most once per hour to avoid spam.
+   */
+  private async sendDatabaseErrorAlert(error: any): Promise<void> {
+    const now_ms: number = Date.now();
+
+    // Transient errors (e.g. DNS resolution failures) are not alertable unless
+    // they persist. Suppress the alert until such an error has been occurring
+    // continuously (no successful query in between) for at least
+    // TRANSIENT_ERROR_PERSIST_MS.
+    if (ManifestStatsServer.TRANSIENT_ERROR_CODES.has(error?.code)) {
+      if (this.firstTransientErrorTimeMs === null) {
+        this.firstTransientErrorTimeMs = now_ms;
+      }
+      if (
+        now_ms - this.firstTransientErrorTimeMs <
+        ManifestStatsServer.TRANSIENT_ERROR_PERSIST_MS
+      ) {
+        console.warn(
+          `Suppressing transient database error alert (${error.code}); ` +
+            `will alert if it persists.`,
+        );
+        return;
+      }
+    }
+
+    // Only send alerts once an hour to avoid spam.
+    if (now_ms - this.lastErrorAlertSentTimeMs < 60 * 60 * 1_000) {
+      return;
+    }
+
+    this.lastErrorAlertSentTimeMs = Date.now();
+
+    // Send to allquiet.app (rate limited by check above)
+    await this.sendAllquietAlert(error);
+
+    // Send to Discord if configured (rate limited by check above)
+    if (this.discordWebhookUrl) {
+      const message = `**Database Alert**
+**Error Details:**
+- Code: ${error.code}
+- Message: ${error.message}
+- Time: ${new Date().toISOString()}
+`;
+
+      try {
+        await sendDiscordNotification(this.discordWebhookUrl, message, {
+          title: '🚨 Database Error Detected',
+          timestamp: true,
+        });
+        console.error('Discord alert sent for database error');
+      } catch (notificationError: unknown) {
+        // Error reporting must never mask the database error or interrupt a
+        // transaction rollback owned by the caller.
+        console.error(
+          'Failed to send Discord database alert:',
+          notificationError,
+        );
+      }
+    }
+  }
+
+  /**
+   * Execute database query with metrics collection
+   */
+  private async executeQueryWithMetrics<T = QueryResult>(
+    queryType: string,
+    queryFn: () => Promise<T>,
+  ): Promise<T> {
+    const timer: () => number = this.dbQueryDuration.startTimer({
+      query_type: queryType,
+    });
+
+    try {
+      const result: T = await queryFn();
+      this.dbQueryCount.inc({ query_type: queryType, status: 'success' });
+      // A successful query means any prior transient error has resolved, so
+      // reset the persistence tracker.
+      this.firstTransientErrorTimeMs = null;
+      return result;
+    } catch (error: any) {
+      this.dbQueryCount.inc({ query_type: queryType, status: 'error' });
+      throw error;
+    } finally {
+      timer();
+    }
+  }
+
+  /**
+   * Execute client query with metrics collection (for transactions)
+   */
+  private async executeClientQueryWithMetrics<T = QueryResult>(
+    client: PoolClient,
+    queryType: string,
+    query: string,
+    params?: any[],
+  ): Promise<T> {
+    const timer = this.dbQueryDuration.startTimer({ query_type: queryType });
+
+    try {
+      const result = await client.query(query, params);
+      this.dbQueryCount.inc({ query_type: queryType, status: 'success' });
+      return result as T;
+    } catch (error) {
+      this.dbQueryCount.inc({ query_type: queryType, status: 'error' });
+      throw error;
+    } finally {
+      timer();
+    }
+  }
+
+  /**
+   * Save complete fill to database immediately (async, non-blocking)
+   */
+  private async saveCompleteFillToDatabase(fill: FillLogResult): Promise<void> {
+    if (this.isReadOnly) {
+      return; // Skip database writes in read-only mode
+    }
+
+    try {
+      await withRetry(async () => {
+        await this.executeQueryWithMetrics('INSERT_FILL_COMPLETE', async () =>
+          this.pool.query(queries.INSERT_FILL_COMPLETE, [
+            fill.slot,
+            fill.market,
+            fill.signature,
+            fill.taker,
+            fill.maker,
+            fill.takerSequenceNumber,
+            fill.makerSequenceNumber,
+            JSON.stringify(fill),
+          ]),
+        );
+      });
+    } catch (error) {
+      console.error('Error saving complete fill to database:', error);
+      await this.sendDatabaseErrorAlert(error);
+      // Don't throw - fire and forget
+    }
+  }
+
+  private async processFillAsync(fill: FillLogResult): Promise<void> {
+    try {
+      const { market, baseAtoms, quoteAtoms, priceAtoms, taker, maker } = fill;
+
+      // Use originalSigner if available (it's optional in FillLogResult)
+      const originalSigner = (fill as any).originalSigner;
+      const actualTaker = resolveActualTrader(taker, originalSigner);
+
+      // Update trader counts
+      this.traderNumTakerTrades.set(
+        actualTaker,
+        (this.traderNumTakerTrades.get(actualTaker) || 0) + 1,
+      );
+      this.traderNumMakerTrades.set(
+        maker,
+        (this.traderNumMakerTrades.get(maker) || 0) + 1,
+      );
+
+      // Initialize notional volumes if needed
+      if (!this.traderTakerNotionalVolume.has(actualTaker)) {
+        this.traderTakerNotionalVolume.set(actualTaker, 0);
+      }
+      if (!this.traderMakerNotionalVolume.has(maker)) {
+        this.traderMakerNotionalVolume.set(maker, 0);
+      }
+      // Track both traders in the sorted volume index (at volume 0 if new) so
+      // /traders sees the same trader set as the num-trades maps.
+      this.traderVolumeIndex.ensure(actualTaker);
+      this.traderVolumeIndex.ensure(maker);
+
+      // Load market and look up tickers if missing (with backoff to avoid RPC spam).
+      await this.attemptTickerLookup(market);
+      const marketObject: Market | undefined = this.markets.get(market);
+      if (!marketObject) {
+        return;
+      }
+
+      // Update price and volume (skip volume for self-trades where maker === taker)
+      this.lastPrice.set(
+        { market },
+        priceAtoms *
+          10 ** (marketObject.baseDecimals() - marketObject.quoteDecimals()),
+      );
+
+      this.lastPriceByMarket.set(market, priceAtoms);
+
+      // Skip volume counting for self-trades (wash trades)
+      if (maker !== actualTaker) {
+        this.baseVolumeAtomsSinceLastCheckpoint.set(
+          market,
+          (this.baseVolumeAtomsSinceLastCheckpoint.get(market) || 0) +
+            safeAtomsToNumber(baseAtoms),
+        );
+        this.quoteVolumeAtomsSinceLastCheckpoint.set(
+          market,
+          (this.quoteVolumeAtomsSinceLastCheckpoint.get(market) || 0) +
+            safeAtomsToNumber(quoteAtoms),
+        );
+
+        // Attribute quote volume to the routing source. Only SOL- and
+        // USDC-quote markets are counted; the quote label is the denomination.
+        const quoteMint: string = marketObject.quoteMint().toBase58();
+        const quote: string | undefined =
+          quoteMint === SOL_MINT
+            ? 'sol'
+            : quoteMint === USDC_MINT
+              ? 'usdc'
+              : undefined;
+        if (quote) {
+          const quoteVolumeAtoms: number = safeAtomsToNumber(quoteAtoms);
+          this.aggregatorQuoteVolume.inc(
+            { aggregator: fill.aggregator ?? 'none', quote },
+            quoteVolumeAtoms,
+          );
+          this.originatingProtocolQuoteVolume.inc(
+            { protocol: fill.originatingProtocol ?? 'none', quote },
+            quoteVolumeAtoms,
+          );
+        }
+
+        // Process notional volumes and positions
+        await this.updateTradingMetrics(fill, marketObject, actualTaker);
+
+        // Process fill for volume monitoring and large fill alerts
+        await this.volumeMonitor.processFill(fill);
+      }
+    } catch (error) {
+      console.error(
+        'Error in background fill processing:',
+        error,
+        'Fill:',
+        fill,
+      );
+      // Don't throw - this is fire-and-forget
+    }
+  }
+
+  /**
+   * Attempt to look up and update tickers for a market.
+   * Backoff only applies to RPC calls (lookupMintTicker), not the check itself.
+   */
+  private async attemptTickerLookup(market: string): Promise<void> {
+    let marketObject: Market | undefined = this.markets.get(market);
+    if (!marketObject) {
+      marketObject = await this.loadNewMarket(market);
+      if (!marketObject) {
+        return;
+      }
+    }
+
+    const tickers: [string, string] | undefined = this.tickers.get(market);
+    const needsBaseLookup: boolean =
+      !tickers || !tickers[0] || tickers[0] === '';
+    const needsQuoteLookup: boolean =
+      !tickers || !tickers[1] || tickers[1] === '';
+
+    if (!needsBaseLookup && !needsQuoteLookup) {
+      return;
+    }
+
+    // Only apply backoff when we actually need to make RPC calls
+    const now: number = Date.now();
+    if (now - this.tickerLookupLastAttempt <= this.TICKER_LOOKUP_BACKOFF_MS) {
+      return;
+    }
+    this.tickerLookupLastAttempt = now;
+
+    const currentBase: string = tickers?.[0] ?? '';
+    const currentQuote: string = tickers?.[1] ?? '';
+
+    const newBase: string = needsBaseLookup
+      ? await lookupMintTicker(this.connection, marketObject.baseMint())
+      : currentBase;
+    const newQuote: string = needsQuoteLookup
+      ? await lookupMintTicker(this.connection, marketObject.quoteMint())
+      : currentQuote;
+
+    this.tickers.set(market, [newBase, newQuote]);
+  }
+
+  // Helper method for market loading. Does not look up tickers - callers must handle separately.
+  private async loadNewMarket(market: string): Promise<Market | undefined> {
+    try {
+      if (
+        !this.markets.has(market) &&
+        !this.baseVolumeAtomsCheckpoints.has(market) &&
+        Math.max(this.markets.size, this.baseVolumeAtomsCheckpoints.size) >=
+          MAX_TRACKED_MARKETS
+      ) {
+        throw new RangeError(
+          `Refusing to track more than ${MAX_TRACKED_MARKETS} markets`,
+        );
+      }
+      // Validate and load the market BEFORE touching any state maps. A null,
+      // undefined, or otherwise invalid `market` (e.g. from a malformed fill)
+      // would throw in `new PublicKey(market)`; initializing the checkpoint maps
+      // first left a bogus key behind that later violated the NOT NULL
+      // constraint on market_checkpoints.market during saveVolumeAndMarketData.
+      const marketPk = new PublicKey(market);
+      const marketObject = await Market.loadFromAddress({
+        connection: this.connection,
+        address: marketPk,
+      });
+
+      // Only initialize checkpoint state once we know the market is valid.
+      if (!this.baseVolumeAtomsCheckpoints.has(market)) {
+        this.baseVolumeAtomsSinceLastCheckpoint.set(market, 0);
+        this.quoteVolumeAtomsSinceLastCheckpoint.set(market, 0);
+        this.baseVolumeAtomsCheckpoints.set(
+          market,
+          new Array<number>(ONE_DAY_SEC / VOLUME_CHECKPOINT_DURATION_SEC).fill(
+            0,
+          ),
+        );
+        this.quoteVolumeAtomsCheckpoints.set(
+          market,
+          new Array<number>(ONE_DAY_SEC / VOLUME_CHECKPOINT_DURATION_SEC).fill(
+            0,
+          ),
+        );
+        this.checkpointTimestamps.set(
+          market,
+          new Array<number>(ONE_DAY_SEC / VOLUME_CHECKPOINT_DURATION_SEC).fill(
+            0,
+          ),
+        );
+      }
+
+      this.markets.set(market, marketObject);
+      this.indexMarketForPnL(market, marketObject);
+      return marketObject;
+    } catch (error) {
+      console.error('Error loading market:', market, error);
+      return undefined; // Changed from null to undefined
+    }
+  }
+
+  // Add a market to the base-mint -> stablecoin-market index used by
+  // calculateTraderPnL. Idempotent: safe to call when a market is reloaded.
+  private indexMarketForPnL(marketPk: string, market: Market): void {
+    if (!STABLECOIN_MINTS.has(market.quoteMint().toBase58())) {
+      return;
+    }
+    const baseMint = market.baseMint().toBase58();
+    let marketsForBase = this.baseMintToStablecoinMarkets.get(baseMint);
+    if (marketsForBase === undefined) {
+      marketsForBase = [];
+      this.baseMintToStablecoinMarkets.set(baseMint, marketsForBase);
+    }
+    if (!marketsForBase.includes(marketPk)) {
+      marketsForBase.push(marketPk);
+    }
+  }
+
+  // Single chokepoint for trader notional-volume changes. Updates the per-side
+  // map and the sorted volume index together so they can never drift. The index
+  // tracks the taker+maker sum, so a delta to either side shifts the sum by the
+  // same delta.
+  private addTraderNotionalVolume(
+    trader: string,
+    side: 'taker' | 'maker',
+    delta: number,
+  ): void {
+    const map: Map<string, number> =
+      side === 'taker'
+        ? this.traderTakerNotionalVolume
+        : this.traderMakerNotionalVolume;
+    map.set(trader, (map.get(trader) || 0) + delta);
+    this.traderVolumeIndex.add(trader, delta);
+  }
+
+  // Helper method for trading metrics
+  private async updateTradingMetrics(
+    fill: FillLogResult,
+    marketObject: Market,
+    actualTaker: string,
+  ): Promise<void> {
+    const { baseAtoms, quoteAtoms, takerIsBuy, maker } = fill;
+    const quoteMint = marketObject.quoteMint().toBase58();
+
+    if (STABLECOIN_MINTS.has(quoteMint)) {
+      const notionalVolume =
+        safeAtomsToNumber(quoteAtoms) / 10 ** marketObject.quoteDecimals();
+
+      this.addTraderNotionalVolume(actualTaker, 'taker', notionalVolume);
+      this.addTraderNotionalVolume(maker, 'maker', notionalVolume);
+
+      const baseMint = marketObject.baseMint().toBase58();
+      this.initTraderPositionTracking(actualTaker);
+      this.initTraderPositionTracking(maker);
+
+      this.updateTraderPosition(
+        actualTaker,
+        baseMint,
+        takerIsBuy
+          ? safeAtomsToNumber(baseAtoms)
+          : -safeAtomsToNumber(baseAtoms),
+        safeAtomsToNumber(quoteAtoms),
+        marketObject,
+      );
+
+      this.updateTraderPosition(
+        maker,
+        baseMint,
+        takerIsBuy
+          ? -safeAtomsToNumber(baseAtoms)
+          : safeAtomsToNumber(baseAtoms),
+        safeAtomsToNumber(quoteAtoms),
+        marketObject,
+      );
+    } else if (quoteMint === SOL_MINT) {
+      const { solPrice } = this.getSolAndBtcPrices();
+      if (solPrice > 0) {
+        const notionalVolume =
+          (safeAtomsToNumber(quoteAtoms) / 10 ** marketObject.quoteDecimals()) *
+          solPrice;
+
+        this.addTraderNotionalVolume(actualTaker, 'taker', notionalVolume);
+        this.addTraderNotionalVolume(maker, 'maker', notionalVolume);
+      }
+    } else if (quoteMint === CBBTC_MINT || quoteMint === WBTC_MINT) {
+      const { cbbtcPrice } = this.getSolAndBtcPrices();
+      if (cbbtcPrice > 0) {
+        const notionalVolume =
+          (safeAtomsToNumber(quoteAtoms) / 10 ** marketObject.quoteDecimals()) *
+          cbbtcPrice;
+
+        this.addTraderNotionalVolume(actualTaker, 'taker', notionalVolume);
+        this.addTraderNotionalVolume(maker, 'maker', notionalVolume);
+      }
+    }
+  }
+
+  private initWebSocket(): void {
+    // This endpoint is selected by the stats server, and its fills are derived
+    // from on-chain Manifest events. Do not add a second signed envelope or
+    // fetch and replay every transaction here: that duplicates the feed's
+    // on-chain verification, adds RPC load and latency, and makes RPC
+    // availability a failure mode for live stats ingestion. Transport limits
+    // remain enforced by WebSocketManager to bound resource consumption.
+    this.wsManager = new WebSocketManager({
+      url: 'wss://mfx-feed-mainnet.fly.dev',
+      reconnectDelay: 1000,
+      maxReconnectDelay: 30000,
+      heartbeatInterval: 30000,
+      connectionTimeout: 10000,
+      maxPayloadBytes: 64 * 1024,
+      maxQueuedMessages: 256,
+      onMessage: async (message: unknown) => {
+        const fill: FillLogResult = message as FillLogResult;
+        await this.fillMutex.runExclusive(async () => {
+          // Accepted recovery model: live persistence can fail after this
+          // cursor advances, but the scheduled trade-verification job compares
+          // chain history with fills_complete and backfills missing signatures.
+          // Keep that job enabled whenever live ingestion is enabled.
+          this.lastFillSlot = Math.max(this.lastFillSlot, fill.slot);
+
+          // Immediately save to recent fill
+          const { market } = fill;
+          if (!this.fillLogResults.has(market)) {
+            this.fillLogResults.set(market, []);
+          }
+
+          // Set temporary createdAtBlockTimestamp until backfill overwrites with oldest from database
+          if (!this.createdAtBlockTimestamp.has(market) && fill.blockTime) {
+            this.createdAtBlockTimestamp.set(market, fill.blockTime);
+          }
+
+          const prevFills = this.fillLogResults.get(market)!;
+          prevFills.push(fill);
+
+          const FILLS_TO_SAVE = 1000;
+          if (prevFills.length > FILLS_TO_SAVE) {
+            prevFills.splice(0, prevFills.length - FILLS_TO_SAVE);
+          }
+          this.fillLogResults.set(market, prevFills);
+
+          // GeckoTerminal: Add to block-indexed events
+          this.addGeckoBlockEvent(fill);
+
+          this.fills.inc({ market });
+
+          await this.processFillAsync(fill);
+
+          // Await persistence so WebSocket ingress is backpressured by the
+          // slowest durable consumer rather than spawning unbounded work.
+          await this.saveCompleteFillToDatabase(fill);
+        });
+      },
+      onConnect: () => {
+        console.log('WebSocket connected to fill feed');
+      },
+      onDisconnect: (code, reason) => {
+        console.log(
+          `WebSocket disconnected from fill feed: ${code} - ${reason}`,
+        );
+        this.reconnects.inc();
+      },
+      onError: (error) => {
+        console.error('WebSocket error:', error);
+        this.reconnects.inc();
+      },
+      onReconnectAttempt: (attempt) => {
+        console.log(
+          `Attempting to reconnect to fill feed (attempt ${attempt})`,
+        );
+      },
+    });
+
+    this.wsManager.connect();
+  }
+
+  /**
+   * Load all wrapper accounts and build the owner -> wrapper cache.
+   * Wrapper account layout:
+   *   - Bytes 0-7: Discriminant (8 bytes, value = 1 as u64 LE)
+   *   - Bytes 8-39: Trader/owner pubkey (32 bytes)
+   */
+  async loadWrapperCache(): Promise<void> {
+    console.log('Loading wrapper accounts...');
+    try {
+      // Wrapper discriminant is 1 as u64 little-endian: [1, 0, 0, 0, 0, 0, 0, 0]
+      const wrapperDiscriminant = Buffer.alloc(8);
+      wrapperDiscriminant.writeBigUInt64LE(BigInt(1));
+
+      const wrapperAccounts = await this.connection.getProgramAccounts(
+        WRAPPER_PROGRAM_ID,
+        {
+          commitment: 'confirmed',
+          filters: [
+            {
+              memcmp: {
+                offset: 0,
+                bytes: wrapperDiscriminant.toString('base64'),
+                encoding: 'base64',
+              },
+            },
+          ],
+        },
+      );
+
+      for (const { pubkey, account } of wrapperAccounts) {
+        if (
+          account.owner.equals(WRAPPER_PROGRAM_ID) &&
+          account.data.length >= 40 &&
+          account.data.readBigUInt64LE(0) === 1n
+        ) {
+          // Extract trader pubkey from bytes 8-40
+          const traderPubkey = new PublicKey(account.data.subarray(8, 40));
+          this.wrapperCache.set(traderPubkey.toBase58(), pubkey.toBase58());
+        }
+      }
+
+      this.cachedWrappersJson = JSON.stringify(this.getAllWrappers());
+
+      console.log(`Loaded ${this.wrapperCache.size} wrapper accounts`);
+    } catch (error) {
+      console.error('Error loading wrapper accounts:', error);
+      // Continue without wrapper cache - it's not critical
+    }
+  }
+
+  /**
+   * Get wrapper pubkey for a given owner pubkey.
+   * Returns null if no wrapper found.
+   */
+  getWrapper(ownerPubkey: string): string | null {
+    return this.wrapperCache.get(ownerPubkey) || null;
+  }
+
+  /**
+   * Get all wrapper mappings (owner -> wrapper).
+   */
+  getAllWrappers(): { [owner: string]: string } {
+    return Object.fromEntries(this.wrapperCache);
+  }
+
+  getAllWrappersJson(): string {
+    return this.cachedWrappersJson;
+  }
+
+  /**
+   * Initialize at the start with a get program accounts.
+   */
+  async initialize(): Promise<void> {
+    await this.loadState();
+    await this.loadWrapperCache();
+
+    // If the chain has more markets than we are willing to track, keep the
+    // ones whose restored checkpoints show volume; the quiet remainder is
+    // dropped and re-tracked lazily on its next fill.
+    const marketProgramAccounts: GetProgramAccountsResponse =
+      await fetchMarketProgramAccounts(this.connection, (marketPk: string) =>
+        this.hasCheckpointVolume(marketPk),
+      );
+
+    // Collect markets that need individual loading (when we only have pubkeys)
+    const marketsToLoad: string[] = [];
+
+    for (const value of marketProgramAccounts) {
+      const marketPk: string = value.pubkey.toBase58();
+
+      // If we have account data, load the market from buffer
+      if (value.account.data.length > 0) {
+        try {
+          const market: Market = Market.loadFromBuffer({
+            buffer: value.account.data,
+            address: new PublicKey(marketPk),
+          });
+
+          this.markets.set(marketPk, market);
+          this.indexMarketForPnL(marketPk, market);
+        } catch (err) {
+          console.error(`Failed to load market ${marketPk}:`, err);
+          // Continue with other markets
+          continue;
+        }
+      } else {
+        // No data - need to fetch individually
+        marketsToLoad.push(marketPk);
+      }
+
+      // Initialize checkpoints regardless of whether we have market data
+      if (!this.baseVolumeAtomsCheckpoints.has(marketPk)) {
+        this.baseVolumeAtomsSinceLastCheckpoint.set(marketPk, 0);
+        this.quoteVolumeAtomsSinceLastCheckpoint.set(marketPk, 0);
+        this.baseVolumeAtomsCheckpoints.set(
+          marketPk,
+          new Array<number>(ONE_DAY_SEC / VOLUME_CHECKPOINT_DURATION_SEC).fill(
+            0,
+          ),
+        );
+        this.quoteVolumeAtomsCheckpoints.set(
+          marketPk,
+          new Array<number>(ONE_DAY_SEC / VOLUME_CHECKPOINT_DURATION_SEC).fill(
+            0,
+          ),
+        );
+        this.checkpointTimestamps.set(
+          marketPk,
+          new Array<number>(ONE_DAY_SEC / VOLUME_CHECKPOINT_DURATION_SEC).fill(
+            0,
+          ),
+        );
+      }
+    }
+
+    // Load markets individually if we only had pubkeys (fallback path)
+    if (marketsToLoad.length > 0) {
+      console.log(
+        `Loading ${marketsToLoad.length} markets individually (fallback path)`,
+      );
+      for (const marketPk of marketsToLoad) {
+        // Rate limit to avoid RPC spam
+        await new Promise((f) => setTimeout(f, 100));
+        // Tickers handled by the mintToSymbols loop below
+        await this.loadNewMarket(marketPk);
+      }
+    }
+
+    // Look up tickers for all markets in the background. Serialized inside
+    // loadAllTickers() so we do not stampede the RPC with one request per
+    // market; fire-and-forget so initialization (and the fill websocket
+    // below) is not blocked on it.
+    this.loadAllTickers().catch((error) => {
+      console.error('Error loading tickers at startup:', error);
+    });
+
+    // Start background backfill of createdAtBlockTimestamp (non-blocking)
+    this.backfillCreatedAtTimestamps();
+
+    // Connect to fill feed after state is loaded to avoid race conditions
+    // where fills arrive before checkpoint data is restored
+    this.initWebSocket();
+  }
+
+  /**
+   * Look up tickers for every tracked market, caching by mint so each unique
+   * mint is resolved at most once.
+   *
+   * Runs strictly sequentially. Previously this used markets.forEach(async ...),
+   * which does not await its callback: every market resolved concurrently, so
+   * the mint cache below never had a value to hit, the backoff sleep did not
+   * serialize anything, and rejections escaped unhandled. That stampede is what
+   * drove the RPC 429s and ran the process out of memory.
+   */
+  private async loadAllTickers(): Promise<void> {
+    const mintToSymbols: Map<string, string> = new Map();
+
+    const resolveSymbol = async (mint: PublicKey): Promise<string> => {
+      const key: string = mint.toBase58();
+      const cached: string | undefined = mintToSymbols.get(key);
+      if (cached !== undefined) {
+        return cached;
+      }
+      // Sleep to backoff on RPC load. Only paid on a cache miss, and now
+      // actually rate limits because this loop is sequential.
+      await new Promise((f) => setTimeout(f, this.TICKER_LOOKUP_DELAY_MS));
+      const symbol: string = await lookupMintTicker(this.connection, mint);
+      mintToSymbols.set(key, symbol);
+      return symbol;
+    };
+
+    for (const market of Array.from(this.markets.values())) {
+      const baseMint: PublicKey = market.baseMint();
+      const quoteMint: PublicKey = market.quoteMint();
+
+      try {
+        const baseSymbol: string = await resolveSymbol(baseMint);
+        const quoteSymbol: string = await resolveSymbol(quoteMint);
+
+        this.tickers.set(market.address.toBase58(), [baseSymbol, quoteSymbol]);
+
+        // GeckoTerminal: Build token metadata for /asset endpoint
+        const baseMintStr: string = baseMint.toBase58();
+        const quoteMintStr: string = quoteMint.toBase58();
+        if (!this.tokenMetadata.has(baseMintStr)) {
+          this.tokenMetadata.set(baseMintStr, {
+            symbol: baseSymbol,
+            decimals: market.baseDecimals(),
+          });
+        }
+        if (!this.tokenMetadata.has(quoteMintStr)) {
+          this.tokenMetadata.set(quoteMintStr, {
+            symbol: quoteSymbol,
+            decimals: market.quoteDecimals(),
+          });
+        }
+      } catch (error) {
+        // Leave this market's ticker empty; attemptTickerLookup() retries it
+        // lazily. One bad mint must not abort the whole pass.
+        console.error(
+          'Error looking up tickers for market',
+          market.address.toBase58(),
+          error,
+        );
+      }
+    }
+  }
+
+  /**
+   * Background task to backfill createdAtBlockTimestamp for all markets.
+   * Queries the first fill for each market to determine when it was created.
+   * Runs slowly with backoff to avoid blocking other operations.
+   * Does not block initialization - runs in background.
+   */
+  private async backfillCreatedAtTimestamps(): Promise<void> {
+    console.log('Starting background backfill of createdAtBlockTimestamp...');
+
+    const marketAddresses = Array.from(this.markets.keys());
+    const BACKOFF_MS = 2000; // 2 seconds between queries to avoid load
+
+    for (const marketPk of marketAddresses) {
+      try {
+        const result = await this.executeQueryWithMetrics(
+          'SELECT_FIRST_FILL_FOR_MARKET',
+          async () =>
+            this.pool.query(queries.SELECT_FIRST_FILL_FOR_MARKET, [marketPk]),
+        );
+
+        if (result.rows.length > 0) {
+          const fillData = result.rows[0].fill_data;
+          const blockTime = fillData?.blockTime;
+          if (blockTime && typeof blockTime === 'number') {
+            this.createdAtBlockTimestamp.set(marketPk, blockTime);
+            console.log(
+              `Backfilled createdAtBlockTimestamp for ${marketPk}: ${blockTime}`,
+            );
+          }
+        }
+      } catch (error) {
+        console.error(
+          `Error backfilling createdAtBlockTimestamp for ${marketPk}:`,
+          error,
+        );
+        // Continue with other markets - don't let one failure stop the backfill
+      }
+
+      // Backoff between queries to avoid load
+      await new Promise((resolve) => setTimeout(resolve, BACKOFF_MS));
+    }
+
+    console.log(
+      `Completed backfill of createdAtBlockTimestamp for ${this.createdAtBlockTimestamp.size} markets`,
+    );
+  }
+
+  /**
+   * Periodically save the volume so a 24 hour rolling volume can be calculated.
+   */
+  async advanceCheckpoints(): Promise<void> {
+    await this.fillMutex.runExclusive(async () => {
+      console.log('Advancing checkpoints');
+
+      // Run memory cleanup to prevent unbounded growth
+      this.runMemoryCleanup();
+
+      // Check websocket connection status - no need to reset every time
+      if (this.wsManager && !this.wsManager.isConnected()) {
+        console.log('WebSocket disconnected, reconnecting...');
+        this.wsManager.connect();
+      }
+
+      const currentTimestamp = Math.floor(Date.now() / 1000); // Unix timestamp in seconds
+
+      this.markets.forEach((value: Market, market: string) => {
+        console.log(
+          'Advancing checkpoints for market',
+          market,
+          'base since last',
+          this.baseVolumeAtomsSinceLastCheckpoint.get(market),
+        );
+        this.baseVolumeAtomsCheckpoints.set(market, [
+          ...this.baseVolumeAtomsCheckpoints.get(market)!.slice(1),
+          this.baseVolumeAtomsSinceLastCheckpoint.get(market)!,
+        ]);
+        this.baseVolumeAtomsSinceLastCheckpoint.set(market, 0);
+
+        this.quoteVolumeAtomsCheckpoints.set(market, [
+          ...this.quoteVolumeAtomsCheckpoints.get(market)!.slice(1),
+          this.quoteVolumeAtomsSinceLastCheckpoint.get(market)!,
+        ]);
+        this.quoteVolumeAtomsSinceLastCheckpoint.set(market, 0);
+
+        // Replace any null values with 0 in the checkpoint arrays
+        this.baseVolumeAtomsCheckpoints.set(
+          market,
+          this.baseVolumeAtomsCheckpoints.get(market)!.map((v) => v ?? 0),
+        );
+        this.quoteVolumeAtomsCheckpoints.set(
+          market,
+          this.quoteVolumeAtomsCheckpoints.get(market)!.map((v) => v ?? 0),
+        );
+
+        // Update checkpoint timestamps
+        this.checkpointTimestamps.set(market, [
+          ...this.checkpointTimestamps.get(market)!.slice(1),
+          currentTimestamp,
+        ]);
+
+        const baseMint: string = value.baseMint().toBase58();
+        const quoteMint: string = value.quoteMint().toBase58();
+
+        // Calculate volume using only checkpoints from the last 24 hours
+        const timestamps = this.checkpointTimestamps.get(market)!;
+        const baseCheckpoints = this.baseVolumeAtomsCheckpoints.get(market)!;
+        const quoteCheckpoints = this.quoteVolumeAtomsCheckpoints.get(market)!;
+        const twentyFourHoursAgo = currentTimestamp - ONE_DAY_SEC;
+
+        let baseVolume = 0;
+        let quoteVolume = 0;
+
+        for (let i = 0; i < timestamps.length; i++) {
+          if (timestamps[i] >= twentyFourHoursAgo) {
+            baseVolume += baseCheckpoints[i];
+            quoteVolume += quoteCheckpoints[i];
+          }
+        }
+
+        this.volume.set({ market, mint: baseMint, side: 'base' }, baseVolume);
+        this.volume.set(
+          { market, mint: quoteMint, side: 'quote' },
+          quoteVolume,
+        );
+      });
+
+      // Rebuild the cached /tickers payload now that 24h volumes have advanced.
+      // The endpoint serves this snapshot verbatim (last_price may be up to one
+      // checkpoint interval stale - see cachedTickersJson).
+      this.refreshTickersCache();
+
+      // Refresh the cached lifetime volume for /volume in the background. Not
+      // awaited: the underlying getProgramAccounts RPC can take several seconds
+      // and must not hold the fill mutex. The in-flight guard prevents stacking.
+      void this.refreshLifetimeVolume();
+
+      // Track checkpoint advances to prevent premature database overwrites
+      this.checkpointAdvancesSinceStartup++;
+      console.log(
+        `Checkpoint advances since startup: ${this.checkpointAdvancesSinceStartup}/${this.MIN_CHECKPOINT_ADVANCES_BEFORE_SAVE}`,
+      );
+    });
+    await this.refreshAggregateResponseCaches();
+  }
+
+  private async refreshAggregateResponseCaches(): Promise<void> {
+    this.cachedCheckpointsJson = JSON.stringify(this.getCheckpoints());
+    this.cachedVolumeJson = JSON.stringify(await this.getVolume());
+    try {
+      this.cachedNotionalJson = JSON.stringify(await this.getNotional());
+    } catch (error) {
+      // Keep the last complete snapshot when the external BTC-price fallback
+      // fails. HTTP requests never retry this checkpoint-owned work.
+      console.error('Failed to refresh cached notional response:', error);
+    }
+  }
+
+  /**
+   * Periodically save to prometheus the depths of different market makers. This
+   * is expensive, so it will only be run every few minutes at most. If we
+   * wanted more frequent, should subscribe to market accounts. Because the
+   * number of markets is unbounded, that is not done here.
+   */
+  async depthProbe(): Promise<void> {
+    console.log('Probing depths for market maker data');
+
+    const marketKeys: PublicKey[] = Array.from(this.markets.keys()).map(
+      (market: string) => {
+        return new PublicKey(market);
+      },
+    );
+
+    try {
+      const marketKeysChunks: PublicKey[][] = chunks(marketKeys, 100);
+      for (const marketKeysChunk of marketKeysChunks) {
+        const accountInfos: (AccountInfo<Buffer> | null)[] =
+          await this.connection.getMultipleAccountsInfo(marketKeysChunk);
+        accountInfos.forEach(
+          (accountInfo: AccountInfo<Buffer> | null, index: number) => {
+            if (!accountInfo) {
+              return;
+            }
+            const marketPk: PublicKey = marketKeys[index];
+            const market: Market = Market.loadFromBuffer({
+              buffer: accountInfo.data,
+              address: marketPk,
+            });
+            const bids: RestingOrder[] = market.bids();
+            const asks: RestingOrder[] = market.asks();
+            if (bids.length == 0 || asks.length == 0) {
+              return;
+            }
+
+            const midTokens: number =
+              (bids[bids.length - 1].tokenPrice +
+                asks[asks.length - 1].tokenPrice) /
+              2;
+
+            DEPTHS_BPS.forEach((depthBps: number) => {
+              const bidsAtDepth: RestingOrder[] = bids.filter(
+                (bid: RestingOrder) => {
+                  return bid.tokenPrice > midTokens * (1 - depthBps * 0.0001);
+                },
+              );
+              const asksAtDepth: RestingOrder[] = asks.filter(
+                (ask: RestingOrder) => {
+                  return ask.tokenPrice < midTokens * (1 + depthBps * 0.0001);
+                },
+              );
+
+              const bidTraders: Set<string> = new Set(
+                bidsAtDepth.map((bid: RestingOrder) => bid.trader.toBase58()),
+              );
+
+              bidTraders.forEach((trader: string) => {
+                const bidTokensAtDepth: number = bidsAtDepth
+                  .filter((bid: RestingOrder) => {
+                    return bid.trader.toBase58() == trader;
+                  })
+                  .map((bid: RestingOrder) => {
+                    return Number(bid.numBaseTokens);
+                  })
+                  .reduce((sum, num) => sum + num, 0);
+                const askTokensAtDepth: number = asksAtDepth
+                  .filter((ask: RestingOrder) => {
+                    return ask.trader.toBase58() == trader;
+                  })
+                  .map((ask: RestingOrder) => {
+                    return Number(ask.numBaseTokens);
+                  })
+                  .reduce((sum, num) => sum + num, 0);
+
+                if (bidTokensAtDepth > 0 && askTokensAtDepth > 0) {
+                  this.depth.set(
+                    {
+                      depth_bps: depthBps,
+                      market: marketPk.toBase58(),
+                      trader: trader,
+                    },
+                    Math.min(bidTokensAtDepth, askTokensAtDepth) * midTokens,
+                  );
+                }
+              });
+            });
+          },
+        );
+      }
+    } catch (err) {
+      console.log('Unable to fetch depth probe', err);
+    }
+  }
+
+  /**
+   * Get Tickers
+   * Defaults to individual markets; true aggregates each base/quote mint pair.
+   *
+   * https://docs.google.com/document/d/1v27QFoQq1SKT3Priq3aqPgB70Xd_PnDzbOCiuoCyixw/edit?tab=t.0#heading=h.pa64vhp5pbih
+   */
+  getTickers(aggregate: boolean = false): MarketTicker[] {
+    const tickers: MarketTicker[] = [];
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const twentyFourHoursAgo = currentTimestamp - ONE_DAY_SEC;
+
+    this.markets.forEach((market: Market, marketPk: string) => {
+      // Calculate volume using only checkpoints from the last 24 hours
+      const timestamps = this.checkpointTimestamps.get(marketPk) || [];
+      const baseCheckpoints =
+        this.baseVolumeAtomsCheckpoints.get(marketPk) || [];
+      const quoteCheckpoints =
+        this.quoteVolumeAtomsCheckpoints.get(marketPk) || [];
+
+      let baseVolumeAtoms = 0;
+      let quoteVolumeAtoms = 0;
+
+      for (let i = 0; i < timestamps.length; i++) {
+        if (timestamps[i] >= twentyFourHoursAgo) {
+          baseVolumeAtoms += baseCheckpoints[i];
+          quoteVolumeAtoms += quoteCheckpoints[i];
+        }
+      }
+
+      const ticker: MarketTicker = {
+        ticker_id: marketPk,
+        base_currency: market.baseMint().toBase58(),
+        target_currency: market.quoteMint().toBase58(),
+        last_price:
+          this.lastPriceByMarket.get(marketPk)! *
+          10 ** (market.baseDecimals() - market.quoteDecimals()),
+        base_volume: baseVolumeAtoms / 10 ** market.baseDecimals(),
+        target_volume: quoteVolumeAtoms / 10 ** market.quoteDecimals(),
+        pool_id: marketPk,
+        // Does not apply to orderbooks.
+        liquidity_in_usd: 0,
+        // Optional: not yet implemented
+        // high: 0,
+        // low: 0,
+      };
+
+      // Emit best bid/ask only when the orderbook is already loaded on the
+      // cached market. Best bid is the highest bid (last element of the raw
+      // ascending bids()); best ask is the lowest ask (last element of the raw
+      // descending asks()) - matching the mid computation used elsewhere.
+      // RestingOrder.tokenPrice already bakes in the
+      // 10 ** (baseDecimals - quoteDecimals) factor, so it is in the same token
+      // units as last_price above and needs no further decimal correction.
+      const bestBid: number | undefined = market.bestBidPrice();
+      const bestAsk: number | undefined = market.bestAskPrice();
+      if (bestBid !== undefined) {
+        ticker.bid = bestBid;
+      }
+      if (bestAsk !== undefined) {
+        ticker.ask = bestAsk;
+      }
+
+      tickers.push(ticker);
+    });
+    return aggregate ? aggregateTickers(tickers) : tickers;
+  }
+
+  /**
+   * Pre-serialized JSON for the /tickers endpoint. Served verbatim so the
+   * endpoint does no per-request looping, base58 encoding, or JSON
+   * serialization. The cache is rebuilt on each checkpoint advance; see the
+   * `cachedTickersJson` field for the staleness note and the Option B
+   * alternative if live `last_price` is needed. Built lazily on first use so
+   * requests before the first advance still get a valid response.
+   */
+  getTickersJson(aggregate: boolean = false): string {
+    if (
+      this.cachedTickersJson === null ||
+      this.cachedAggregatedTickersJson === null
+    ) {
+      this.refreshTickersCache();
+    }
+    return aggregate
+      ? this.cachedAggregatedTickersJson!
+      : this.cachedTickersJson!;
+  }
+
+  /**
+   * Rebuild both /tickers views from the same current checkpoint state.
+   * Called after checkpoints advance (and lazily on first request).
+   */
+  private refreshTickersCache(): void {
+    const marketTickers = this.getTickers(false);
+    this.cachedTickersJson = JSON.stringify(marketTickers);
+    this.cachedAggregatedTickersJson = JSON.stringify(
+      aggregateTickers(marketTickers),
+    );
+  }
+
+  /**
+   * Would be named tickers if that wasnt reserved for coingecko.
+   *
+   */
+  getMetadata() {
+    console.log(
+      'Getting metadata request. Returning',
+      this.tickers.size,
+      'tickers',
+    );
+    return this.tickers;
+  }
+
+  /**
+   * Return a Market suitable for serving /orderbook, reloading its on-chain
+   * state from RPC only when the cached copy is older than
+   * ORDERBOOK_MARKET_TTL_MS (or the market has never been loaded). See
+   * orderbookMarketLastLoadMs for the rationale. Reloads happen here, on the
+   * request path - never on checkpoint advance.
+   */
+  private async getFreshOrderbookMarket(
+    marketPk: string,
+  ): Promise<Market | undefined> {
+    const now: number = Date.now();
+    const lastLoadMs: number =
+      this.orderbookMarketLastLoadMs.get(marketPk) ?? 0;
+    const market: Market | undefined = this.markets.get(marketPk);
+
+    // Cached and still within the freshness window: serve it as-is.
+    if (
+      market !== undefined &&
+      now - lastLoadMs < this.ORDERBOOK_MARKET_TTL_MS
+    ) {
+      return market;
+    }
+
+    if (market === undefined) {
+      // Public requests may not turn arbitrary account keys into RPC work.
+      // New markets are indexed by the checkpoint loader before being served.
+      return undefined;
+    }
+
+    const existingRefresh = this.orderbookMarketRefreshes.get(marketPk);
+    if (existingRefresh) {
+      return existingRefresh;
+    }
+
+    const refresh: Promise<Market> = (async (): Promise<Market> => {
+      // A stale cached market must be refreshed before it is returned. This is
+      // intentionally request-driven: the five-minute TTL and per-market
+      // shared promise keep ordinary hits cheap while ensuring callers never
+      // receive data that this service already knows is stale.
+      // Publish this promise before awaiting RPC so concurrent requests share
+      // one refresh after a predictable TTL expiry.
+      await market.reload(this.connection);
+      this.orderbookMarketLastLoadMs.set(marketPk, Date.now());
+      return market;
+    })();
+    this.orderbookMarketRefreshes.set(marketPk, refresh);
+    try {
+      return await refresh;
+    } finally {
+      this.orderbookMarketRefreshes.delete(marketPk);
+    }
+  }
+
+  /**
+   * Get Orderbook
+   *
+   * https://docs.google.com/document/d/1v27QFoQq1SKT3Priq3aqPgB70Xd_PnDzbOCiuoCyixw/edit?tab=t.0#heading=h.vgzsfbx8rvps
+   *
+   * Order state is served from the in-memory market cache and is good for at
+   * least ORDERBOOK_MARKET_TTL_MS (~5 min); a stale market is reloaded from RPC
+   * lazily on request. See orderbookMarketLastLoadMs.
+   */
+  async getOrderbook(tickerId: string, depth: number) {
+    try {
+      const market: Market | undefined =
+        await this.getFreshOrderbookMarket(tickerId);
+      if (!market) {
+        return {};
+      }
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+
+      const bids: RestingOrder[] = market.bids().slice().reverse();
+      const asks: RestingOrder[] = market.asks().slice().reverse();
+
+      // CoinGecko spec: depth = total orders, split evenly between bids/asks
+      // depth=100 means 50 bids + 50 asks
+      const ordersPerSide = Math.floor(depth / 2);
+      const bidsUpToDepth = bids.slice(0, ordersPerSide);
+      const asksUpToDepth = asks.slice(0, ordersPerSide);
+
+      return {
+        ticker_id: tickerId,
+        timestamp,
+        bids: bidsUpToDepth.map((restingOrder: RestingOrder) => {
+          return [restingOrder.tokenPrice, Number(restingOrder.numBaseTokens)];
+        }),
+        asks: asksUpToDepth
+          .slice()
+          .reverse()
+          .map((restingOrder: RestingOrder) => {
+            return [
+              restingOrder.tokenPrice,
+              Number(restingOrder.numBaseTokens),
+            ];
+          }),
+      };
+    } catch (err) {
+      console.log('Error getOrderbook', tickerId, depth, err);
+      return {};
+    }
+  }
+
+  /**
+   * Get Checkpoints
+   *
+   * Returns all base and quote volume checkpoints for all markets
+   */
+  getCheckpoints(): {
+    [market: string]: {
+      baseCheckpoints: number[];
+      quoteCheckpoints: number[];
+      timestamps: number[];
+    };
+  } {
+    const checkpointsByMarket: {
+      [market: string]: {
+        baseCheckpoints: number[];
+        quoteCheckpoints: number[];
+        timestamps: number[];
+      };
+    } = {};
+
+    this.markets.forEach((_market: Market, marketPk: string) => {
+      const baseCheckpoints =
+        this.baseVolumeAtomsCheckpoints.get(marketPk) || [];
+      const quoteCheckpoints =
+        this.quoteVolumeAtomsCheckpoints.get(marketPk) || [];
+      const timestamps = this.checkpointTimestamps.get(marketPk) || [];
+
+      checkpointsByMarket[marketPk] = {
+        baseCheckpoints,
+        quoteCheckpoints,
+        timestamps,
+      };
+    });
+
+    return checkpointsByMarket;
+  }
+
+  getCheckpointsJson(): string {
+    return this.cachedCheckpointsJson;
+  }
+
+  /**
+   * Get checkpoint health status for debugging.
+   * Returns information about checkpoint data quality and save readiness.
+   */
+  getCheckpointStatus(): {
+    checkpointAdvancesSinceStartup: number;
+    minRequiredAdvances: number;
+    readyToSave: boolean;
+    uptimeSeconds: number;
+    totalMarkets: number;
+    marketsWithData: number;
+    oldestTimestamp: number;
+    newestTimestamp: number;
+  } {
+    const now: number = Math.floor(Date.now() / 1000);
+    let oldestTimestamp: number = now;
+    let newestTimestamp: number = 0;
+    let marketsWithData: number = 0;
+
+    this.checkpointTimestamps.forEach((timestamps: number[]) => {
+      const nonZeroTimestamps: number[] = timestamps.filter(
+        (t: number) => t > 0,
+      );
+      if (nonZeroTimestamps.length > 0) {
+        marketsWithData++;
+        const minTs: number = Math.min(...nonZeroTimestamps);
+        const maxTs: number = Math.max(...nonZeroTimestamps);
+        if (minTs < oldestTimestamp) oldestTimestamp = minTs;
+        if (maxTs > newestTimestamp) newestTimestamp = maxTs;
+      }
+    });
+
+    return {
+      checkpointAdvancesSinceStartup: this.checkpointAdvancesSinceStartup,
+      minRequiredAdvances: this.MIN_CHECKPOINT_ADVANCES_BEFORE_SAVE,
+      readyToSave:
+        this.checkpointAdvancesSinceStartup >=
+        this.MIN_CHECKPOINT_ADVANCES_BEFORE_SAVE,
+      uptimeSeconds: Math.floor((Date.now() - this.startTime) / 1000),
+      totalMarkets: this.markets.size,
+      marketsWithData,
+      oldestTimestamp: oldestTimestamp === now ? 0 : oldestTimestamp,
+      newestTimestamp,
+    };
+  }
+
+  /**
+   * Get Notional Volume (USD) by Market
+   *
+   * Returns USD notional traded on each market in the last 24 hours
+   */
+  async getNotional(): Promise<{ [market: string]: number }> {
+    const notionalByMarket: { [market: string]: number } = {};
+
+    // Get SOL price for converting SOL-quoted volumes to USDC equivalent
+    const solPriceAtoms = this.lastPriceByMarket.get(SOL_USDC_MARKET);
+    const solUsdcMarket = this.markets.get(SOL_USDC_MARKET);
+    let solPrice = 0;
+    if (solPriceAtoms && solUsdcMarket) {
+      solPrice =
+        solPriceAtoms *
+        10 ** (solUsdcMarket.baseDecimals() - solUsdcMarket.quoteDecimals());
+    }
+
+    // Get CBBTC price for converting CBBTC-quoted volumes to USDC equivalent
+    const cbbtcPriceAtoms = this.lastPriceByMarket.get(CBBTC_USDC_MARKET);
+    const cbbtcUsdcMarket = this.markets.get(CBBTC_USDC_MARKET);
+    let cbbtcPrice = 0;
+    if (cbbtcPriceAtoms && cbbtcUsdcMarket) {
+      cbbtcPrice =
+        cbbtcPriceAtoms *
+        10 **
+          (cbbtcUsdcMarket.baseDecimals() - cbbtcUsdcMarket.quoteDecimals());
+    }
+
+    // Get WBTC price as fallback for BTC conversion
+    const wbtcPriceAtoms = this.lastPriceByMarket.get(WBTC_USDC_MARKET);
+    const wbtcUsdcMarket = this.markets.get(WBTC_USDC_MARKET);
+    let wbtcPrice = 0;
+    if (wbtcPriceAtoms && wbtcUsdcMarket) {
+      wbtcPrice =
+        wbtcPriceAtoms *
+        10 ** (wbtcUsdcMarket.baseDecimals() - wbtcUsdcMarket.quoteDecimals());
+    }
+
+    // Use whichever BTC price is available (prefer CBBTC, fallback to WBTC, then CoinGecko)
+    let btcPrice = cbbtcPrice > 0 ? cbbtcPrice : wbtcPrice;
+
+    // If no BTC price available from markets, fetch from CoinGecko
+    if (btcPrice === 0) {
+      btcPrice = await fetchBtcPriceFromCoinGecko();
+    }
+
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const twentyFourHoursAgo = currentTimestamp - ONE_DAY_SEC;
+
+    this.markets.forEach((market: Market, marketPk: string) => {
+      // Calculate volume using only checkpoints from the last 24 hours
+      const timestamps = this.checkpointTimestamps.get(marketPk) || [];
+      const quoteCheckpoints =
+        this.quoteVolumeAtomsCheckpoints.get(marketPk) || [];
+
+      let checkpointsVolume = 0;
+      for (let i = 0; i < timestamps.length; i++) {
+        if (timestamps[i] >= twentyFourHoursAgo) {
+          checkpointsVolume += quoteCheckpoints[i];
+        }
+      }
+
+      // Include both the checkpoints AND the volume since last checkpoint
+      const currentPeriodVolume =
+        this.quoteVolumeAtomsSinceLastCheckpoint.get(marketPk) || 0;
+      const totalVolumeAtoms = checkpointsVolume + currentPeriodVolume;
+
+      const quoteVolume: number =
+        totalVolumeAtoms / 10 ** market.quoteDecimals();
+
+      if (quoteVolume === 0) {
+        return;
+      }
+
+      const quoteMint = market.quoteMint().toBase58();
+
+      // Track stablecoin quote volume directly (USDC, USDT, PYUSD, USDS, USD1)
+      if (STABLECOIN_MINTS.has(quoteMint)) {
+        notionalByMarket[marketPk] = quoteVolume;
+        return;
+      }
+
+      // Convert SOL quote volume to USDC equivalent
+      if (quoteMint === SOL_MINT && solPrice > 0) {
+        notionalByMarket[marketPk] = quoteVolume * solPrice;
+        return;
+      }
+
+      // Convert CBBTC/WBTC quote volume to USDC equivalent
+      if (
+        (quoteMint === CBBTC_MINT || quoteMint === WBTC_MINT) &&
+        btcPrice > 0
+      ) {
+        notionalByMarket[marketPk] = quoteVolume * btcPrice;
+        return;
+      }
+
+      // If we can't convert to USD, don't include it
+    });
+
+    return notionalByMarket;
+  }
+
+  getNotionalJson(): string {
+    return this.cachedNotionalJson;
+  }
+
+  /**
+   * Get normalized SOL and BTC prices
+   * @returns Object containing solPrice and cbbtcPrice (both normalized to USDC)
+   */
+  private getSolAndBtcPrices(): { solPrice: number; cbbtcPrice: number } {
+    let solPrice = 0;
+    let cbbtcPrice = 0;
+
+    // Get SOL price for converting SOL-quoted volumes to USDC equivalent
+    const solPriceAtoms = this.lastPriceByMarket.get(SOL_USDC_MARKET);
+    const solUsdcMarket = this.markets.get(SOL_USDC_MARKET);
+    if (solPriceAtoms && solUsdcMarket) {
+      solPrice =
+        solPriceAtoms *
+        10 ** (solUsdcMarket.baseDecimals() - solUsdcMarket.quoteDecimals());
+    }
+
+    // Get CBBTC price for converting CBBTC-quoted volumes to USDC equivalent
+    const cbbtcPriceAtoms = this.lastPriceByMarket.get(CBBTC_USDC_MARKET);
+    const cbbtcUsdcMarket = this.markets.get(CBBTC_USDC_MARKET);
+    if (cbbtcPriceAtoms && cbbtcUsdcMarket) {
+      cbbtcPrice =
+        cbbtcPriceAtoms *
+        10 **
+          (cbbtcUsdcMarket.baseDecimals() - cbbtcUsdcMarket.quoteDecimals());
+    }
+
+    return { solPrice, cbbtcPrice };
+  }
+
+  /**
+   * Get Volume
+   *
+   * https://docs.llama.fi/list-your-project/other-dashboards/dimensions
+   */
+  /**
+   * Recompute the cached lifetime (total) volume via a getProgramAccounts RPC
+   * call. Runs in the background (off the /volume request path) - on each
+   * checkpoint advance and lazily on the first request. On RPC failure the
+   * previously cached value is retained rather than zeroed, so a transient RPC
+   * error doesn't make /volume report a sudden drop to 0.
+   */
+  async refreshLifetimeVolume(): Promise<void> {
+    // Never run two RPC fetches at once; a refresh can take several seconds.
+    if (this.lifetimeVolumeRefreshInFlight) {
+      return;
+    }
+    this.lifetimeVolumeRefreshInFlight = true;
+    try {
+      const { solPrice, cbbtcPrice } = this.getSolAndBtcPrices();
+      const marketProgramAccounts: GetProgramAccountsResponse =
+        await ManifestClient.getMarketProgramAccounts(this.connection);
+      this.cachedLifetimeVolume = getLifetimeVolumeForMarkets(
+        marketProgramAccounts,
+        solPrice,
+        cbbtcPrice,
+      );
+      this.cachedVolumeJson = JSON.stringify(await this.getVolume());
+    } catch (error) {
+      console.error(
+        'Failed to get market program accounts for volume calculation:',
+        error,
+      );
+      // Retain the previously cached value (if any) on error.
+    } finally {
+      this.lifetimeVolumeRefreshInFlight = false;
+    }
+  }
+
+  async getVolume() {
+    // Get normalized SOL and BTC prices
+    const { solPrice } = this.getSolAndBtcPrices();
+
+    // Serve the cached lifetime volume. It's refreshed in the background on
+    // each checkpoint advance; kick off a one-time populate if no refresh has
+    // completed yet (e.g. shortly after startup) without blocking this request.
+    if (this.cachedLifetimeVolume === null) {
+      void this.refreshLifetimeVolume();
+    }
+    const lifetimeVolume = this.cachedLifetimeVolume ?? 0;
+
+    const dailyVolumesByToken: Map<string, number> = new Map();
+    let dailyUsdcEquivalentVolume = 0;
+    let dailyDirectUsdcVolume = 0;
+
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const twentyFourHoursAgo = currentTimestamp - ONE_DAY_SEC;
+
+    this.markets.forEach((market: Market, marketPk: string) => {
+      // Calculate volume using only checkpoints from the last 24 hours
+      const timestamps = this.checkpointTimestamps.get(marketPk) || [];
+      const baseCheckpoints =
+        this.baseVolumeAtomsCheckpoints.get(marketPk) || [];
+      const quoteCheckpoints =
+        this.quoteVolumeAtomsCheckpoints.get(marketPk) || [];
+
+      let baseVolumeAtoms = 0;
+      let quoteVolumeAtoms = 0;
+
+      for (let i = 0; i < timestamps.length; i++) {
+        if (timestamps[i] >= twentyFourHoursAgo) {
+          baseVolumeAtoms += baseCheckpoints[i];
+          quoteVolumeAtoms += quoteCheckpoints[i];
+        }
+      }
+
+      const baseVolume: number = baseVolumeAtoms / 10 ** market.baseDecimals();
+      const quoteVolume: number =
+        quoteVolumeAtoms / 10 ** market.quoteDecimals();
+      const baseMint: string = 'solana:' + market.baseMint().toBase58();
+      const quoteMint: string = 'solana:' + market.quoteMint().toBase58();
+      if (baseVolume == 0 || quoteVolume == 0) {
+        return;
+      }
+      // Track individual token volumes (excluding USDC which we'll handle separately)
+      if (!dailyVolumesByToken.has(baseMint)) {
+        dailyVolumesByToken.set(baseMint, 0);
+      }
+      dailyVolumesByToken.set(
+        baseMint,
+        dailyVolumesByToken.get(baseMint)! + baseVolume,
+      );
+
+      // Handle quote volumes differently for USDC vs other tokens
+      if (market.quoteMint().toBase58() != USDC_MINT) {
+        if (!dailyVolumesByToken.has(quoteMint)) {
+          dailyVolumesByToken.set(quoteMint, 0);
+        }
+        dailyVolumesByToken.set(
+          quoteMint,
+          dailyVolumesByToken.get(quoteMint)! + quoteVolume,
+        );
+      }
+
+      // Calculate total USDC equivalent volume
+      if (market.quoteMint().toBase58() == SOL_MINT && solPrice > 0) {
+        dailyUsdcEquivalentVolume += quoteVolume * solPrice;
+      } else if (market.quoteMint().toBase58() == USDC_MINT) {
+        dailyDirectUsdcVolume += quoteVolume;
+        dailyUsdcEquivalentVolume += quoteVolume;
+      }
+    });
+
+    // Report direct USDC volume separately and combined volume under USDC key
+    const usdcKey = 'solana:' + USDC_MINT;
+    if (dailyDirectUsdcVolume > 0) {
+      dailyVolumesByToken.set(
+        'manifest:direct_usdc_volume',
+        dailyDirectUsdcVolume,
+      );
+    }
+    if (dailyUsdcEquivalentVolume > 0) {
+      dailyVolumesByToken.set(usdcKey, dailyUsdcEquivalentVolume);
+    }
+
+    return {
+      totalVolume: {
+        [usdcKey]: lifetimeVolume,
+      },
+      dailyVolume: Object.fromEntries(dailyVolumesByToken),
+    };
+  }
+  getVolumeJson(): string {
+    return this.cachedVolumeJson;
+  }
+  /**
+   * Get Traders to be used in a leaderboard if a UI wants to.
+   * Returns counts for taker/maker trades and volumes.
+   */
+  getTraders(
+    includeDebug: boolean = false,
+    limit: number = 500,
+  ): {
+    [key: string]: {
+      taker: number;
+      maker: number;
+      takerNotionalVolume: number;
+      makerNotionalVolume: number;
+      pnl: number;
+      _debug?: any;
+    };
+  } {
+    // Read the most active traders straight from the volume index, which is
+    // kept sorted as fills arrive, instead of re-sorting every trader here.
+    const topTraders: string[] = this.traderVolumeIndex.top(limit);
+
+    const traderData: {
+      [key: string]: {
+        taker: number;
+        maker: number;
+        takerNotionalVolume: number;
+        makerNotionalVolume: number;
+        pnl: number;
+        _debug?: any;
+      };
+    } = {};
+
+    topTraders.forEach((trader: string) => {
+      const takerNotionalVolume =
+        this.traderTakerNotionalVolume.get(trader) || 0;
+      const makerNotionalVolume =
+        this.traderMakerNotionalVolume.get(trader) || 0;
+
+      const pnlResult = calculateTraderPnL(
+        trader,
+        this.traderPositions,
+        this.traderAcquisitionValue,
+        this.markets,
+        this.lastPriceByMarket,
+        this.baseMintToStablecoinMarkets,
+        includeDebug,
+      );
+
+      const pnl =
+        typeof pnlResult === 'number' ? pnlResult : pnlResult.totalPnL;
+
+      traderData[trader] = {
+        taker: this.traderNumTakerTrades.get(trader) || 0,
+        maker: this.traderNumMakerTrades.get(trader) || 0,
+        takerNotionalVolume,
+        makerNotionalVolume,
+        pnl,
+      };
+
+      if (includeDebug && typeof pnlResult !== 'number') {
+        traderData[trader]._debug = pnlResult;
+      }
+    });
+
+    return traderData;
+  }
+
+  async getAlts(): Promise<{ alt: string; market: string }[]> {
+    const response = await this.executeQueryWithMetrics(
+      'SELECT_ALT_MARKETS',
+      async () => this.pool.query(queries.SELECT_ALT_MARKETS),
+    );
+    return response.rows.map((r) => ({ alt: r.alt, market: r.market }));
+  }
+
+  /**
+   * Get array of recent fills.
+   */
+  getRecentFills(market: string): {
+    [market: string]: FillLogResult[] | undefined;
+  } {
+    return { [market]: this.fillLogResults.get(market) };
+  }
+
+  async getCompleteFillsFromDatabase(
+    options: CompleteFillsQueryOptions = {},
+  ): Promise<CompleteFillsQueryResult> {
+    const {
+      market,
+      taker,
+      maker,
+      wallet,
+      signature,
+      limit = 100,
+      offset = 0,
+      toSlot,
+    } = options;
+    // Bound the response size, but not how deep a caller may page. Capping
+    // offset put a hard ceiling on how much of a busy market was reachable at
+    // all; see the note on MAX_COMPLETE_FILLS_OFFSET in stats-server.ts.
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new RangeError('limit must be a positive safe integer');
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new RangeError('offset must be a non-negative safe integer');
+    }
+
+    for (const [name, value] of [
+      ['fromSlot', options.fromSlot],
+      ['toSlot', toSlot],
+    ] as const) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+        throw new RangeError(`${name} must be a non-negative safe integer`);
+      }
+    }
+    if (
+      options.fromSlot !== undefined &&
+      toSlot !== undefined &&
+      options.fromSlot > toSlot
+    ) {
+      throw new RangeError('fromSlot must be less than or equal to toSlot');
+    }
+
+    // Apply default slot filter only if no efficient index filter is present.
+    const hasNonWalletEfficientFilter: boolean = Boolean(
+      market || signature || taker || maker,
+    );
+    const hasEfficientFilter: boolean = Boolean(
+      hasNonWalletEfficientFilter || wallet,
+    );
+    let { fromSlot } = options;
+    let currentSlot: number | undefined;
+    const getCurrentSlot = async (): Promise<number> => {
+      if (currentSlot === undefined) {
+        currentSlot = await this.connection.getSlot();
+      }
+      return currentSlot;
+    };
+    let effectiveToSlot: number | undefined = toSlot;
+    if (fromSlot === undefined && !hasEfficientFilter) {
+      console.log(
+        `[completeFills] Query without efficient filter, applying default slot range. Options: ${JSON.stringify(options)}`,
+      );
+      fromSlot = Math.max(0, (await getCurrentSlot()) - SLOTS_PER_DAY);
+    }
+
+    // Wallet-only queries default to one day ending at the caller's toSlot (or
+    // the current slot). Explicit ranges remain available for historical
+    // pagination and use the split taker/maker index scans below.
+    if (wallet && !hasNonWalletEfficientFilter) {
+      effectiveToSlot ??= await getCurrentSlot();
+      if (fromSlot === undefined) {
+        fromSlot = Math.max(0, effectiveToSlot - SLOTS_PER_DAY);
+      }
+      if (fromSlot > effectiveToSlot) {
+        throw new RangeError('fromSlot must be less than or equal to toSlot');
+      }
+    }
+
+    try {
+      const conditions: string[] = [];
+      const params: (string | number)[] = [];
+      let paramIndex: number = 1;
+
+      if (market) {
+        conditions.push(`market = $${paramIndex++}`);
+        params.push(market);
+      }
+
+      if (taker) {
+        conditions.push(`taker = $${paramIndex++}`);
+        params.push(taker);
+      }
+
+      if (maker) {
+        conditions.push(`maker = $${paramIndex++}`);
+        params.push(maker);
+      }
+
+      // Wallet uses two independently bounded index scans below rather than a
+      // single OR predicate that would require sorting the full match set.
+      let walletParamIndex: number | undefined;
+      if (wallet) {
+        walletParamIndex = paramIndex;
+        params.push(wallet);
+        paramIndex++;
+      }
+
+      if (signature) {
+        conditions.push(`signature = $${paramIndex++}`);
+        params.push(signature);
+      }
+
+      if (fromSlot !== undefined) {
+        conditions.push(`slot >= $${paramIndex++}`);
+        params.push(fromSlot);
+      }
+
+      if (effectiveToSlot !== undefined) {
+        conditions.push(`slot <= $${paramIndex++}`);
+        params.push(effectiveToSlot);
+      }
+
+      const whereClause =
+        conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+      // No longer   Get complete fills count
+      // const countResult = await this.executeQueryWithMetrics(
+      //   'SELECT_FILLS_COUNT',
+      //   async () =>
+      //     this.pool.query(
+      //       `${queries.SELECT_FILLS_COMPLETE_COUNT_BASE} ${whereClause}`,
+      //       params,
+      //     ),
+      // );
+      // const total = parseInt(countResult.rows[0].total);
+
+      // Always order by slot DESC. Every filter we query on has a composite index whose
+      // leading column is the filter and whose next column is slot DESC, so this is an
+      // index range scan that stops at LIMIT+OFFSET — no full fetch + sort:
+      //   maker  -> idx_fills_complete_maker_slot  (maker,  slot DESC, ...)
+      //   taker  -> idx_fills_complete_taker_slot  (taker,  slot DESC, ...)
+      //   market -> idx_fills_complete_market_slot (market, slot DESC)
+      // For very common filter values the planner instead walks idx_fills_complete_slot
+      // (slot) backward and filters — also cheap, since the first LIMIT rows match quickly.
+      // Wallet scans the maker and taker indexes separately, bounds each side
+      // to LIMIT+OFFSET, then merges those small result sets.
+      //
+      // We deliberately do NOT order by timestamp: it is the row's insert time, not the
+      // on-chain time, so backfilled rows land out of chronological order. slot is
+      // monotonic with on-chain time, so it gives one consistent, correct recency order
+      // across all filter types. (A timestamp ordering would also only be index-backed for
+      // the market filter, via idx_fills_complete_market_timestamp, and force a sort for
+      // maker/taker.)
+      let dataQuery: string;
+      if (walletParamIndex !== undefined) {
+        const sharedConditions: string =
+          conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
+        const branchLimitParamIndex: number = paramIndex++;
+        const limitParamIndex: number = paramIndex++;
+        const offsetParamIndex: number = paramIndex++;
+        dataQuery = `
+          WITH wallet_fills AS (
+            (
+              SELECT fill_data, slot
+              FROM fills_complete
+              WHERE taker = $${walletParamIndex} ${sharedConditions}
+              ORDER BY slot DESC
+              LIMIT $${branchLimitParamIndex}
+            )
+            UNION ALL
+            (
+              SELECT fill_data, slot
+              FROM fills_complete
+              WHERE maker = $${walletParamIndex}
+                AND taker <> $${walletParamIndex}
+                ${sharedConditions}
+              ORDER BY slot DESC
+              LIMIT $${branchLimitParamIndex}
+            )
+          )
+          SELECT fill_data
+          FROM wallet_fills
+          ORDER BY slot DESC
+          LIMIT $${limitParamIndex} OFFSET $${offsetParamIndex}
+        `;
+        params.push(limit + offset, limit, offset);
+      } else {
+        dataQuery = `
+          ${queries.SELECT_FILLS_COMPLETE_DATA_BASE}
+          ${whereClause}
+          ORDER BY slot DESC
+          LIMIT $${paramIndex++} OFFSET $${paramIndex++}
+        `;
+        params.push(limit, offset);
+      }
+      const dataResult = await this.executeQueryWithMetrics(
+        'SELECT_FILLS_DATA',
+        async () => this.pool.query(dataQuery, params),
+      );
+
+      const fills: FillLogResult[] = dataResult.rows.map(
+        (row) => row.fill_data,
+      );
+
+      return {
+        fills,
+        total: 0,
+        // A short page means the index scan ran out of rows, so this is the
+        // last one. Previously hardcoded true, which told every paginating
+        // client to request one more page than exists.
+        hasMore: fills.length === limit,
+        effectiveSlotRange: {
+          fromSlot: fromSlot ?? null,
+          toSlot: effectiveToSlot ?? null,
+        },
+      };
+    } catch (error) {
+      console.error('Error querying complete fills:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Backfill fills from a transaction signature.
+   * Fetches the transaction from RPC, parses fills, and inserts any missing ones.
+   * Returns the number of fills backfilled.
+   */
+  async backfillTransaction(
+    signature: string,
+  ): Promise<{ backfilled: number; alreadyExisted: number }> {
+    if (this.isReadOnly) {
+      throw new Error('Cannot backfill in read-only mode');
+    }
+
+    // Parse fills from the transaction
+    const { fills, hasTruncatedLogs } = await parseTransactionForFills(
+      this.connection,
+      signature,
+    );
+
+    if (hasTruncatedLogs) {
+      console.warn(`Truncated logs detected during backfill for ${signature}`);
+      this.backfillRunStats.truncatedSignatures.push(signature);
+    }
+
+    if (fills.length === 0) {
+      this.recordBackfillResult(0, 0);
+      return { backfilled: 0, alreadyExisted: 0 };
+    }
+
+    let backfilled = 0;
+    let alreadyExisted = 0;
+
+    for (const fill of fills) {
+      try {
+        const result: QueryResult = await this.pool.query(
+          queries.INSERT_FILL_COMPLETE,
+          [
+            fill.slot,
+            fill.market,
+            fill.signature,
+            fill.taker,
+            fill.maker,
+            fill.takerSequenceNumber,
+            fill.makerSequenceNumber,
+            JSON.stringify(fill),
+          ],
+        );
+
+        // INSERT with ON CONFLICT DO NOTHING returns rowCount 0 if it already existed
+        if (result.rowCount === 0) {
+          alreadyExisted++;
+        } else {
+          backfilled++;
+        }
+      } catch (error) {
+        console.error(`Error backfilling fill from ${signature}:`, error);
+        throw error;
+      }
+    }
+
+    console.log(
+      `Backfill for ${signature}: ${backfilled} new, ${alreadyExisted} already existed`,
+    );
+
+    // Attempt ticker lookups for any markets encountered (with backoff)
+    const uniqueMarkets: Set<string> = new Set(fills.map((f) => f.market));
+    for (const market of uniqueMarkets) {
+      await this.attemptTickerLookup(market);
+    }
+
+    this.recordBackfillResult(backfilled, alreadyExisted);
+    return { backfilled, alreadyExisted };
+  }
+
+  /**
+   * Accumulate stats for the current backfill run and (re)arm the debounced
+   * summary alert. The summary fires once no backfill request has arrived for
+   * BACKFILL_SUMMARY_DEBOUNCE_MS, i.e. once per backfill run.
+   */
+  private recordBackfillResult(
+    backfilled: number,
+    alreadyExisted: number,
+  ): void {
+    this.backfillRunStats.transactions++;
+    this.backfillRunStats.backfilled += backfilled;
+    this.backfillRunStats.alreadyExisted += alreadyExisted;
+
+    if (this.backfillSummaryTimer) {
+      clearTimeout(this.backfillSummaryTimer);
+    }
+    this.backfillSummaryTimer = setTimeout((): void => {
+      void this.sendBackfillSummary();
+    }, this.BACKFILL_SUMMARY_DEBOUNCE_MS);
+    this.backfillSummaryTimer.unref();
+  }
+
+  /**
+   * Send a single Discord alert summarizing the completed backfill run,
+   * including stats on transactions with truncated logs.
+   */
+  private async sendBackfillSummary(): Promise<void> {
+    const stats: {
+      transactions: number;
+      backfilled: number;
+      alreadyExisted: number;
+      truncatedSignatures: string[];
+    } = this.backfillRunStats;
+    this.backfillRunStats = {
+      transactions: 0,
+      backfilled: 0,
+      alreadyExisted: 0,
+      truncatedSignatures: [],
+    };
+    this.backfillSummaryTimer = null;
+
+    if (!this.discordWebhookUrl || stats.transactions === 0) {
+      return;
+    }
+
+    const lines: string[] = [
+      `**Backfill run complete**`,
+      `Transactions processed: ${stats.transactions}`,
+      `Fills backfilled: ${stats.backfilled}`,
+      `Fills already existed: ${stats.alreadyExisted}`,
+      `Transactions with truncated logs: ${stats.truncatedSignatures.length}`,
+    ];
+    if (stats.truncatedSignatures.length > 0) {
+      const shown: string[] = stats.truncatedSignatures.slice(
+        0,
+        this.BACKFILL_SUMMARY_MAX_SIGNATURES,
+      );
+      lines.push(
+        `Truncated (fills may be missing from the database):`,
+        ...shown.map(
+          (signature: string): string =>
+            `[${signature.slice(0, 8)}...](https://solscan.io/tx/${signature})`,
+        ),
+      );
+      const hidden: number = stats.truncatedSignatures.length - shown.length;
+      if (hidden > 0) {
+        lines.push(`...and ${hidden} more`);
+      }
+    }
+
+    try {
+      await sendDiscordNotification(this.discordWebhookUrl, lines.join('\n'), {
+        title: '📥 Trade Backfill Summary',
+        timestamp: true,
+      });
+    } catch (error) {
+      console.error('Error sending backfill summary alert:', error);
+    }
+  }
+
+  /**
+   * Set up database schema if needed
+   */
+  async initDatabase(): Promise<void> {
+    try {
+      // Create tables if they don't exist
+
+      // Market_volumes table is deprecated, volume data is now in market_checkpoints
+      // Fill_log_result table is deprecated. fill_log_complete is now used.
+
+      await this.executeQueryWithMetrics(
+        'CREATE_STATE_CHECKPOINTS_TABLE',
+        async () => this.pool.query(queries.CREATE_STATE_CHECKPOINTS_TABLE),
+      );
+      await this.executeQueryWithMetrics(
+        'CREATE_MARKET_CHECKPOINTS_TABLE',
+        async () => this.pool.query(queries.CREATE_MARKET_CHECKPOINTS_TABLE),
+      );
+      await this.executeQueryWithMetrics(
+        'CREATE_TRADER_STATS_TABLE',
+        async () => this.pool.query(queries.CREATE_TRADER_STATS_TABLE),
+      );
+      await this.executeQueryWithMetrics(
+        'CREATE_TRADER_POSITIONS_TABLE',
+        async () => this.pool.query(queries.CREATE_TRADER_POSITIONS_TABLE),
+      );
+      await this.executeQueryWithMetrics(
+        'CREATE_FILLS_COMPLETE_TABLE',
+        async () => this.pool.query(queries.CREATE_FILLS_COMPLETE_TABLE),
+      );
+      await this.executeQueryWithMetrics(
+        'CREATE_FILLS_COMPLETE_INDEXES',
+        async () => this.pool.query(queries.CREATE_FILLS_COMPLETE_INDEXES),
+      );
+      await this.executeQueryWithMetrics('CREATE_ALT_MARKETS_TABLE', async () =>
+        this.pool.query(queries.CREATE_ALT_MARKETS_TABLE),
+      );
+
+      // Run migrations for existing tables
+      await this.executeQueryWithMetrics(
+        'ALTER_MARKET_CHECKPOINTS_ADD_TIMESTAMPS',
+        async () =>
+          this.pool.query(queries.ALTER_MARKET_CHECKPOINTS_ADD_TIMESTAMPS),
+      );
+
+      console.log('Database schema initialized');
+    } catch (error) {
+      console.error('Error initializing database:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Save checkpoint and return checkpoint ID
+   */
+  private async saveLastFillSlot(): Promise<number> {
+    if (this.isReadOnly) {
+      throw new Error('Cannot save checkpoint in read-only mode');
+    }
+
+    console.log('Saving checkpoint to database...');
+    let client: PoolClient | undefined;
+
+    try {
+      client = await this.pool.connect();
+      client.on('error', (err: Error) => {
+        console.error('Database client error during checkpoint save:', err);
+      });
+
+      await this.executeClientQueryWithMetrics(
+        client,
+        'BEGIN_TRANSACTION',
+        queries.BEGIN_TRANSACTION,
+      );
+
+      const checkpointResult: QueryResult =
+        await this.executeClientQueryWithMetrics(
+          client,
+          'INSERT_STATE_CHECKPOINT',
+          queries.INSERT_STATE_CHECKPOINT,
+          [this.lastFillSlot],
+        );
+
+      const checkpointId: number = checkpointResult.rows[0].id;
+
+      await this.executeClientQueryWithMetrics(
+        client,
+        'COMMIT_TRANSACTION',
+        queries.COMMIT_TRANSACTION,
+      );
+      console.log(`Checkpoint saved with ID: ${checkpointId}`);
+
+      return checkpointId;
+    } catch (error: any) {
+      console.error('Error saving checkpoint:', error);
+
+      if (client) {
+        try {
+          await this.executeClientQueryWithMetrics(
+            client,
+            'ROLLBACK_TRANSACTION',
+            queries.ROLLBACK_TRANSACTION,
+          );
+        } catch (rollbackError: any) {
+          console.error('Error during checkpoint rollback:', rollbackError);
+        }
+      }
+      await this.sendDatabaseErrorAlert(error);
+      throw error;
+    } finally {
+      if (client) {
+        try {
+          client.release();
+        } catch (releaseError: any) {
+          console.error(
+            'Error releasing client after checkpoint save:',
+            releaseError,
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Save volume and market data for a checkpoint
+   */
+  private async saveVolumeAndMarketData(checkpointId: number): Promise<void> {
+    if (this.isReadOnly) {
+      return; // Skip in read-only mode
+    }
+
+    console.log('Saving volume and market data to database...');
+    let client: PoolClient | undefined;
+
+    try {
+      client = await this.pool.connect();
+      client.on('error', (err: Error) => {
+        console.error('Database client error during volume save:', err);
+      });
+
+      await this.executeClientQueryWithMetrics(
+        client,
+        'BEGIN_TRANSACTION',
+        queries.BEGIN_TRANSACTION,
+      );
+
+      // Save market checkpoints
+      const checkpointPromises: Promise<QueryResult>[] = [];
+      for (const [
+        market,
+        baseCheckpoints,
+      ] of this.baseVolumeAtomsCheckpoints.entries()) {
+        // Defensive: never attempt to persist a null/empty market key. The
+        // market column is NOT NULL; a bogus key would fail the whole
+        // transaction. See loadNewMarket for how such a key could appear.
+        if (market === null || market === undefined || market === '') {
+          console.error(
+            'Skipping checkpoint save for invalid market key:',
+            market,
+          );
+          continue;
+        }
+        const quoteCheckpoints: number[] =
+          this.quoteVolumeAtomsCheckpoints.get(market) || [];
+        const checkpointTimestamps: number[] =
+          this.checkpointTimestamps.get(market) || [];
+        const lastPrice: number = this.lastPriceByMarket.get(market) || 0;
+
+        checkpointPromises.push(
+          client.query(queries.INSERT_MARKET_CHECKPOINT, [
+            checkpointId,
+            market,
+            JSON.stringify(baseCheckpoints),
+            JSON.stringify(quoteCheckpoints),
+            JSON.stringify(checkpointTimestamps),
+            lastPrice,
+          ]),
+        );
+      }
+
+      console.log('Awaiting checkpoint inserts to complete');
+      await Promise.all(checkpointPromises);
+
+      await this.executeClientQueryWithMetrics(
+        client,
+        'COMMIT_TRANSACTION',
+        queries.COMMIT_TRANSACTION,
+      );
+      console.log('Volume and market data saved successfully');
+    } catch (error: any) {
+      console.error('Error saving volume and market data:', error);
+
+      if (client) {
+        try {
+          await this.executeClientQueryWithMetrics(
+            client,
+            'ROLLBACK_TRANSACTION',
+            queries.ROLLBACK_TRANSACTION,
+          );
+        } catch (rollbackError: any) {
+          console.error('Error during volume data rollback:', rollbackError);
+        }
+      }
+      await this.sendDatabaseErrorAlert(error);
+      throw error;
+    } finally {
+      if (client) {
+        try {
+          client.release();
+        } catch (releaseError: any) {
+          console.error(
+            'Error releasing client after volume save:',
+            releaseError,
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Save trader data for a checkpoint
+   */
+  private async saveTraderData(checkpointId: number): Promise<void> {
+    if (this.isReadOnly) {
+      return; // Skip in read-only mode
+    }
+
+    console.log('Saving trader data to database...');
+    let client: PoolClient | undefined;
+
+    try {
+      client = await this.pool.connect();
+      client.on('error', (err: Error) => {
+        console.error('Database client error during trader data save:', err);
+      });
+
+      await this.executeClientQueryWithMetrics(
+        client,
+        'BEGIN_TRANSACTION',
+        queries.BEGIN_TRANSACTION,
+      );
+
+      // Save trader stats in batches
+      console.log('Saving trader stats in batches');
+      const traderArray: string[] = Array.from(
+        new Set([
+          ...Array.from(this.traderNumTakerTrades.keys()),
+          ...Array.from(this.traderNumMakerTrades.keys()),
+        ]),
+      );
+      const TRADER_BATCH_SIZE: number = 20;
+
+      for (let i = 0; i < traderArray.length; i += TRADER_BATCH_SIZE) {
+        const batch: string[] = traderArray.slice(i, i + TRADER_BATCH_SIZE);
+        const batchPromises: Promise<QueryResult>[] = [];
+
+        for (const trader of batch) {
+          const numTakerTrades: number =
+            this.traderNumTakerTrades.get(trader) || 0;
+          const numMakerTrades: number =
+            this.traderNumMakerTrades.get(trader) || 0;
+          const takerVolume: number =
+            this.traderTakerNotionalVolume.get(trader) || 0;
+          const makerVolume: number =
+            this.traderMakerNotionalVolume.get(trader) || 0;
+
+          batchPromises.push(
+            client.query(queries.INSERT_TRADER_STATS, [
+              checkpointId,
+              trader,
+              numTakerTrades,
+              numMakerTrades,
+              takerVolume,
+              makerVolume,
+            ]),
+          );
+        }
+
+        await Promise.all(batchPromises);
+      }
+
+      // Save trader positions with filtering and batching
+      console.log('Saving trader positions with filtering');
+      const POSITION_THRESHOLD: number = 1;
+      const BATCH_SIZE: number = 10;
+      const DELAY_BETWEEN_BATCHES: number = 50;
+
+      const delay = (ms: number | undefined): Promise<void> =>
+        new Promise((resolve) => setTimeout(resolve, ms));
+
+      // Copy the positions before the first await. The loop below yields to
+      // the event loop between traders, and during that time
+      // pruneInactiveTraders can delete a trader while a new fill re-adds it.
+      // A Map iterator revisits a key that is deleted and re-added
+      // mid-iteration, which would insert the same (checkpoint_id, trader,
+      // mint) twice and violate the primary key. The copy is synchronous, so
+      // it is also a consistent point-in-time snapshot of every trader.
+      const positionsSnapshot: [
+        string,
+        Map<string, number>,
+        Map<string, number>,
+      ][] = Array.from(this.traderPositions.entries()).map(
+        ([trader, positions]) => [
+          trader,
+          new Map(positions),
+          new Map(this.traderAcquisitionValue.get(trader) || []),
+        ],
+      );
+
+      let traderCount: number = 0;
+      for (const [trader, positions, acquisitionValues] of positionsSnapshot) {
+        const positionBatchPromises: Promise<QueryResult>[] = [];
+
+        for (const [mint, position] of positions.entries()) {
+          const acquisitionValue: number = acquisitionValues.get(mint) || 0;
+
+          if (
+            Math.abs(position) === 0 ||
+            Math.abs(acquisitionValue) < POSITION_THRESHOLD
+          ) {
+            continue;
+          }
+
+          positionBatchPromises.push(
+            client.query(queries.INSERT_TRADER_POSITION, [
+              checkpointId,
+              trader,
+              mint,
+              position,
+              acquisitionValue,
+            ]),
+          );
+        }
+
+        if (positionBatchPromises.length > 0) {
+          await Promise.all(positionBatchPromises);
+        }
+
+        traderCount++;
+        if (traderCount % BATCH_SIZE === 0) {
+          await delay(DELAY_BETWEEN_BATCHES);
+        }
+      }
+
+      await this.executeClientQueryWithMetrics(
+        client,
+        'COMMIT_TRANSACTION',
+        queries.COMMIT_TRANSACTION,
+      );
+      console.log('Trader data saved successfully');
+    } catch (error: any) {
+      console.error('Error saving trader data:', error);
+
+      if (client) {
+        try {
+          await this.executeClientQueryWithMetrics(
+            client,
+            'ROLLBACK_TRANSACTION',
+            queries.ROLLBACK_TRANSACTION,
+          );
+        } catch (rollbackError: any) {
+          console.error('Error during trader data rollback:', rollbackError);
+        }
+      }
+      await this.sendDatabaseErrorAlert(error);
+      throw error;
+    } finally {
+      if (client) {
+        try {
+          client.release();
+        } catch (releaseError: any) {
+          console.error(
+            'Error releasing client after trader data save:',
+            releaseError,
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Clean up old checkpoints. This deletes the state_checkpoint with the id as
+   * well as the market checkpoints with the base and volume. This ensures that
+   * these tables only have 1 save of data in them and are just acting as a
+   * disk, not as a database.
+   */
+  private async cleanupOldCheckpoints(
+    previousCheckpointId: number,
+  ): Promise<void> {
+    if (this.isReadOnly) {
+      return; // Skip in read-only mode
+    }
+
+    console.log('Cleaning up old checkpoints...');
+    let client: PoolClient | undefined;
+
+    try {
+      client = await this.pool.connect();
+      client.on('error', (err: Error) => {
+        console.error('Database client error during cleanup:', err);
+      });
+
+      await this.executeClientQueryWithMetrics(
+        client,
+        'BEGIN_TRANSACTION',
+        queries.BEGIN_TRANSACTION,
+      );
+
+      await this.executeClientQueryWithMetrics(
+        client,
+        'DELETE_OLD_CHECKPOINTS',
+        queries.DELETE_OLD_CHECKPOINTS,
+        [previousCheckpointId],
+      );
+
+      await this.executeClientQueryWithMetrics(
+        client,
+        'DELETE_OLD_MARKET_VOLUMES',
+        queries.DELETE_OLD_MARKET_VOLUMES,
+        [previousCheckpointId],
+      );
+
+      await this.executeClientQueryWithMetrics(
+        client,
+        'COMMIT_TRANSACTION',
+        queries.COMMIT_TRANSACTION,
+      );
+      console.log('Old checkpoints cleaned up successfully');
+    } catch (error: any) {
+      console.error('Error cleaning up old checkpoints:', error);
+
+      if (client) {
+        try {
+          await this.executeClientQueryWithMetrics(
+            client,
+            'ROLLBACK_TRANSACTION',
+            queries.ROLLBACK_TRANSACTION,
+          );
+        } catch (rollbackError: any) {
+          console.error('Error during cleanup rollback:', rollbackError);
+        }
+      }
+      await this.sendDatabaseErrorAlert(error);
+      throw error;
+    } finally {
+      if (client) {
+        try {
+          client.release();
+        } catch (releaseError: any) {
+          console.error('Error releasing client after cleanup:', releaseError);
+        }
+      }
+    }
+  }
+
+  /**
+   * Save current state to database.
+   * Protected to prevent overwriting good checkpoint data before new data has accumulated.
+   */
+  async saveState(): Promise<void> {
+    if (this.isReadOnly) {
+      console.log('Skipping state save (read-only mode)');
+      return;
+    }
+
+    // Protect against overwriting good checkpoint data before we've accumulated enough new data.
+    // This prevents data loss when the server restarts frequently.
+    if (
+      this.checkpointAdvancesSinceStartup <
+      this.MIN_CHECKPOINT_ADVANCES_BEFORE_SAVE
+    ) {
+      console.log(
+        `Skipping state save: only ${this.checkpointAdvancesSinceStartup}/${this.MIN_CHECKPOINT_ADVANCES_BEFORE_SAVE} checkpoint advances since startup. ` +
+          `Waiting for more data to accumulate before overwriting database.`,
+      );
+      return;
+    }
+
+    console.log('Saving state to database...');
+
+    try {
+      // Save checkpoint first and get the ID. This is a different checkpoint from the volume checkpoints.
+      const checkpointId: number = await this.saveLastFillSlot();
+
+      // Save volume and market data in separate transaction
+      await this.saveVolumeAndMarketData(checkpointId);
+
+      // Save trader data in separate transaction
+      await this.saveTraderData(checkpointId);
+
+      // Clean up old checkpoints - this gets its own transaction
+      await this.cleanupOldCheckpoints(checkpointId);
+
+      console.log('All state saved successfully to database');
+    } catch (error: unknown) {
+      console.error('Error saving state to database:', error);
+      await this.sendDatabaseErrorAlert(error);
+      // Don't re-throw - we want to continue operation even after errors
+    }
+  }
+
+  /**
+   * Load state from database.
+   * Loads the freshest checkpoint data for each market across all checkpoints,
+   * which handles cases where some checkpoints may be incomplete.
+   */
+  async loadState(): Promise<boolean> {
+    console.log('Loading state from database...');
+
+    try {
+      // Get the most recent checkpoint for lastFillSlot
+      const checkpointResultRecent: QueryResult =
+        await this.executeQueryWithMetrics(
+          'SELECT_RECENT_CHECKPOINT',
+          async () => this.pool.query(queries.SELECT_RECENT_CHECKPOINT),
+        );
+
+      if (checkpointResultRecent.rowCount === 0) {
+        console.log('No saved checkpoint found in database');
+        return false;
+      }
+
+      this.lastFillSlot = checkpointResultRecent.rows[0].last_fill_slot;
+      console.log(`Loaded lastFillSlot: ${this.lastFillSlot}`);
+
+      // Load the freshest checkpoint data for each market across ALL checkpoints
+      // This handles cases where a checkpoint was partially saved or interrupted
+      const marketCheckpointsResult: QueryResult =
+        await this.executeQueryWithMetrics(
+          'SELECT_FRESHEST_MARKET_CHECKPOINTS',
+          async () =>
+            this.pool.query(queries.SELECT_FRESHEST_MARKET_CHECKPOINTS),
+        );
+
+      const checkpointIdsUsed: Set<number> = new Set();
+
+      for (const row of marketCheckpointsResult.rows) {
+        const market: string = row.market;
+        const baseCheckpoints: number[] = row.base_volume_checkpoints || [];
+        const quoteCheckpoints: number[] = row.quote_volume_checkpoints || [];
+        const timestamps: number[] = row.checkpoint_timestamps || [];
+
+        this.baseVolumeAtomsCheckpoints.set(market, baseCheckpoints);
+        this.quoteVolumeAtomsCheckpoints.set(market, quoteCheckpoints);
+        this.checkpointTimestamps.set(market, timestamps);
+        // Initialize "since last checkpoint" counters for loaded markets
+        // These start at 0 because we're resuming from a saved checkpoint
+        this.baseVolumeAtomsSinceLastCheckpoint.set(market, 0);
+        this.quoteVolumeAtomsSinceLastCheckpoint.set(market, 0);
+        if (row.last_price) {
+          this.lastPriceByMarket.set(market, Number(row.last_price));
+        }
+        checkpointIdsUsed.add(row.checkpoint_id);
+      }
+
+      console.log(
+        `Loaded ${marketCheckpointsResult.rowCount} market checkpoints from database (from checkpoint IDs: ${Array.from(checkpointIdsUsed).join(', ')})`,
+      );
+
+      console.log('State loaded successfully from database');
+      return true;
+    } catch (error: unknown) {
+      console.error('Error loading state from database:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Prune inactive traders to prevent memory leaks.
+   * Keeps only the top traders by volume when the limit is exceeded.
+   */
+  private pruneInactiveTraders(): void {
+    const allTraders = new Set<string>([
+      ...Array.from(this.traderNumTakerTrades.keys()),
+      ...Array.from(this.traderNumMakerTrades.keys()),
+    ]);
+
+    const traderCount = allTraders.size;
+    if (traderCount <= MAX_TRADERS) {
+      return;
+    }
+
+    console.log(
+      `Pruning traders: ${traderCount} traders exceeds limit of ${MAX_TRADERS}`,
+    );
+
+    // Sort traders by total volume and keep top MAX_TRADERS
+    const tradersByVolume = Array.from(allTraders)
+      .map((trader) => ({
+        trader,
+        totalVolume:
+          (this.traderTakerNotionalVolume.get(trader) || 0) +
+          (this.traderMakerNotionalVolume.get(trader) || 0),
+      }))
+      .sort((a, b) => b.totalVolume - a.totalVolume);
+
+    // Keep top MAX_TRADERS traders
+    const keptTraders: { trader: string; totalVolume: number }[] =
+      tradersByVolume.slice(0, MAX_TRADERS);
+    const tradersToKeep: Set<string> = new Set(
+      keptTraders.map(
+        (t: { trader: string; totalVolume: number }): string => t.trader,
+      ),
+    );
+
+    // Remove traders not in the keep set
+    let removedCount = 0;
+    for (const trader of allTraders) {
+      if (!tradersToKeep.has(trader)) {
+        this.traderNumTakerTrades.delete(trader);
+        this.traderNumMakerTrades.delete(trader);
+        this.traderTakerNotionalVolume.delete(trader);
+        this.traderMakerNotionalVolume.delete(trader);
+        this.traderPositions.delete(trader);
+        this.traderAcquisitionValue.delete(trader);
+        removedCount++;
+      }
+    }
+
+    // Rebuild the sorted volume index from the survivors so it stays in sync
+    // with the pruned maps.
+    this.traderVolumeIndex.rebuild(
+      keptTraders.map(
+        (t: { trader: string; totalVolume: number }): [string, number] => [
+          t.trader,
+          t.totalVolume,
+        ],
+      ),
+    );
+
+    console.log(`Pruned ${removedCount} inactive traders`);
+  }
+
+  /**
+   * Prune old fill log results to prevent memory leaks.
+   * Keeps only the most recent markets.
+   */
+  private pruneFillLogResults(): void {
+    if (this.fillLogResults.size <= MAX_FILL_LOG_MARKETS) {
+      return;
+    }
+
+    console.log(
+      `Pruning fill log results: ${this.fillLogResults.size} markets exceeds limit of ${MAX_FILL_LOG_MARKETS}`,
+    );
+
+    // Get markets sorted by most recent fill (based on array length as proxy)
+    const marketsByActivity = Array.from(this.fillLogResults.entries())
+      .map(([market, fills]) => ({
+        market,
+        fillCount: fills.length,
+      }))
+      .sort((a, b) => b.fillCount - a.fillCount);
+
+    // Keep top MAX_FILL_LOG_MARKETS markets
+    const marketsToKeep = new Set(
+      marketsByActivity.slice(0, MAX_FILL_LOG_MARKETS).map((m) => m.market),
+    );
+
+    // Remove markets not in the keep set
+    let removedCount = 0;
+    for (const market of this.fillLogResults.keys()) {
+      if (!marketsToKeep.has(market)) {
+        this.fillLogResults.delete(market);
+        this.createdAtBlockTimestamp.delete(market);
+        removedCount++;
+      }
+    }
+
+    console.log(`Pruned ${removedCount} inactive fill log markets`);
+  }
+
+  /**
+   * Log memory usage for debugging
+   */
+  private logMemoryUsage(): void {
+    const used = process.memoryUsage();
+    console.log('Memory usage:', {
+      heapUsed: `${Math.round(used.heapUsed / 1024 / 1024)}MB`,
+      heapTotal: `${Math.round(used.heapTotal / 1024 / 1024)}MB`,
+      rss: `${Math.round(used.rss / 1024 / 1024)}MB`,
+      external: `${Math.round(used.external / 1024 / 1024)}MB`,
+      traders: this.traderNumTakerTrades.size,
+      markets: this.markets.size,
+      fillLogMarkets: this.fillLogResults.size,
+    });
+  }
+
+  // True when any restored checkpoint bucket for the market holds volume.
+  private hasCheckpointVolume(marketPk: string): boolean {
+    const base: number[] | undefined =
+      this.baseVolumeAtomsCheckpoints.get(marketPk);
+    if (base !== undefined && base.some((v: number): boolean => v > 0)) {
+      return true;
+    }
+    const quote: number[] | undefined =
+      this.quoteVolumeAtomsCheckpoints.get(marketPk);
+    return quote !== undefined && quote.some((v: number): boolean => v > 0);
+  }
+
+  // A market is dead (evictable) when it has no volume in any checkpoint
+  // bucket of the last 24 hours and nothing pending since the last advance.
+  // Markets still advancing their checkpoints must additionally have been
+  // observed for the full 24h window (oldest timestamp populated), so a newly
+  // created quiet market is not evicted before it has had a day to trade.
+  // Orphans - checkpoint rows restored from the database for markets that no
+  // longer exist on chain (e.g. closed by defrag) - never advance, so the
+  // window requirement is waived for them; there is nothing to lose.
+  private isMarketEvictable(marketPk: string, nowSec: number): boolean {
+    if ((this.baseVolumeAtomsSinceLastCheckpoint.get(marketPk) || 0) > 0) {
+      return false;
+    }
+    if ((this.quoteVolumeAtomsSinceLastCheckpoint.get(marketPk) || 0) > 0) {
+      return false;
+    }
+    const timestamps: number[] = this.checkpointTimestamps.get(marketPk) || [];
+    const base: number[] = this.baseVolumeAtomsCheckpoints.get(marketPk) || [];
+    const quote: number[] =
+      this.quoteVolumeAtomsCheckpoints.get(marketPk) || [];
+    const dayAgo: number = nowSec - ONE_DAY_SEC;
+    for (let i: number = 0; i < timestamps.length; i++) {
+      if (
+        timestamps[i] >= dayAgo &&
+        ((base[i] || 0) > 0 || (quote[i] || 0) > 0)
+      ) {
+        return false;
+      }
+    }
+    if (
+      this.markets.has(marketPk) &&
+      (timestamps.length === 0 || timestamps[0] === 0)
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  // Drop every piece of per-market state. The market is re-tracked lazily by
+  // loadNewMarket on its next fill. Database rows from already-saved
+  // checkpoints are left alone; they stop being refreshed once the market is
+  // out of the checkpoint maps, and a restart that restores one is handled by
+  // the orphan path in isMarketEvictable.
+  private evictMarket(marketPk: string): void {
+    const market: Market | undefined = this.markets.get(marketPk);
+    if (market !== undefined) {
+      // Remove prometheus series so evicted markets do not report stale
+      // values forever (and the scrape payload actually shrinks).
+      this.volume.remove({
+        market: marketPk,
+        mint: market.baseMint().toBase58(),
+        side: 'base',
+      });
+      this.volume.remove({
+        market: marketPk,
+        mint: market.quoteMint().toBase58(),
+        side: 'quote',
+      });
+      this.lastPrice.remove({ market: marketPk });
+      this.fills.remove({ market: marketPk });
+
+      // Keep the PnL index in sync with `markets` (see indexMarketForPnL).
+      const baseMint: string = market.baseMint().toBase58();
+      const marketsForBase: string[] | undefined =
+        this.baseMintToStablecoinMarkets.get(baseMint);
+      if (marketsForBase !== undefined) {
+        const index: number = marketsForBase.indexOf(marketPk);
+        if (index >= 0) {
+          marketsForBase.splice(index, 1);
+        }
+        if (marketsForBase.length === 0) {
+          this.baseMintToStablecoinMarkets.delete(baseMint);
+        }
+      }
+    }
+    this.markets.delete(marketPk);
+    this.baseVolumeAtomsSinceLastCheckpoint.delete(marketPk);
+    this.quoteVolumeAtomsSinceLastCheckpoint.delete(marketPk);
+    this.baseVolumeAtomsCheckpoints.delete(marketPk);
+    this.quoteVolumeAtomsCheckpoints.delete(marketPk);
+    this.checkpointTimestamps.delete(marketPk);
+    this.lastPriceByMarket.delete(marketPk);
+    this.tickers.delete(marketPk);
+    this.fillLogResults.delete(marketPk);
+    this.createdAtBlockTimestamp.delete(marketPk);
+    this.orderbookMarketLastLoadMs.delete(marketPk);
+  }
+
+  /**
+   * Evict dead markets once the tracked set passes the high water mark,
+   * bringing it back down to the low water mark. Orphaned checkpoint entries
+   * (markets absent from `markets`) go first since they serve no endpoint.
+   * Must run under the fill mutex (called from runMemoryCleanup inside
+   * advanceCheckpoints) so eviction cannot race fill processing.
+   */
+  private evictDeadMarkets(): void {
+    // Same size measure as the loadNewMarket cap check.
+    const tracked: number = Math.max(
+      this.markets.size,
+      this.baseVolumeAtomsCheckpoints.size,
+    );
+    if (tracked <= MARKET_EVICTION_HIGH_WATER) {
+      return;
+    }
+    const evictTarget: number = tracked - MARKET_EVICTION_LOW_WATER;
+    const nowSec: number = Math.floor(Date.now() / 1000);
+
+    const candidates: string[] = [];
+    for (const marketPk of this.baseVolumeAtomsCheckpoints.keys()) {
+      if (
+        !this.markets.has(marketPk) &&
+        this.isMarketEvictable(marketPk, nowSec)
+      ) {
+        candidates.push(marketPk);
+      }
+    }
+    for (const marketPk of this.markets.keys()) {
+      if (candidates.length >= evictTarget) {
+        break;
+      }
+      if (this.isMarketEvictable(marketPk, nowSec)) {
+        candidates.push(marketPk);
+      }
+    }
+
+    const toEvict: string[] = candidates.slice(0, evictTarget);
+    for (const marketPk of toEvict) {
+      this.evictMarket(marketPk);
+    }
+    console.log(
+      `Evicted ${toEvict.length} dead markets (${tracked} tracked > high water ` +
+        `${MARKET_EVICTION_HIGH_WATER}, target ${MARKET_EVICTION_LOW_WATER}); ` +
+        `now tracking ${Math.max(
+          this.markets.size,
+          this.baseVolumeAtomsCheckpoints.size,
+        )}`,
+    );
+  }
+
+  /**
+   * Run all memory cleanup tasks
+   */
+  runMemoryCleanup(): void {
+    this.logMemoryUsage();
+    this.pruneInactiveTraders();
+    this.pruneFillLogResults();
+    this.evictDeadMarkets();
+    this.logMemoryUsage();
+  }
+
+  /**
+   * Add a fill event to the GeckoTerminal block-indexed storage.
+   * Maintains a maximum of GECKO_MAX_BLOCKS blocks.
+   */
+  private addGeckoBlockEvent(fill: FillLogResult): void {
+    const slot = fill.slot;
+    const blockTime = fill.blockTime ?? Math.floor(Date.now() / 1000);
+
+    // Update latest block time
+    if (slot >= this.lastFillSlot) {
+      this.latestBlockTime = blockTime;
+    }
+
+    // Add event to existing block or create new block entry
+    if (this.geckoBlockEvents.has(slot)) {
+      const block = this.geckoBlockEvents.get(slot)!;
+      appendUniqueFill(
+        block.events,
+        fill,
+        MAX_GECKO_EVENTS_PER_BLOCK,
+        `slot ${slot}`,
+      );
+    } else {
+      this.geckoBlockEvents.set(slot, { blockTime, events: [fill] });
+
+      // Add slot to ordered list and maintain sort order
+      // Insert in sorted position (slots should mostly come in order)
+      const insertIndex = this.geckoBlockSlots.findIndex((s) => s > slot);
+      if (insertIndex === -1) {
+        this.geckoBlockSlots.push(slot);
+      } else {
+        this.geckoBlockSlots.splice(insertIndex, 0, slot);
+      }
+
+      // Cleanup: remove oldest blocks if we exceed the limit
+      while (this.geckoBlockSlots.length > this.GECKO_MAX_BLOCKS) {
+        const oldestSlot = this.geckoBlockSlots.shift()!;
+        this.geckoBlockEvents.delete(oldestSlot);
+      }
+    }
+  }
+
+  /**
+   * GeckoTerminal: Get latest indexed block info
+   */
+  getGeckoLatestBlock(): {
+    block: { blockNumber: number; blockTimestamp: number };
+  } {
+    return {
+      block: {
+        blockNumber: this.lastFillSlot,
+        blockTimestamp: this.latestBlockTime,
+      },
+    };
+  }
+
+  /**
+   * GeckoTerminal: Get token/asset info by mint address
+   */
+  getGeckoAsset(id: string): {
+    asset: { id: string; name: string; symbol: string; decimals: number };
+  } | null {
+    const metadata = this.tokenMetadata.get(id);
+    if (!metadata) {
+      return null;
+    }
+    return {
+      asset: {
+        id,
+        name: metadata.symbol, // Use symbol as name since we don't have separate name
+        symbol: metadata.symbol,
+        decimals: metadata.decimals,
+      },
+    };
+  }
+
+  /**
+   * GeckoTerminal: Get pair/market info by market address
+   */
+  getGeckoPair(id: string): {
+    pair: {
+      id: string;
+      dexKey: string;
+      asset0Id: string;
+      asset1Id: string;
+      feeBps: number;
+      createdAtBlockTimestamp: number;
+    };
+  } | null {
+    const market = this.markets.get(id);
+    if (!market) {
+      return null;
+    }
+    return {
+      pair: {
+        id,
+        dexKey: 'manifest',
+        asset0Id: market.baseMint().toBase58(),
+        asset1Id: market.quoteMint().toBase58(),
+        feeBps: 0, // Manifest has no trading fees
+        createdAtBlockTimestamp: this.createdAtBlockTimestamp.get(id) || 0,
+      },
+    };
+  }
+
+  /**
+   * GeckoTerminal: Get swap events within block range (inclusive)
+   * Returns a flat array of events, each containing its own block info
+   */
+  getGeckoEvents(
+    fromBlock: number,
+    toBlock: number,
+    maxEvents: number = 5_000,
+  ): {
+    events: Array<{
+      block: { blockNumber: number; blockTimestamp: number };
+      eventType: string;
+      txnId: string;
+      txnIndex: number;
+      eventIndex: number;
+      maker: string;
+      pairId: string;
+      asset0In?: number;
+      asset1Out?: number;
+      asset1In?: number;
+      asset0Out?: number;
+      priceNative: number;
+      reserves: { asset0: number; asset1: number };
+    }>;
+  } {
+    const result: Array<{
+      block: { blockNumber: number; blockTimestamp: number };
+      eventType: string;
+      txnId: string;
+      txnIndex: number;
+      eventIndex: number;
+      maker: string;
+      pairId: string;
+      asset0In?: number;
+      asset1Out?: number;
+      asset1In?: number;
+      asset0Out?: number;
+      priceNative: number;
+      reserves: { asset0: number; asset1: number };
+    }> = [];
+
+    // Filter slots within range
+    for (const slot of this.geckoBlockSlots) {
+      if (slot < fromBlock) continue;
+      if (slot > toBlock) break;
+
+      const blockData = this.geckoBlockEvents.get(slot);
+      if (!blockData) continue;
+
+      // Group fills by transaction to assign txnIndex
+      const fillsByTx = new Map<string, FillLogResult[]>();
+      for (const fill of blockData.events) {
+        if (!fillsByTx.has(fill.signature)) {
+          fillsByTx.set(fill.signature, []);
+        }
+        fillsByTx.get(fill.signature)!.push(fill);
+      }
+
+      let txnIndex = 0;
+      for (const [_signature, fills] of fillsByTx) {
+        for (let eventIndex = 0; eventIndex < fills.length; eventIndex++) {
+          const fill = fills[eventIndex];
+          const market = this.markets.get(fill.market);
+
+          // Convert amounts to decimalized values
+          const baseDecimals = market?.baseDecimals() ?? 9;
+          const quoteDecimals = market?.quoteDecimals() ?? 6;
+          const baseAmount = Number(fill.baseAtoms) / 10 ** baseDecimals;
+          const quoteAmount = Number(fill.quoteAtoms) / 10 ** quoteDecimals;
+
+          // Calculate native price (price of asset0 in terms of asset1)
+          const priceNative =
+            fill.priceAtoms * 10 ** (baseDecimals - quoteDecimals);
+
+          // Determine direction: takerIsBuy means taker buys base (asset0)
+          // So asset0 goes out (to taker), asset1 goes in (from taker)
+          const event: {
+            block: { blockNumber: number; blockTimestamp: number };
+            eventType: string;
+            txnId: string;
+            txnIndex: number;
+            eventIndex: number;
+            maker: string;
+            pairId: string;
+            asset0In?: number;
+            asset1Out?: number;
+            asset1In?: number;
+            asset0Out?: number;
+            priceNative: number;
+            reserves: { asset0: number; asset1: number };
+          } = {
+            block: {
+              blockNumber: slot,
+              blockTimestamp: blockData.blockTime,
+            },
+            eventType: 'swap',
+            txnId: fill.signature,
+            txnIndex,
+            eventIndex,
+            maker: fill.maker,
+            pairId: fill.market,
+            priceNative,
+            reserves: { asset0: 0, asset1: 0 }, // Orderbook, no reserves
+          };
+
+          if (fill.takerIsBuy) {
+            // Taker buys base: asset1 goes in, asset0 goes out
+            event.asset1In = quoteAmount;
+            event.asset0Out = baseAmount;
+          } else {
+            // Taker sells base: asset0 goes in, asset1 goes out
+            event.asset0In = baseAmount;
+            event.asset1Out = quoteAmount;
+          }
+
+          result.push(event);
+          if (result.length > maxEvents) {
+            throw new RangeError(`event result exceeds ${maxEvents} entries`);
+          }
+        }
+        txnIndex++;
+      }
+    }
+
+    return { events: result };
+  }
+
+  /**
+   * Clean shutdown of the server
+   */
+  async shutdown(): Promise<void> {
+    console.log('Shutting down ManifestStatsServer...');
+
+    // Close WebSocket manager
+    if (this.wsManager) {
+      this.wsManager.close();
+      this.wsManager = null;
+    }
+
+    // Close database pool
+    if (this.pool) {
+      await this.pool.end();
+    }
+
+    console.log('ManifestStatsServer shutdown complete');
+  }
+}

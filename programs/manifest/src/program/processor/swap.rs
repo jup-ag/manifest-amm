@@ -1,4 +1,5 @@
-use std::cell::RefMut;
+use crate::validation::{io_to_program_error, to_program_error, AccountViewExt};
+use pinocchio::{account::RefMut, ProgramResult};
 
 use crate::{
     logs::{emit_stack, PlaceOrderLogV2},
@@ -6,8 +7,8 @@ use crate::{
     quantities::{BaseAtoms, QuoteAtoms, QuoteAtomsPerBaseAtom, WrapperU64},
     require,
     state::{
-        AddOrderToMarketArgs, AddOrderToMarketResult, MarketRefMut, OrderType,
-        NO_EXPIRATION_LAST_VALID_SLOT,
+        utils::settle_global_gas_refunds, AddOrderToMarketArgs, AddOrderToMarketResult,
+        MarketRefMut, OrderType, NO_EXPIRATION_LAST_VALID_SLOT,
     },
     validation::loaders::SwapContext,
 };
@@ -18,7 +19,8 @@ use crate::{
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use hypertree::{trace, DataIndex, NIL};
-use solana_program::{account_info::AccountInfo, entrypoint::ProgramResult, pubkey::Pubkey};
+use pinocchio::account::AccountView;
+use solana_program::pubkey::Pubkey;
 
 use super::shared::get_mut_dynamic_account;
 
@@ -30,16 +32,26 @@ use {
 };
 
 use crate::validation::{MintAccountInfo, Signer, TokenAccountInfo, TokenProgram};
-use solana_program::program_error::ProgramError;
+use pinocchio::error::ProgramError;
+#[cfg(not(feature = "certora"))]
+use {
+    crate::state::utils::get_now_epoch,
+    spl_token_2022::{
+        extension::{
+            transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions,
+        },
+        state::Mint,
+    },
+};
 
 #[derive(BorshDeserialize, BorshSerialize)]
 pub struct SwapParams {
     pub in_atoms: u64,
     pub out_atoms: u64,
     pub is_base_in: bool,
-    // Exact in is a technical term that doesnt actually mean exact. It is
-    // desired. If not that much can be fulfilled, less will be allowed assuming
-    // the min_out/max_in is satisfied.
+    // Exact-in may consume less than the requested input when the book is
+    // exhausted, but must satisfy the minimum output. Exact-out must deliver
+    // the requested output without exceeding the maximum input.
     pub is_exact_in: bool,
 }
 
@@ -54,19 +66,44 @@ impl SwapParams {
     }
 }
 
+#[inline(always)]
+fn minimum_output_satisfied<F>(
+    minimum_output: u64,
+    gross_output: u64,
+    calculate_post_fee: F,
+) -> Result<bool, ProgramError>
+where
+    F: FnOnce(u64) -> Result<u64, ProgramError>,
+{
+    Ok(minimum_output <= calculate_post_fee(gross_output)?)
+}
+
+#[inline(always)]
+fn calculate_consumed_input_transfer<F>(
+    net_input_credit: u64,
+    unused_net_input: u64,
+    calculate_pre_fee: F,
+) -> Result<u64, ProgramError>
+where
+    F: FnOnce(u64) -> Result<u64, ProgramError>,
+{
+    let consumed_net_input = net_input_credit.saturating_sub(unused_net_input);
+    calculate_pre_fee(consumed_net_input)
+}
+
 pub(crate) fn process_swap(
     program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
-    let params = SwapParams::try_from_slice(data)?;
+    let params = SwapParams::try_from_slice(data).map_err(io_to_program_error)?;
     process_swap_core(program_id, accounts, params)
 }
 
 #[cfg_attr(all(feature = "certora", not(feature = "certora-test")), early_panic)]
 pub(crate) fn process_swap_core(
     _program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    accounts: &[AccountView],
     params: SwapParams,
 ) -> ProgramResult {
     let swap_context: SwapContext = SwapContext::load(accounts)?;
@@ -87,18 +124,19 @@ pub(crate) fn process_swap_core(
     } = swap_context;
 
     let (existing_seat_index, trader_index, initial_base_atoms, initial_quote_atoms) = {
-        let market_data: &mut RefMut<&mut [u8]> = &mut market.try_borrow_mut_data()?;
+        let market_data: &mut RefMut<[u8]> = &mut market.try_borrow_mut()?;
         let mut dynamic_account: MarketRefMut = get_mut_dynamic_account(market_data);
 
         // Claim seat if needed
-        let existing_seat_index: DataIndex = dynamic_account.get_trader_index(owner.key);
-        if existing_seat_index == NIL {
-            dynamic_account.claim_seat(owner.key)?;
-        }
-        let trader_index: DataIndex = dynamic_account.get_trader_index(owner.key);
+        let existing_seat_index: DataIndex = dynamic_account.get_trader_index(owner.pubkey());
+        let trader_index: DataIndex = if existing_seat_index == NIL {
+            dynamic_account.claim_seat_with_index(owner.pubkey())?
+        } else {
+            existing_seat_index
+        };
 
         let (initial_base_atoms, initial_quote_atoms) =
-            dynamic_account.get_trader_balance(owner.key);
+            dynamic_account.get_trader_balance_by_index(trader_index);
 
         (
             existing_seat_index,
@@ -114,7 +152,7 @@ pub(crate) fn process_swap_core(
     // free block for the reverse order.
     expand_market_if_needed(&payer, &market)?;
 
-    let market_data: &mut RefMut<&mut [u8]> = &mut market.try_borrow_mut_data()?;
+    let market_data: &mut RefMut<[u8]> = &mut market.try_borrow_mut()?;
     let mut dynamic_account: MarketRefMut = get_mut_dynamic_account(market_data);
 
     let SwapParams {
@@ -124,7 +162,33 @@ pub(crate) fn process_swap_core(
         is_exact_in,
     } = params;
 
-    trace!("swap in_atoms:{in_atoms} out_atoms:{out_atoms} is_base_in:{is_base_in} is_exact_in:{is_exact_in}");
+    // Calculate in_atoms_after_transfer_fees after transfer fees for Token-2022 tokens.
+    // This is the amount that will actually arrive at the vault.
+    let in_atoms_after_transfer_fees: u64 = calculate_post_fee_amount(
+        in_atoms,
+        is_base_in,
+        &token_program_base,
+        &token_program_quote,
+        &base_mint,
+        &quote_mint,
+    )?;
+
+    // For exact_out (!is_exact_in), calculate how much the market needs to give
+    // so that after transfer fees, the trader receives their desired out_atoms.
+    let out_atoms_after_transfer_fees: u64 = if !is_exact_in {
+        calculate_pre_fee_amount(
+            out_atoms,
+            is_base_in, // Output is opposite of input: if base_in, output is quote; if quote_in, output is base
+            &token_program_base,
+            &token_program_quote,
+            &base_mint,
+            &quote_mint,
+        )?
+    } else {
+        out_atoms
+    };
+
+    trace!("swap in_atoms:{in_atoms} in_atoms_after_transfer_fees:{in_atoms_after_transfer_fees} out_atoms:{out_atoms} out_atoms_after_transfer_fees:{out_atoms_after_transfer_fees} is_base_in:{is_base_in} is_exact_in:{is_exact_in}");
 
     // This check is redundant with the check that will be done within token
     // program on deposit, but it is done here to future proof in case we later
@@ -154,23 +218,25 @@ pub(crate) fn process_swap_core(
 
     // this is a virtual credit to ensure matching always proceeds
     // net token transfers will be handled later
-    dynamic_account.deposit(trader_index, in_atoms, is_base_in)?;
+    // Use in_atoms_after_transfer_fees (post-fee) to account for Token-2022 transfer fees
+    dynamic_account.deposit(trader_index, in_atoms_after_transfer_fees, is_base_in)?;
 
     // 4 cases:
     // 1. Exact in base. Simplest case, just use the base atoms given.
     // 2. Exact in quote. Search the asks for the number of base atoms in bids to match.
     // 3. Exact out quote. Search the bids for the number of base atoms needed to match to get the right quote out.
     // 4. Exact out base. Use the number of out atoms as the number of atoms to place_order against.
+    // Note: For exact_in cases, we use in_atoms_after_transfer_fees (post-fee) since that's what's available to trade.
     let base_atoms: BaseAtoms = if is_exact_in {
         if is_base_in {
             // input=desired(base) output=min(quote)
-            BaseAtoms::new(in_atoms)
+            BaseAtoms::new(in_atoms_after_transfer_fees)
         } else {
             // input=desired(quote)* output=min(base)
             // round down base amount to not cross quote limit
             dynamic_account.impact_base_atoms(
                 true,
-                QuoteAtoms::new(in_atoms),
+                QuoteAtoms::new(in_atoms_after_transfer_fees),
                 &global_trade_accounts_opts,
             )?
         }
@@ -178,30 +244,23 @@ pub(crate) fn process_swap_core(
         if is_base_in {
             // input=max(base) output=desired(quote)
             // round up base amount to ensure not staying below quote limit
+            // Use out_atoms_after_transfer_fees to account for transfer fees on output
             dynamic_account.impact_base_atoms(
                 false,
-                QuoteAtoms::new(out_atoms),
+                QuoteAtoms::new(out_atoms_after_transfer_fees),
                 &global_trade_accounts_opts,
             )?
         } else {
             // input=max(quote) output=desired(base)
-            BaseAtoms::new(out_atoms)
+            // Use out_atoms_after_transfer_fees to account for transfer fees on output
+            BaseAtoms::new(out_atoms_after_transfer_fees)
         }
     };
 
-    // Note that in the case of fully exhausting the book, exact in/out will not
-    // be respected. It should be treated as a desired in/out. This pushes the
-    // burden of checking the results onto the caller program.
-
-    // Example case is exact quote in. User wants exact quote in of 1_000_000
-    // and min base out of 1_000. Suppose they fully exhaust the book and get
-    // out 2_000 but that is not enough to fully use the entire 1_000_000. In
-    // this case the ix will succeed.
-
-    // Another interesting case is exact quote out. Suppose the user is doing
-    // exact quote out 1_000_000 with max_base_in of 1_000. If it fully exhausts
-    // the book without using the entire max_base_in and that is still not
-    // enough for the exact quote amount, the transaction will still succeed.
+    // Exact-in may exhaust the book before consuming the requested input; that
+    // is safe as long as the minimum output is met. Exact-out must fail if the
+    // book is exhausted before delivering the requested post-fee output. Both
+    // output guarantees are checked after matching below.
 
     let price: QuoteAtomsPerBaseAtom = if is_base_in {
         QuoteAtomsPerBaseAtom::MIN
@@ -222,7 +281,7 @@ pub(crate) fn process_swap_core(
     } = place_order(
         &mut dynamic_account,
         AddOrderToMarketArgs {
-            market: *market.key,
+            market: market.pubkey(),
             trader_index,
             num_base_atoms: base_atoms,
             price,
@@ -234,20 +293,31 @@ pub(crate) fn process_swap_core(
         },
     )?;
 
-    if is_exact_in {
-        let out_atoms_traded: u64 = if is_base_in {
-            quote_atoms_traded.as_u64()
-        } else {
-            base_atoms_traded.as_u64()
-        };
-        require!(
-            out_atoms <= out_atoms_traded,
-            ManifestError::InsufficientOut,
-            "Insufficient out atoms returned. Minimum: {} Actual: {}",
-            out_atoms,
-            out_atoms_traded
-        )?;
+    let gross_out_atoms_traded: u64 = if is_base_in {
+        quote_atoms_traded.as_u64()
     } else {
+        base_atoms_traded.as_u64()
+    };
+    let output_satisfied =
+        minimum_output_satisfied(out_atoms, gross_out_atoms_traded, |gross_output| {
+            calculate_post_fee_amount(
+                gross_output,
+                !is_base_in,
+                &token_program_base,
+                &token_program_quote,
+                &base_mint,
+                &quote_mint,
+            )
+        })?;
+    require!(
+        output_satisfied,
+        ManifestError::InsufficientOut,
+        "Insufficient post-fee out atoms returned. Minimum: {} Gross actual: {}",
+        out_atoms,
+        gross_out_atoms_traded
+    )?;
+
+    if !is_exact_in {
         let in_atoms_traded = if is_base_in {
             base_atoms_traded.as_u64()
         } else {
@@ -262,7 +332,10 @@ pub(crate) fn process_swap_core(
         )?;
     }
 
-    let (end_base_atoms, end_quote_atoms) = dynamic_account.get_trader_balance(owner.key);
+    // Seat indices survive account growth and tree rotations. Matching changes
+    // balances and orders but never releases this swapper's seat.
+    let (end_base_atoms, end_quote_atoms) =
+        dynamic_account.get_trader_balance_by_index(trader_index);
 
     let extra_base_atoms: BaseAtoms = end_base_atoms.checked_sub(initial_base_atoms)?;
     let extra_quote_atoms: QuoteAtoms = end_quote_atoms.checked_sub(initial_quote_atoms)?;
@@ -271,13 +344,22 @@ pub(crate) fn process_swap_core(
     if is_base_in {
         // Trader is depositing base.
 
-        // In order to make the trade, we previously credited the seat with the
-        // maximum they could possibly need,
-        // The amount to take from them is repaying the full credit, minus the
-        // unused amount.
-        let initial_credit_base_atoms: BaseAtoms = BaseAtoms::new(in_atoms);
+        let base_atoms_to_transfer = calculate_consumed_input_transfer(
+            in_atoms_after_transfer_fees,
+            extra_base_atoms.as_u64(),
+            |net_consumed| {
+                calculate_pre_fee_input_amount(
+                    net_consumed,
+                    is_base_in,
+                    &token_program_base,
+                    &token_program_quote,
+                    &base_mint,
+                    &quote_mint,
+                )
+            },
+        )?;
 
-        if *token_program_base.key == spl_token_2022_interface::id() {
+        if *token_program_base.pubkey() == spl_token_2022::id() {
             spl_token_2022_transfer_from_trader_to_vault(
                 &token_program_base,
                 &trader_base_account,
@@ -285,7 +367,7 @@ pub(crate) fn process_swap_core(
                 dynamic_account.fixed.get_base_mint(),
                 &base_vault,
                 &owner,
-                (initial_credit_base_atoms.checked_sub(extra_base_atoms)?).as_u64(),
+                base_atoms_to_transfer,
                 dynamic_account.fixed.get_base_mint_decimals(),
             )?;
         } else {
@@ -294,13 +376,13 @@ pub(crate) fn process_swap_core(
                 &trader_base_account,
                 &base_vault,
                 &owner,
-                (initial_credit_base_atoms.checked_sub(extra_base_atoms)?).as_u64(),
+                base_atoms_to_transfer,
             )?;
         }
 
         // Give all but what started there.
         let quote_vault_bump: u8 = dynamic_account.fixed.get_quote_vault_bump();
-        if *token_program_quote.key == spl_token_2022_interface::id() {
+        if *token_program_quote.pubkey() == spl_token_2022::id() {
             spl_token_2022_transfer_from_vault_to_trader(
                 &token_program_quote,
                 quote_mint,
@@ -309,7 +391,7 @@ pub(crate) fn process_swap_core(
                 &trader_quote_account,
                 extra_quote_atoms.as_u64(),
                 dynamic_account.fixed.get_quote_mint_decimals(),
-                market.key,
+                market.pubkey(),
                 quote_vault_bump,
             )?;
         } else {
@@ -318,7 +400,7 @@ pub(crate) fn process_swap_core(
                 &quote_vault,
                 &trader_quote_account,
                 extra_quote_atoms.as_u64(),
-                market.key,
+                market.pubkey(),
                 quote_vault_bump,
                 dynamic_account.fixed.get_quote_mint(),
             )?;
@@ -326,12 +408,22 @@ pub(crate) fn process_swap_core(
     } else {
         // Trader is depositing quote.
 
-        // In order to make the trade, we previously credited the seat with the
-        // maximum they could possibly need.
-        // The amount to take from them is repaying the full credit, minus the
-        // unused amount.
-        let initial_credit_quote_atoms: QuoteAtoms = QuoteAtoms::new(in_atoms);
-        if *token_program_quote.key == spl_token_2022_interface::id() {
+        let quote_atoms_to_transfer = calculate_consumed_input_transfer(
+            in_atoms_after_transfer_fees,
+            extra_quote_atoms.as_u64(),
+            |net_consumed| {
+                calculate_pre_fee_input_amount(
+                    net_consumed,
+                    is_base_in,
+                    &token_program_base,
+                    &token_program_quote,
+                    &base_mint,
+                    &quote_mint,
+                )
+            },
+        )?;
+
+        if *token_program_quote.pubkey() == spl_token_2022::id() {
             spl_token_2022_transfer_from_trader_to_vault(
                 &token_program_quote,
                 &trader_quote_account,
@@ -339,7 +431,7 @@ pub(crate) fn process_swap_core(
                 dynamic_account.fixed.get_quote_mint(),
                 &quote_vault,
                 &owner,
-                (initial_credit_quote_atoms.checked_sub(extra_quote_atoms)?).as_u64(),
+                quote_atoms_to_transfer,
                 dynamic_account.fixed.get_quote_mint_decimals(),
             )?;
         } else {
@@ -348,13 +440,13 @@ pub(crate) fn process_swap_core(
                 &trader_quote_account,
                 &quote_vault,
                 &owner,
-                (initial_credit_quote_atoms.checked_sub(extra_quote_atoms)?).as_u64(),
+                quote_atoms_to_transfer,
             )?;
         }
 
         // Give all but what started there.
         let base_vault_bump: u8 = dynamic_account.fixed.get_base_vault_bump();
-        if *token_program_base.key == spl_token_2022_interface::id() {
+        if *token_program_base.pubkey() == spl_token_2022::id() {
             spl_token_2022_transfer_from_vault_to_trader(
                 &token_program_base,
                 base_mint,
@@ -363,7 +455,7 @@ pub(crate) fn process_swap_core(
                 &trader_base_account,
                 extra_base_atoms.as_u64(),
                 dynamic_account.fixed.get_base_mint_decimals(),
-                market.key,
+                market.pubkey(),
                 base_vault_bump,
             )?;
         } else {
@@ -372,7 +464,7 @@ pub(crate) fn process_swap_core(
                 &base_vault,
                 &trader_base_account,
                 extra_base_atoms.as_u64(),
-                market.key,
+                market.pubkey(),
                 base_vault_bump,
                 dynamic_account.get_base_mint(),
             )?;
@@ -380,7 +472,7 @@ pub(crate) fn process_swap_core(
     }
 
     if existing_seat_index == NIL {
-        dynamic_account.release_seat(owner.key)?;
+        dynamic_account.release_seat_by_index(trader_index)?;
     } else {
         // Withdraw in case there already was a seat so it doesnt mess with their
         // balances. Need to withdraw base and quote in case the order wasnt fully
@@ -396,9 +488,9 @@ pub(crate) fn process_swap_core(
     )?;
 
     emit_stack(PlaceOrderLogV2 {
-        market: *market.key,
-        trader: *owner.key,
-        payer: *payer.key,
+        market: *market.pubkey(),
+        trader: *owner.pubkey(),
+        payer: *payer.pubkey(),
         base_atoms,
         price,
         order_type,
@@ -408,6 +500,15 @@ pub(crate) fn process_swap_core(
         order_index,
         last_valid_slot,
     })?;
+
+    // Matching can take global orders off the book, either by filling them or
+    // by cleaning up expired and unbacked ones. Each of those carries a gas
+    // prepayment, which `gas_refund_market_opt` sends to the market account
+    // for the fee collector to sweep rather than to the swapper. Must come
+    // after the token transfers above: the lamport move is direct, so a CPI
+    // in between that includes only one of the two accounts would fail the
+    // runtime lamport sum check. See `settle_global_gas_refunds`.
+    settle_global_gas_refunds(&global_trade_accounts_opts)?;
 
     Ok(())
 }
@@ -430,37 +531,34 @@ fn place_order(
 
 /** Transfer from base (quote) trader to base (quote) vault using SPL Token **/
 #[cfg(not(feature = "certora"))]
-fn spl_token_transfer_from_trader_to_vault<'a, 'info>(
-    token_program: &TokenProgram<'a, 'info>,
-    trader_account: &TokenAccountInfo<'a, 'info>,
-    vault: &TokenAccountInfo<'a, 'info>,
-    owner: &Signer<'a, 'info>,
+fn spl_token_transfer_from_trader_to_vault<'a>(
+    token_program: &TokenProgram<'a>,
+    trader_account: &TokenAccountInfo<'a>,
+    vault: &TokenAccountInfo<'a>,
+    owner: &Signer<'a>,
     amount: u64,
 ) -> ProgramResult {
     invoke(
-        &spl_token_interface::instruction::transfer(
-            token_program.key,
-            trader_account.key,
-            vault.key,
-            owner.key,
+        &spl_token::instruction::transfer(
+            token_program.pubkey(),
+            trader_account.pubkey(),
+            vault.pubkey(),
+            owner.pubkey(),
             &[],
             amount,
-        )?,
-        &[
-            token_program.as_ref().clone(),
-            trader_account.as_ref().clone(),
-            vault.as_ref().clone(),
-            owner.as_ref().clone(),
-        ],
+        )
+        .map_err(to_program_error)?,
+        // source, destination, authority.
+        &[trader_account.as_ref(), vault.as_ref(), owner.as_ref()],
     )
 }
 #[cfg(feature = "certora")]
 /** (Summary) Transfer from base (quote) trader to base (quote) vault using SPL Token **/
-fn spl_token_transfer_from_trader_to_vault<'a, 'info>(
-    _token_program: &TokenProgram<'a, 'info>,
-    trader_account: &TokenAccountInfo<'a, 'info>,
-    vault: &TokenAccountInfo<'a, 'info>,
-    owner: &Signer<'a, 'info>,
+fn spl_token_transfer_from_trader_to_vault<'a>(
+    _token_program: &TokenProgram<'a>,
+    trader_account: &TokenAccountInfo<'a>,
+    vault: &TokenAccountInfo<'a>,
+    owner: &Signer<'a>,
     amount: u64,
 ) -> ProgramResult {
     spl_token_transfer(trader_account.info, vault.info, owner.info, amount)
@@ -468,46 +566,47 @@ fn spl_token_transfer_from_trader_to_vault<'a, 'info>(
 
 /** Transfer from base (quote) trader to base (quote) vault using SPL Token 2022 **/
 #[cfg(not(feature = "certora"))]
-fn spl_token_2022_transfer_from_trader_to_vault<'a, 'info>(
-    token_program: &TokenProgram<'a, 'info>,
-    trader_account: &TokenAccountInfo<'a, 'info>,
-    mint: Option<MintAccountInfo<'a, 'info>>,
+fn spl_token_2022_transfer_from_trader_to_vault<'a>(
+    token_program: &TokenProgram<'a>,
+    trader_account: &TokenAccountInfo<'a>,
+    mint: Option<MintAccountInfo<'a>>,
     mint_pubkey: &Pubkey,
-    vault: &TokenAccountInfo<'a, 'info>,
-    owner: &Signer<'a, 'info>,
+    vault: &TokenAccountInfo<'a>,
+    owner: &Signer<'a>,
     amount: u64,
     decimals: u8,
 ) -> ProgramResult {
     invoke(
-        &spl_token_2022_interface::instruction::transfer_checked(
-            token_program.key,
-            trader_account.key,
+        &spl_token_2022::instruction::transfer_checked(
+            token_program.pubkey(),
+            trader_account.pubkey(),
             mint_pubkey,
-            vault.key,
-            owner.key,
+            vault.pubkey(),
+            owner.pubkey(),
             &[],
             amount,
             decimals,
-        )?,
+        )
+        .map_err(to_program_error)?,
+        // source, mint, destination, authority.
         &[
-            token_program.as_ref().clone(),
-            trader_account.as_ref().clone(),
-            vault.as_ref().clone(),
-            mint.unwrap().as_ref().clone(),
-            owner.as_ref().clone(),
+            trader_account.as_ref(),
+            mint.unwrap().as_ref(),
+            vault.as_ref(),
+            owner.as_ref(),
         ],
     )
 }
 
 #[cfg(feature = "certora")]
 /** (Summary) Transfer from base (quote) trader to base (quote) vault using SPL Token 2022 **/
-fn spl_token_2022_transfer_from_trader_to_vault<'a, 'info>(
-    _token_program: &TokenProgram<'a, 'info>,
-    trader_account: &TokenAccountInfo<'a, 'info>,
-    _mint: Option<MintAccountInfo<'a, 'info>>,
+fn spl_token_2022_transfer_from_trader_to_vault<'a>(
+    _token_program: &TokenProgram<'a>,
+    trader_account: &TokenAccountInfo<'a>,
+    _mint: Option<MintAccountInfo<'a>>,
     _mint_pubkey: &Pubkey,
-    vault: &TokenAccountInfo<'a, 'info>,
-    owner: &Signer<'a, 'info>,
+    vault: &TokenAccountInfo<'a>,
+    owner: &Signer<'a>,
     amount: u64,
     _decimals: u8,
 ) -> ProgramResult {
@@ -516,39 +615,37 @@ fn spl_token_2022_transfer_from_trader_to_vault<'a, 'info>(
 
 /** Transfer from base (quote) vault to base (quote) trader using SPL Token **/
 #[cfg(not(feature = "certora"))]
-fn spl_token_transfer_from_vault_to_trader<'a, 'info>(
-    token_program: &TokenProgram<'a, 'info>,
-    vault: &TokenAccountInfo<'a, 'info>,
-    trader_account: &TokenAccountInfo<'a, 'info>,
+fn spl_token_transfer_from_vault_to_trader<'a>(
+    token_program: &TokenProgram<'a>,
+    vault: &TokenAccountInfo<'a>,
+    trader_account: &TokenAccountInfo<'a>,
     amount: u64,
     market_key: &Pubkey,
     vault_bump: u8,
     mint_pubkey: &Pubkey,
 ) -> ProgramResult {
-    solana_program::program::invoke_signed(
-        &spl_token_interface::instruction::transfer(
-            token_program.key,
-            vault.key,
-            trader_account.key,
-            vault.key,
+    crate::program::invoke_signed(
+        &spl_token::instruction::transfer(
+            token_program.pubkey(),
+            vault.pubkey(),
+            trader_account.pubkey(),
+            vault.pubkey(),
             &[],
             amount,
-        )?,
-        &[
-            token_program.as_ref().clone(),
-            vault.as_ref().clone(),
-            trader_account.as_ref().clone(),
-        ],
+        )
+        .map_err(to_program_error)?,
+        // source, destination, authority: the vault signs for itself.
+        &[vault.as_ref(), trader_account.as_ref()],
         market_vault_seeds_with_bump!(market_key, mint_pubkey, vault_bump),
     )
 }
 
 #[cfg(feature = "certora")]
 /** (Summary) Transfer from base (quote) vault to base (quote) trader using SPL Token **/
-fn spl_token_transfer_from_vault_to_trader<'a, 'info>(
-    _token_program: &TokenProgram<'a, 'info>,
-    vault: &TokenAccountInfo<'a, 'info>,
-    trader_account: &TokenAccountInfo<'a, 'info>,
+fn spl_token_transfer_from_vault_to_trader<'a>(
+    _token_program: &TokenProgram<'a>,
+    vault: &TokenAccountInfo<'a>,
+    trader_account: &TokenAccountInfo<'a>,
     amount: u64,
     _market_key: &Pubkey,
     _vault_bump: u8,
@@ -559,33 +656,34 @@ fn spl_token_transfer_from_vault_to_trader<'a, 'info>(
 
 /** Transfer from base (quote) vault to base (quote) trader using SPL Token 2022 **/
 #[cfg(not(feature = "certora"))]
-fn spl_token_2022_transfer_from_vault_to_trader<'a, 'info>(
-    token_program: &TokenProgram<'a, 'info>,
-    mint: Option<MintAccountInfo<'a, 'info>>,
+fn spl_token_2022_transfer_from_vault_to_trader<'a>(
+    token_program: &TokenProgram<'a>,
+    mint: Option<MintAccountInfo<'a>>,
     mint_pubkey: &Pubkey,
-    vault: &TokenAccountInfo<'a, 'info>,
-    trader_account: &TokenAccountInfo<'a, 'info>,
+    vault: &TokenAccountInfo<'a>,
+    trader_account: &TokenAccountInfo<'a>,
     amount: u64,
     decimals: u8,
     market_key: &Pubkey,
     vault_bump: u8,
 ) -> ProgramResult {
-    solana_program::program::invoke_signed(
-        &spl_token_2022_interface::instruction::transfer_checked(
-            token_program.key,
-            vault.key,
+    crate::program::invoke_signed(
+        &spl_token_2022::instruction::transfer_checked(
+            token_program.pubkey(),
+            vault.pubkey(),
             mint_pubkey,
-            trader_account.key,
-            vault.key,
+            trader_account.pubkey(),
+            vault.pubkey(),
             &[],
             amount,
             decimals,
-        )?,
+        )
+        .map_err(to_program_error)?,
+        // source, mint, destination, authority: the vault signs for itself.
         &[
-            token_program.as_ref().clone(),
-            vault.as_ref().clone(),
-            mint.unwrap().as_ref().clone(),
-            trader_account.as_ref().clone(),
+            vault.as_ref(),
+            mint.unwrap().as_ref(),
+            trader_account.as_ref(),
         ],
         market_vault_seeds_with_bump!(market_key, mint_pubkey, vault_bump),
     )
@@ -593,16 +691,226 @@ fn spl_token_2022_transfer_from_vault_to_trader<'a, 'info>(
 
 #[cfg(feature = "certora")]
 /** (Summary) Transfer from base (quote) vault to base (quote) trader using SPL Token 2022 **/
-fn spl_token_2022_transfer_from_vault_to_trader<'a, 'info>(
-    _token_program: &TokenProgram<'a, 'info>,
-    _mint: Option<MintAccountInfo<'a, 'info>>,
+fn spl_token_2022_transfer_from_vault_to_trader<'a>(
+    _token_program: &TokenProgram<'a>,
+    _mint: Option<MintAccountInfo<'a>>,
     _mint_pubkey: &Pubkey,
-    vault: &TokenAccountInfo<'a, 'info>,
-    trader_account: &TokenAccountInfo<'a, 'info>,
+    vault: &TokenAccountInfo<'a>,
+    trader_account: &TokenAccountInfo<'a>,
     amount: u64,
     _decimals: u8,
     _market_key: &Pubkey,
     _vault_bump: u8,
 ) -> ProgramResult {
     spl_token_2022_transfer(vault.info, trader_account.info, vault.info, amount)
+}
+
+/// Calculate the amount that will arrive at the vault after transfer fees.
+/// For Token-2022 tokens with TransferFeeConfig, this accounts for the fee.
+/// For regular SPL tokens or Token-2022 without fees, returns the original amount.
+#[cfg(not(feature = "certora"))]
+fn calculate_post_fee_amount<'a>(
+    amount: u64,
+    is_base_in: bool,
+    token_program_base: &TokenProgram<'a>,
+    token_program_quote: &TokenProgram<'a>,
+    base_mint: &Option<MintAccountInfo<'a>>,
+    quote_mint: &Option<MintAccountInfo<'a>>,
+) -> Result<u64, ProgramError> {
+    let (token_program, mint_opt) = if is_base_in {
+        (token_program_base, base_mint)
+    } else {
+        (token_program_quote, quote_mint)
+    };
+
+    // Only Token-2022 can have transfer fees
+    if *token_program.pubkey() != spl_token_2022::id() {
+        return Ok(amount);
+    }
+
+    // If no mint info provided, assume no fee
+    let Some(mint_info) = mint_opt else {
+        return Ok(amount);
+    };
+
+    let mint_data = mint_info.info.try_borrow()?;
+    let mint_state = StateWithExtensions::<Mint>::unpack(&mint_data).map_err(to_program_error)?;
+
+    // Check for TransferFeeConfig extension
+    if let Ok(fee_config) = mint_state.get_extension::<TransferFeeConfig>() {
+        let epoch_fee = fee_config.get_epoch_fee(get_now_epoch());
+        // calculate_post_fee_amount returns the amount after fee is deducted
+        if let Some(post_fee_amount) = epoch_fee.calculate_post_fee_amount(amount) {
+            return Ok(post_fee_amount);
+        }
+    }
+
+    Ok(amount)
+}
+
+#[cfg(feature = "certora")]
+fn calculate_post_fee_amount<'a>(
+    amount: u64,
+    _is_base_in: bool,
+    _token_program_base: &TokenProgram<'a>,
+    _token_program_quote: &TokenProgram<'a>,
+    _base_mint: &Option<MintAccountInfo<'a>>,
+    _quote_mint: &Option<MintAccountInfo<'a>>,
+) -> Result<u64, ProgramError> {
+    // For certora verification, assume no transfer fees
+    Ok(amount)
+}
+
+/// Calculate the amount that must be sent for a specific amount to arrive after transfer fees.
+/// This is used for the output side of swaps to ensure the trader receives their desired amount.
+/// For Token-2022 tokens with TransferFeeConfig, this accounts for the fee.
+/// For regular SPL tokens or Token-2022 without fees, returns the original amount.
+/// Note: is_base_in refers to input direction; output is the opposite (if base_in, output is quote).
+#[cfg(not(feature = "certora"))]
+fn calculate_pre_fee_amount<'a>(
+    desired_amount: u64,
+    is_base_in: bool,
+    token_program_base: &TokenProgram<'a>,
+    token_program_quote: &TokenProgram<'a>,
+    base_mint: &Option<MintAccountInfo<'a>>,
+    quote_mint: &Option<MintAccountInfo<'a>>,
+) -> Result<u64, ProgramError> {
+    // Output token is opposite of input: if is_base_in, output is quote; otherwise output is base
+    let (token_program, mint_opt) = if is_base_in {
+        (token_program_quote, quote_mint)
+    } else {
+        (token_program_base, base_mint)
+    };
+
+    // Only Token-2022 can have transfer fees
+    if *token_program.pubkey() != spl_token_2022::id() {
+        return Ok(desired_amount);
+    }
+
+    // If no mint info provided, assume no fee
+    let Some(mint_info) = mint_opt else {
+        return Ok(desired_amount);
+    };
+
+    let mint_data = mint_info.info.try_borrow()?;
+    let mint_state = StateWithExtensions::<Mint>::unpack(&mint_data).map_err(to_program_error)?;
+
+    // Check for TransferFeeConfig extension
+    if let Ok(fee_config) = mint_state.get_extension::<TransferFeeConfig>() {
+        let epoch_fee = fee_config.get_epoch_fee(get_now_epoch());
+        // calculate_pre_fee_amount returns the amount to send to get desired_amount after fee
+        if let Some(pre_fee_amount) = epoch_fee.calculate_pre_fee_amount(desired_amount) {
+            return Ok(pre_fee_amount);
+        }
+    }
+
+    Ok(desired_amount)
+}
+
+/// Calculate the gross input transfer needed to deliver `desired_amount` to
+/// the vault. Unlike `calculate_pre_fee_amount`, this selects the input mint.
+#[cfg(not(feature = "certora"))]
+fn calculate_pre_fee_input_amount<'a>(
+    desired_amount: u64,
+    is_base_in: bool,
+    token_program_base: &TokenProgram<'a>,
+    token_program_quote: &TokenProgram<'a>,
+    base_mint: &Option<MintAccountInfo<'a>>,
+    quote_mint: &Option<MintAccountInfo<'a>>,
+) -> Result<u64, ProgramError> {
+    // `calculate_pre_fee_amount` selects the token opposite its direction
+    // argument, so invert the direction to select the input token.
+    calculate_pre_fee_amount(
+        desired_amount,
+        !is_base_in,
+        token_program_base,
+        token_program_quote,
+        base_mint,
+        quote_mint,
+    )
+}
+
+#[cfg(feature = "certora")]
+fn calculate_pre_fee_amount<'a>(
+    desired_amount: u64,
+    _is_base_in: bool,
+    _token_program_base: &TokenProgram<'a>,
+    _token_program_quote: &TokenProgram<'a>,
+    _base_mint: &Option<MintAccountInfo<'a>>,
+    _quote_mint: &Option<MintAccountInfo<'a>>,
+) -> Result<u64, ProgramError> {
+    // For certora verification, assume no transfer fees
+    Ok(desired_amount)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ten_percent_post_fee(gross: u64) -> Result<u64, ProgramError> {
+        Ok(gross - gross / 10)
+    }
+
+    fn ten_percent_pre_fee(net: u64) -> Result<u64, ProgramError> {
+        Ok(net.div_ceil(9) * 10)
+    }
+
+    #[test]
+    fn base_output_fee_cannot_bypass_exact_in_minimum() {
+        assert!(!minimum_output_satisfied(100, 100, ten_percent_post_fee).unwrap());
+        assert!(minimum_output_satisfied(90, 100, ten_percent_post_fee).unwrap());
+    }
+
+    #[test]
+    fn quote_output_fee_cannot_bypass_exact_in_minimum() {
+        assert!(!minimum_output_satisfied(1_000, 1_000, ten_percent_post_fee).unwrap());
+        assert!(minimum_output_satisfied(900, 1_000, ten_percent_post_fee).unwrap());
+    }
+
+    #[test]
+    fn exact_out_rejects_a_short_post_fee_output() {
+        assert!(!minimum_output_satisfied(100, 99, Ok).unwrap());
+        assert!(!minimum_output_satisfied(100, 100, ten_percent_post_fee).unwrap());
+        assert!(minimum_output_satisfied(100, 100, Ok).unwrap());
+    }
+
+    #[test]
+    fn partial_base_input_only_charges_for_consumed_net_amount() {
+        // A gross credit of 100 produces 90 net. Consuming half the net must
+        // debit 50 gross, not the vulnerable G - unused_net = 55.
+        assert_eq!(
+            calculate_consumed_input_transfer(90, 45, ten_percent_pre_fee).unwrap(),
+            50
+        );
+        assert_eq!(
+            calculate_consumed_input_transfer(90, 90, ten_percent_pre_fee).unwrap(),
+            0,
+            "a zero-fill swap must not debit a fee-sized surplus"
+        );
+    }
+
+    #[test]
+    fn partial_quote_input_only_charges_for_consumed_net_amount() {
+        assert_eq!(
+            calculate_consumed_input_transfer(900, 450, ten_percent_pre_fee).unwrap(),
+            500
+        );
+        assert_eq!(
+            calculate_consumed_input_transfer(900, 900, ten_percent_pre_fee).unwrap(),
+            0,
+            "a zero-fill swap must not debit a fee-sized surplus"
+        );
+    }
+}
+
+#[cfg(feature = "certora")]
+fn calculate_pre_fee_input_amount<'a>(
+    desired_amount: u64,
+    _is_base_in: bool,
+    _token_program_base: &TokenProgram<'a>,
+    _token_program_quote: &TokenProgram<'a>,
+    _base_mint: &Option<MintAccountInfo<'a>>,
+    _quote_mint: &Option<MintAccountInfo<'a>>,
+) -> Result<u64, ProgramError> {
+    Ok(desired_amount)
 }

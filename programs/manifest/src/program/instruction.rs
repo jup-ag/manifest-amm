@@ -70,18 +70,21 @@ pub enum ManifestInstruction {
     Expand = 5,
 
     /// Batch update with multiple place orders and cancels.
+    ///
+    /// A batch that places any global or reverse order pays a flat
+    /// ADVANCED_ORDER_FEE_LAMPORTS to the market, collected later by Defrag.
     #[account(0, writable, signer, name = "payer", desc = "Payer")]
     #[account(1, writable, name = "market", desc = "Account holding all market state")]
     #[account(2, name = "system_program", desc = "System program")]
     #[account(3, optional, name = "base_mint", desc = "Mint for the base global account")]
     #[account(4, optional, writable, name = "base_global", desc = "Base global account")]
-    #[account(5, optional, name = "base_global_vault", desc = "Base global vault")]
-    #[account(6, optional, name = "base_market_vault", desc = "Base market vault")]
+    #[account(5, optional, writable, name = "base_global_vault", desc = "Base global vault")]
+    #[account(6, optional, writable, name = "base_market_vault", desc = "Base market vault")]
     #[account(7, optional, name = "base_token_program", desc = "Token program(22)")]
     #[account(8, optional, name = "quote_mint", desc = "Mint for this global account")]
     #[account(9, optional, writable, name = "quote_global", desc = "Quote global account")]
-    #[account(10, optional, name = "quote_global_vault", desc = "Quote global vault")]
-    #[account(11, optional, name = "quote_market_vault", desc = "Quote market vault")]
+    #[account(10, optional, writable, name = "quote_global_vault", desc = "Quote global vault")]
+    #[account(11, optional, writable, name = "quote_market_vault", desc = "Quote market vault")]
     #[account(12, optional, name = "quote_token_program", desc = "Token program(22)")]
     BatchUpdate = 6,
 
@@ -123,8 +126,8 @@ pub enum ManifestInstruction {
     #[account(1, writable, name = "global", desc = "Global account")]
     #[account(2, name = "mint", desc = "Mint for this global account")]
     #[account(3, writable, name = "global_vault", desc = "Global vault")]
-    #[account(4, name = "trader_token", desc = "Trader token account")]
-    #[account(5, name = "evictee_token", desc = "Evictee token account")]
+    #[account(4, writable, name = "trader_token", desc = "Trader token account")]
+    #[account(5, writable, name = "evictee_token", desc = "Evictee token account")]
     #[account(6, name = "token_program", desc = "Token program(22)")]
     GlobalEvict = 11,
 
@@ -136,6 +139,12 @@ pub enum ManifestInstruction {
     /// gas prepayment deposits. This is not required for normal operation of
     /// market. It exists as a deterrent to unfillable and unmaintained global
     /// spam.
+    ///
+    /// The payer must be the fee collector, the same key Defrag requires, so
+    /// the gas prepayment pays the operator who runs the cleanup rather than
+    /// whoever wins a race to it. The flip side is that nobody else will do
+    /// this work, so unfillable global orders rest on the book until the
+    /// collector clears them.
     #[account(0, writable, signer, name = "payer", desc = "Payer for this tx, receiver of rent deposit")]
     #[account(1, writable, name = "market", desc = "Account holding all market state")]
     #[account(2, name = "system_program", desc = "System program")]
@@ -162,6 +171,16 @@ pub enum ManifestInstruction {
     #[account(12, writable, optional, name = "global", desc = "Global account")]
     #[account(13, writable, optional, name = "global_vault", desc = "Global vault")]
     SwapV2 = 13,
+
+    /// Reclaim empty seats, compact to two spare nodes and collect market/vault excess.
+    #[account(0, writable, signer, name = "collector", desc = "Authorized rent collector") ]
+    #[account(1, writable, name = "market", desc = "Market") ]
+    #[account(2, writable, name = "base_vault", desc = "Base vault") ]
+    #[account(3, writable, name = "quote_vault", desc = "Quote vault") ]
+    #[account(4, name = "base_token_program", desc = "Base token program") ]
+    #[account(5, name = "quote_token_program", desc = "Quote token program") ]
+    #[account(6, name = "system_program", desc = "System program") ]
+    Defrag = 14,
 }
 
 impl ManifestInstruction {
@@ -172,7 +191,7 @@ impl ManifestInstruction {
 
 #[test]
 fn test_instruction_serialization() {
-    let num_instructions: u8 = 13;
+    let num_instructions: u8 = 14;
     for i in 0..=255 {
         let instruction: ManifestInstruction = match ManifestInstruction::try_from(i) {
             Ok(j) => {

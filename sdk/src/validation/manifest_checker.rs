@@ -15,7 +15,7 @@ pub struct ManifestAccountInfo<'a, 'info, T: ManifestAccount + Pod + Clone> {
     phantom: std::marker::PhantomData<T>,
 }
 
-impl<'a, 'info, T: ManifestAccount + Get + Clone> ManifestAccountInfo<'a, 'info, T> {
+impl<'a, 'info, T: ManifestAccount + Get + Pod + Clone> ManifestAccountInfo<'a, 'info, T> {
     pub fn new(
         info: &'a AccountInfo<'info>,
     ) -> Result<ManifestAccountInfo<'a, 'info, T>, ProgramError> {

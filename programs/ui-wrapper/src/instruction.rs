@@ -13,7 +13,7 @@ pub enum ManifestWrapperInstruction {
     #[account(0, name = "owner", desc = "Owner of the Manifest account")]
     #[account(1, name = "system_program", desc = "System program")]
     #[account(2, writable, signer, name = "payer", desc = "Payer of rent and gas")]
-    #[account(3, writable, name = "wrapper_state", desc = "Wrapper state")]
+    #[account(3, writable, signer, name = "wrapper_state", desc = "Wrapper state")]
     CreateWrapper = 0,
 
     /// Unused
@@ -110,9 +110,17 @@ pub enum ManifestWrapperInstruction {
     #[account(9, name = "token_program_base", desc = "Token program for base token")]
     #[account(10, name = "token_program_quote", desc = "Token program for quote token")]
     #[account(11, name = "manifest_program", desc = "Manifest program")]
-    #[account(12, writable, name = "platform_token_account", desc = "Platform fee token account")]
-    #[account(13, writable, name = "referrer_token_account", desc = "Referrer fee token account", optional)]
+    #[account(12, signer, name = "fee_authority", desc = "Authority that authenticates fee policy and destinations")]
+    #[account(13, writable, name = "platform_token_account", desc = "Platform fee token account")]
+    #[account(14, writable, name = "referrer_token_account", desc = "Referrer fee token account", optional)]
     SettleFunds = 5,
+
+    /// Sweep the lamport fees accrued on a wrapper state, leaving it rent
+    /// exempt. Callable only by the fee collector.
+    #[account(0, writable, name = "wrapper_state", desc = "Wrapper state")]
+    #[account(1, name = "system_program", desc = "System program")]
+    #[account(2, writable, signer, name = "collector", desc = "Fee collector")]
+    Collect = 6,
 }
 
 impl ManifestWrapperInstruction {

@@ -2,8 +2,8 @@ use crate::program::ManifestError;
 use borsh::{BorshDeserialize as Deserialize, BorshSerialize as Serialize};
 use bytemuck::{Pod, Zeroable};
 use hypertree::trace;
+use pinocchio::error::ProgramError;
 use shank::ShankAccount;
-use solana_program::program_error::ProgramError;
 use static_assertions::const_assert;
 use std::{
     cmp::Ordering,
@@ -235,22 +235,541 @@ pub struct QuoteAtomsPerBaseAtom {
 // has no native support for u128 math and requires us only to be 8 byte
 // aligned.
 #[cfg(not(feature = "certora"))]
+/// The little endian split of a u128 into its low and high words.
+///
+/// Done with shifts rather than by reinterpreting the bytes. A `u128` may
+/// need 16 byte alignment while `[u64; 2]` guarantees only 8, so the pointer
+/// version had to go through an unaligned read, and that made the compiler
+/// round the value through the stack instead of keeping it in the register
+/// pair it already occupies. These conversions sit under every price
+/// comparison and every piece of price arithmetic, so that round trip was
+/// paid at every level of every orderbook tree descent.
 const fn u128_to_u64_slice(a: u128) -> [u64; 2] {
-    unsafe {
-        let ptr: *const u128 = &a;
-        *ptr.cast::<[u64; 2]>()
-    }
+    [a as u64, (a >> 64) as u64]
 }
-pub(crate) fn u64_slice_to_u128(a: [u64; 2]) -> u128 {
-    unsafe {
-        let ptr: *const [u64; 2] = &a;
-        *ptr.cast::<u128>()
-    }
+pub(crate) const fn u64_slice_to_u128(a: [u64; 2]) -> u128 {
+    ((a[1] as u128) << 64) | (a[0] as u128)
 }
 
 #[cfg(not(feature = "certora"))]
 const ATOM_LIMIT: u128 = u64::MAX as u128;
 const D18: u128 = 10u128.pow(18);
+/// Exact `x / 10^18`. The common u64 quotient uses normalized long division
+/// with native 64-bit operations. sBPF v3 lacks v2's high-multiply opcode,
+/// which made the previous 256-bit reciprocal product expensive. Keeping the
+/// remainder also makes ceiling division cheap without multiplying back.
+#[cfg(all(not(feature = "certora"), test))]
+#[inline(always)]
+fn div_d18(x: u128) -> u128 {
+    div_rem_d18(x).0
+}
+
+/// Formal verification keeps the plain division.
+///
+/// The Certora state-machine rules use the reduced price model in
+/// `quantities_certora.rs`, not the deployed full-width arithmetic.
+/// `div_d18_test` checks the optimized production arithmetic against Rust's
+/// full-width operations on boundaries, bit patterns, random inputs, and
+/// complete price conversions, including overflow and rounding.
+#[cfg(feature = "certora")]
+#[allow(dead_code)]
+#[inline(always)]
+fn div_d18(x: u128) -> u128 {
+    x / D18
+}
+
+/// `ceil(x / 10^18)`.
+#[cfg(any(feature = "certora", test))]
+#[cfg_attr(feature = "certora", allow(dead_code))]
+#[inline(always)]
+fn div_ceil_d18(x: u128) -> u128 {
+    #[cfg(not(feature = "certora"))]
+    {
+        let (quotient, remainder) = div_rem_d18(x);
+        quotient + u128::from(remainder != 0)
+    }
+    #[cfg(feature = "certora")]
+    {
+        let quotient: u128 = div_d18(x);
+        // quotient * 10^18 <= x, so this cannot overflow.
+        quotient + ((x != quotient * D18) as u128)
+    }
+}
+
+/// Divide in base 2^32 using two quotient digits. Normalizing 10^18 by four
+/// bits makes its high digit at least 2^31, so each quotient estimate needs
+/// at most two corrections. All products fit u64; the wrapping operations
+/// discard the high base-2^32 digits that cancel in the subtraction.
+#[cfg(not(feature = "certora"))]
+#[inline(always)]
+fn div_rem_d18(x: u128) -> (u128, u64) {
+    const DIVISOR: u64 = D18 as u64;
+    const NORMALIZED: u64 = DIVISOR << 4;
+    const HIGH: u64 = NORMALIZED >> 32;
+    const LOW: u64 = NORMALIZED & u32::MAX as u64;
+    const BASE: u64 = 1 << 32;
+    const MASK: u64 = BASE - 1;
+
+    #[inline(always)]
+    fn digit(top: u64, next: u64) -> u64 {
+        let mut quotient = top / HIGH;
+        let mut remainder = top - quotient * HIGH;
+        // LOW < HIGH, so quotient * LOW <= top and cannot overflow.
+        while quotient >= BASE || quotient * LOW > ((remainder << 32) | next) {
+            quotient -= 1;
+            remainder += HIGH;
+            if remainder >= BASE {
+                break;
+            }
+        }
+        quotient
+    }
+
+    let high = (x >> 64) as u64;
+    let low = x as u64;
+    if high == 0 {
+        return ((low / DIVISOR) as u128, low % DIVISOR);
+    }
+    // The fast path has a u64 quotient. Larger results are rejected by the
+    // caller's atom limit, but retain exact full-width semantics here.
+    if high >= DIVISOR {
+        return (x / D18, (x % D18) as u64);
+    }
+    let top = (high << 4) | (low >> 60);
+    let bottom = low << 4;
+    let next = bottom >> 32;
+    let last = bottom & MASK;
+    let q1 = digit(top, next);
+    let middle = (top << 32)
+        .wrapping_add(next)
+        .wrapping_sub(q1.wrapping_mul(NORMALIZED));
+    let q0 = digit(middle, last);
+    let remainder = (middle << 32)
+        .wrapping_add(last)
+        .wrapping_sub(q0.wrapping_mul(NORMALIZED))
+        >> 4;
+    (((q1 << 32) | q0) as u128, remainder)
+}
+
+/// Checked 128-by-64 product using 32-bit limbs for the high half. sBPF v3
+/// has native 64-bit low multiplication but no high multiplication opcode.
+#[cfg(not(feature = "certora"))]
+#[inline(always)]
+fn checked_price_product(price: [u64; 2], amount: u64) -> Option<u128> {
+    let a0 = price[0] & u32::MAX as u64;
+    let a1 = price[0] >> 32;
+    let b0 = amount & u32::MAX as u64;
+    let b1 = amount >> 32;
+    let p00 = a0 * b0;
+    // Each limb is at most 2^32-1, so these sums fit u64.
+    let middle = a1 * b0 + (p00 >> 32);
+    let carry = (middle & u32::MAX as u64) + a0 * b1;
+    let high = a1 * b1 + (middle >> 32) + (carry >> 32);
+    let high = if price[1] == 0 {
+        high
+    } else {
+        high.checked_add(price[1].checked_mul(amount)?)?
+    };
+    Some(((high as u128) << 64) | price[0].wrapping_mul(amount) as u128)
+}
+
+#[cfg(test)]
+mod div_d18_test {
+    use super::*;
+
+    /// Reference: the plain division the fast path replaces.
+    fn reference(x: u128, round_up: bool) -> u128 {
+        if round_up {
+            x.div_ceil(D18)
+        } else {
+            x / D18
+        }
+    }
+
+    fn check(x: u128) {
+        assert_eq!(div_d18(x), reference(x, false), "floor {x}");
+        assert_eq!(div_ceil_d18(x), reference(x, true), "ceil {x}");
+    }
+
+    /// Simple deterministic generator so the tests need no dependencies.
+    struct XorShift(u128);
+    impl XorShift {
+        fn next(&mut self) -> u128 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    fn edge_values() {
+        for x in [
+            0,
+            1,
+            2,
+            D18 - 2,
+            D18 - 1,
+            D18,
+            D18 + 1,
+            D18 + 2,
+            u32::MAX as u128,
+            u64::MAX as u128 - 1,
+            u64::MAX as u128,
+            u64::MAX as u128 + 1,
+            1u128 << 64,
+            (1u128 << 64) + 1,
+            1u128 << 100,
+            1u128 << 127,
+            (1u128 << 127) + 1,
+            u128::MAX - 2,
+            u128::MAX - 1,
+            u128::MAX,
+            D18 * D18 - 1,
+            D18 * D18,
+            D18 * D18 + 1,
+            ATOM_LIMIT * D18 - 1,
+            ATOM_LIMIT * D18,
+            ATOM_LIMIT * D18 + 1,
+            (ATOM_LIMIT + 1) * D18 - 1,
+            (ATOM_LIMIT + 1) * D18,
+        ] {
+            check(x);
+        }
+    }
+
+    /// Every power of two and its neighbours across the whole width.
+    #[test]
+    fn powers_of_two() {
+        for shift in 0..128u32 {
+            let p: u128 = 1u128 << shift;
+            for x in [p.wrapping_sub(2), p - 1, p, p + 1, p.wrapping_add(2)] {
+                check(x);
+            }
+            // Also every power of two scaled by the divisor and by 10^9.
+            for scale in [D18, 1_000_000_000u128] {
+                if let Some(v) = p.checked_mul(scale) {
+                    for x in [v - 1, v, v + 1] {
+                        check(x);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Exact multiples of the divisor and their neighbours, which are the
+    /// values where floor/ceil rounding flips, for small, large and random
+    /// multipliers.
+    #[test]
+    fn around_multiples_of_the_divisor() {
+        for k in 0..=200_000u128 {
+            let base: u128 = k * D18;
+            for x in [base.wrapping_sub(1), base, base + 1] {
+                check(x);
+            }
+        }
+        for shift in 0..64u32 {
+            for k in [(1u128 << shift) - 1, 1u128 << shift, (1u128 << shift) + 1] {
+                let base: u128 = k * D18;
+                for x in [
+                    base.wrapping_sub(2),
+                    base.wrapping_sub(1),
+                    base,
+                    base + 1,
+                    base + 2,
+                ] {
+                    check(x);
+                }
+            }
+        }
+        // Exact multiples are where a wrong magic number or shift shows
+        // itself, so sample the multiplier across the whole range a quotient
+        // can take, up to `u128::MAX / 10^18`, which is about 2^68. Drawing
+        // 64 bit multipliers would leave the top of that range untested.
+        const K_MAX: u128 = u128::MAX / D18;
+        let mut rng = XorShift(0x243f6a8885a308d313198a2e03707344);
+        for k in [0, 1, 2, K_MAX - 1, K_MAX] {
+            check_multiple(k);
+        }
+        for _ in 0..300_000 {
+            check_multiple(rng.next() % (K_MAX + 1));
+        }
+    }
+
+    /// `k * 10^18` and the two values on either side of it, skipping the ones
+    /// that fall outside a `u128`.
+    fn check_multiple(k: u128) {
+        let base: u128 = k * D18;
+        for delta in [2, 1] {
+            if base >= delta {
+                check(base - delta);
+            }
+        }
+        check(base);
+        for delta in [1, 2] {
+            if let Some(x) = base.checked_add(delta) {
+                check(x);
+            }
+        }
+    }
+
+    /// Every 16-bit pattern in every 16-bit lane of the dividend, with the
+    /// other lanes zero, all ones, or the divisor's bits.
+    #[test]
+    fn bit_lanes() {
+        for lane in 0..8u32 {
+            for pattern in 0..=u16::MAX {
+                let placed: u128 = (pattern as u128) << (16 * lane);
+                check(placed);
+                check(placed | !((0xffffu128) << (16 * lane)));
+                check(placed ^ D18);
+            }
+        }
+    }
+
+    /// Random dividends of every bit length, plus uniformly random ones.
+    #[test]
+    fn random_dividends() {
+        let mut rng = XorShift(0x9e3779b97f4a7c15f39cc0605cedc835);
+        for i in 0..2_000_000u32 {
+            let raw: u128 = rng.next();
+            let x: u128 = match i % 5 {
+                0 => raw,
+                1 => raw >> (i % 128),
+                2 => raw >> 64,
+                3 => (raw >> 64).wrapping_mul(D18).wrapping_add(raw % 3),
+                _ => raw | (1u128 << 127),
+            };
+            check(x);
+        }
+    }
+
+    #[test]
+    fn mantissa_conversion_matches_full_width_multiplication() {
+        let mut rng = XorShift(0x13198a2e03707344243f6a8885a308d3);
+        for exponent in -18..=8i8 {
+            let scale = 10u128.pow((exponent + 18) as u32);
+            for mantissa in [0, 1, 2, 0x7fff_ffff, 0x8000_0000, u32::MAX]
+                .into_iter()
+                .chain((0..10_000).map(|_| rng.next() as u32))
+            {
+                let price =
+                    QuoteAtomsPerBaseAtom::try_from_mantissa_and_exponent(mantissa, exponent)
+                        .unwrap();
+                assert_eq!(u64_slice_to_u128(price.inner), scale * mantissa as u128);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "certora"))]
+    #[test]
+    fn price_product_matches_checked_u128_multiplication() {
+        let mut rng = XorShift(0x082efa98ec4e6c89452821e638d01377);
+        for i in 0..500_000 {
+            let raw = rng.next();
+            let price = match i % 4 {
+                0 => raw,
+                1 => raw >> 64,
+                2 => u128::MAX >> (i % 128),
+                _ => 1u128 << (i % 128),
+            };
+            let amount = rng.next() as u64 >> (i % 64);
+            assert_eq!(
+                checked_price_product(u128_to_u64_slice(price), amount),
+                price.checked_mul(amount as u128)
+            );
+        }
+        for price in [0, 1, u64::MAX as u128, 1u128 << 64, u128::MAX] {
+            for amount in [0, 1, 2, u32::MAX as u64, 1u64 << 32, u64::MAX] {
+                assert_eq!(
+                    checked_price_product(u128_to_u64_slice(price), amount),
+                    price.checked_mul(amount as u128)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_factor_fast_path_and_fallback_match_reference() {
+        let mut rng = XorShift(0x9e3779b97f4a7c15d1b54a32d192ed03);
+        for i in 0..100_000 {
+            let raw = rng.next();
+            let factor = if i % 8 < 4 {
+                1_000_000_000
+            } else {
+                1_000_000_000_000
+            };
+            let factored = ((raw as u64 as u128) / factor) * factor;
+            let inner = match i % 4 {
+                0 => factored,
+                1 => factored + 1,
+                2 => factored.saturating_sub(1),
+                _ => raw,
+            };
+            let size = (rng.next() as u64) >> (i % 64);
+            let price = QuoteAtomsPerBaseAtom {
+                inner: u128_to_u64_slice(inner),
+            };
+            for round_up in [false, true] {
+                let expected = inner
+                    .checked_mul(size as u128)
+                    .ok_or_else(|| ProgramError::from(PriceConversionError(0x8)))
+                    .and_then(|product| {
+                        let quote = reference(product, round_up);
+                        if quote <= ATOM_LIMIT {
+                            Ok(QuoteAtoms::new(quote as u64))
+                        } else {
+                            Err(PriceConversionError(0x9).into())
+                        }
+                    });
+                assert_eq!(
+                    price.checked_quote_for_base(BaseAtoms::new(size), round_up),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_factor_product_boundaries() {
+        for factor in [1_000_000_000u64, 1_000_000_000_000] {
+            for reduced in [1, 999, 1000, u64::MAX / factor] {
+                let inner = (reduced * factor) as u128;
+                let limit = u64::MAX / reduced;
+                let price = QuoteAtomsPerBaseAtom {
+                    inner: u128_to_u64_slice(inner),
+                };
+                for size in [
+                    0,
+                    1,
+                    factor - 1,
+                    factor,
+                    factor + 1,
+                    limit - 1,
+                    limit,
+                    limit.saturating_add(1),
+                    u64::MAX,
+                ] {
+                    for round_up in [false, true] {
+                        let expected = reference(inner * size as u128, round_up);
+                        let expected = if expected <= ATOM_LIMIT {
+                            Ok(QuoteAtoms::new(expected as u64))
+                        } else {
+                            Err(PriceConversionError(0x9).into())
+                        };
+                        assert_eq!(
+                            price.checked_quote_for_base(BaseAtoms::new(size), round_up),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+        for size in [0, 1, u64::MAX] {
+            for round_up in [false, true] {
+                assert_eq!(
+                    QuoteAtomsPerBaseAtom::ZERO
+                        .checked_quote_for_base(BaseAtoms::new(size), round_up)
+                        .unwrap(),
+                    QuoteAtoms::ZERO
+                );
+            }
+        }
+    }
+
+    /// The fast path is only reachable through `checked_quote_for_base`;
+    /// compare that whole function against the reference on a price and size
+    /// grid covering every exponent, extreme mantissas and extreme sizes.
+    #[test]
+    fn checked_quote_for_base_matches_reference() {
+        let mantissas: [u32; 7] = [1, 2, 7, 999, 123_456_789, u32::MAX - 1, u32::MAX];
+        let sizes: [u64; 9] = [
+            1,
+            2,
+            999,
+            1_000_000,
+            1_000_000_000,
+            1 << 32,
+            u64::MAX / 3,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let mut cases: u32 = 0;
+        for exponent in -18..=8i8 {
+            for mantissa in mantissas {
+                let Ok(price) =
+                    QuoteAtomsPerBaseAtom::try_from_mantissa_and_exponent(mantissa, exponent)
+                else {
+                    continue;
+                };
+                let inner: u128 = u64_slice_to_u128(price.inner);
+                for size in sizes {
+                    for round_up in [false, true] {
+                        let expected: Result<u128, ()> = inner
+                            .checked_mul(size as u128)
+                            .map(|product| reference(product, round_up))
+                            .filter(|quote| *quote <= ATOM_LIMIT)
+                            .ok_or(());
+                        let actual: Result<u128, ()> = price
+                            .checked_quote_for_base(BaseAtoms::new(size), round_up)
+                            .map(|quote| quote.as_u64() as u128)
+                            .map_err(|_| ());
+                        assert_eq!(
+                            actual, expected,
+                            "{mantissa}e{exponent} x {size} round_up={round_up}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert!(cases > 1_000, "grid covered {cases} cases");
+        // And random price/size pairs.
+        let mut rng = XorShift(0x452821e638d01377be5466cf34e90c6c);
+        for _ in 0..200_000 {
+            let raw: u128 = rng.next();
+            let mantissa: u32 = (raw >> 96) as u32;
+            let exponent: i8 = ((raw >> 64) as u8 % 27) as i8 - 18;
+            let size: u64 = raw as u64 >> (raw >> 90 & 63);
+            let Ok(price) =
+                QuoteAtomsPerBaseAtom::try_from_mantissa_and_exponent(mantissa, exponent)
+            else {
+                continue;
+            };
+            let inner: u128 = u64_slice_to_u128(price.inner);
+            for round_up in [false, true] {
+                let expected: Result<u128, ()> = inner
+                    .checked_mul(size as u128)
+                    .map(|product| reference(product, round_up))
+                    .filter(|quote| *quote <= ATOM_LIMIT)
+                    .ok_or(());
+                let actual: Result<u128, ()> = price
+                    .checked_quote_for_base(BaseAtoms::new(size), round_up)
+                    .map(|quote| quote.as_u64() as u128)
+                    .map_err(|_| ());
+                assert_eq!(
+                    actual, expected,
+                    "{mantissa}e{exponent} x {size} round_up={round_up}"
+                );
+            }
+        }
+    }
+
+    /// Rounding invariants that hold independently of the reference.
+    #[test]
+    fn rounding_invariants() {
+        let mut rng = XorShift(0xc0ac29b7c97c50dd3f84d5b5b5470917);
+        for _ in 0..500_000 {
+            let x: u128 = rng.next();
+            let floor: u128 = div_d18(x);
+            let ceil: u128 = div_ceil_d18(x);
+            assert!(floor * D18 <= x);
+            assert!(x - floor * D18 < D18);
+            assert!(ceil == floor || ceil == floor + 1);
+            assert_eq!(ceil == floor, x == floor * D18);
+        }
+    }
+}
 const D18F: f64 = D18 as f64;
 
 #[cfg(not(feature = "certora"))]
@@ -318,10 +837,30 @@ impl QuoteAtomsPerBaseAtom {
         -18 -> [26] ->  D0
         */
         let offset: usize = (Self::MAX_EXP as i64).wrapping_sub(exponent as i64) as usize;
-        // can not overflow 10^26 * u32::MAX < u128::MAX
-        let inner: u128 = DECIMAL_CONSTANTS[offset].wrapping_mul(mantissa as u128);
-        QuoteAtomsPerBaseAtom {
-            inner: u128_to_u64_slice(inner),
+        #[cfg(feature = "certora")]
+        {
+            let inner: u128 = DECIMAL_CONSTANTS[offset].wrapping_mul(mantissa as u128);
+            QuoteAtomsPerBaseAtom {
+                inner: u128_to_u64_slice(inner),
+            }
+        }
+        #[cfg(not(feature = "certora"))]
+        {
+            // Three native 64-bit products instead of a generic u128 multiply.
+            // The low and middle products fit because mantissa has 32 bits;
+            // the final high word fits because 10^26 * u32::MAX < u128::MAX.
+            let decimal = u128_to_u64_slice(DECIMAL_CONSTANTS[offset]);
+            let mantissa = mantissa as u64;
+            let low = (decimal[0] & u32::MAX as u64).wrapping_mul(mantissa);
+            let middle = (decimal[0] >> 32)
+                .wrapping_mul(mantissa)
+                .wrapping_add(low >> 32);
+            QuoteAtomsPerBaseAtom {
+                inner: [
+                    (middle << 32) | (low & u32::MAX as u64),
+                    decimal[1].wrapping_mul(mantissa).wrapping_add(middle >> 32),
+                ],
+            }
         }
     }
 
@@ -396,20 +935,76 @@ impl QuoteAtomsPerBaseAtom {
         self,
         base_atoms: BaseAtoms,
         round_up: bool,
-    ) -> Result<u128, ProgramError> {
-        let inner: u128 = u64_slice_to_u128(self.inner);
-        let product: u128 = inner
+    ) -> Result<u64, ProgramError> {
+        #[cfg(not(feature = "certora"))]
+        {
+            // Prices on decimal grids often contain these exact factors.
+            // Cancel one before multiplying so ordinary order sizes fit u64.
+            // A successful reduced product also proves the original product
+            // fits u128: u64::MAX * 10^12 < u128::MAX. Otherwise use the full
+            // checked path, preserving precision, overflow and rounding.
+            if self.inner[1] == 0 {
+                let (reduced_price, divisor, safe_base_limit) =
+                    if self.inner[0] % 1_000_000_000_000 == 0 {
+                        (
+                            self.inner[0] / 1_000_000_000_000,
+                            1_000_000,
+                            1_000_000_000_000,
+                        )
+                    } else if self.inner[0] % 1_000_000_000 == 0 {
+                        (self.inner[0] / 1_000_000_000, 1_000_000_000, 1_000_000_000)
+                    } else {
+                        (0, 0, 0)
+                    };
+                if divisor != 0 {
+                    // reduced_price <= u64::MAX / safe_base_limit. If the
+                    // amount is at most that cancelled decimal factor, its
+                    // reduced product fits u64 without a wide overflow check.
+                    let product = if base_atoms.inner <= safe_base_limit {
+                        Some(reduced_price.wrapping_mul(base_atoms.inner))
+                    } else {
+                        reduced_price.checked_mul(base_atoms.inner)
+                    };
+                    if let Some(product) = product {
+                        return Ok(
+                            product / divisor + u64::from(round_up && product % divisor != 0)
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "certora")]
+        let product: u128 = u64_slice_to_u128(self.inner)
             .checked_mul(base_atoms.inner as u128)
             .ok_or(PriceConversionError(0x8))?;
-        let quote_atoms: u128 = if round_up {
-            product.div_ceil(D18)
-        } else {
-            product.div(D18)
-        };
-        if quote_atoms <= ATOM_LIMIT {
-            Ok(quote_atoms)
-        } else {
-            Err(PriceConversionError(0x9).into())
+        #[cfg(not(feature = "certora"))]
+        let product: u128 =
+            checked_price_product(self.inner, base_atoms.inner).ok_or(PriceConversionError(0x8))?;
+        #[cfg(not(feature = "certora"))]
+        {
+            // A high word at least 10^18 makes the floor quotient at least
+            // 2^64. Reject it before division; every remaining quotient fits
+            // u64 and only ceiling's final carry can overflow the atom limit.
+            if product >> 64 >= D18 {
+                return Err(PriceConversionError(0x9).into());
+            }
+            let (quotient, remainder) = div_rem_d18(product);
+            return (quotient as u64)
+                .checked_add(u64::from(round_up && remainder != 0))
+                .ok_or_else(|| PriceConversionError(0x9).into());
+        }
+        #[cfg(feature = "certora")]
+        {
+            let quote_atoms: u128 = if round_up {
+                div_ceil_d18(product)
+            } else {
+                div_d18(product)
+            };
+            if quote_atoms <= ATOM_LIMIT {
+                Ok(quote_atoms as u64)
+            } else {
+                Err(PriceConversionError(0x9).into())
+            }
         }
     }
 
@@ -420,14 +1015,21 @@ impl QuoteAtomsPerBaseAtom {
         round_up: bool,
     ) -> Result<QuoteAtoms, ProgramError> {
         self.checked_quote_for_base_(other, round_up)
-            .map(|r| QuoteAtoms::new(r as u64))
+            .map(QuoteAtoms::new)
     }
 }
 
 impl Ord for QuoteAtomsPerBaseAtom {
     #[inline(always)]
     fn cmp(&self, other: &Self) -> Ordering {
-        (u64_slice_to_u128(self.inner)).cmp(&u64_slice_to_u128(other.inner))
+        // `inner` is the little endian u64 split of the u128, so comparing the
+        // high word and then the low word is the same ordering as comparing
+        // the u128 itself, and it keeps both operands in registers.
+        // The old conversion took the array by value and materialized the
+        // u128 through an unaligned read, which cost a stack round trip.
+        // This comparison runs at every level of every orderbook tree descent,
+        // so that round trip is paid once per level per order.
+        (self.inner[1], self.inner[0]).cmp(&(other.inner[1], other.inner[0]))
     }
 }
 
@@ -754,4 +1356,84 @@ fn test_debug() {
             inner: u128_to_u64_slice(123 * D18 / 100),
         }
     );
+}
+
+#[cfg(test)]
+mod price_ordering_tests {
+    use super::*;
+
+    /// The word wise comparison in `Ord for QuoteAtomsPerBaseAtom` has to
+    /// agree with comparing the u128 it stands for, including across the
+    /// 64 bit boundary where only the high word separates two prices.
+    #[test]
+    fn word_wise_price_order_matches_u128() {
+        let interesting: [u128; 14] = [
+            0,
+            1,
+            2,
+            u64::MAX as u128 - 1,
+            u64::MAX as u128,
+            u64::MAX as u128 + 1,
+            u64::MAX as u128 + 2,
+            1u128 << 64,
+            (1u128 << 64) | 1,
+            (1u128 << 64) | (u64::MAX as u128),
+            2u128 << 64,
+            u128::MAX - 1,
+            u128::MAX,
+            D18,
+        ];
+        for left in interesting.iter() {
+            for right in interesting.iter() {
+                let a: QuoteAtomsPerBaseAtom = QuoteAtomsPerBaseAtom {
+                    inner: u128_to_u64_slice(*left),
+                };
+                let b: QuoteAtomsPerBaseAtom = QuoteAtomsPerBaseAtom {
+                    inner: u128_to_u64_slice(*right),
+                };
+                assert_eq!(
+                    a.cmp(&b),
+                    left.cmp(right),
+                    "comparing {left} against {right}"
+                );
+                assert_eq!(a == b, left == right, "equality of {left} and {right}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod word_split_tests {
+    use super::*;
+
+    /// The shift based split has to be the same little endian split the byte
+    /// reinterpretation produced, in both directions, or every stored price
+    /// changes meaning.
+    #[test]
+    fn split_and_join_round_trip() {
+        let interesting: [u128; 10] = [
+            0,
+            1,
+            u64::MAX as u128,
+            u64::MAX as u128 + 1,
+            1u128 << 64,
+            (1u128 << 64) | 0xdead_beef,
+            u128::MAX,
+            D18,
+            D18 * 1_000,
+            0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+        ];
+        for value in interesting.iter() {
+            let words: [u64; 2] = u128_to_u64_slice(*value);
+            assert_eq!(words[0], *value as u64, "low word of {value}");
+            assert_eq!(words[1], (*value >> 64) as u64, "high word of {value}");
+            assert_eq!(u64_slice_to_u128(words), *value, "round trip of {value}");
+            // What the pointer reinterpretation did, on a little endian target.
+            let reinterpreted: [u64; 2] = unsafe {
+                let ptr: *const u128 = value;
+                *ptr.cast::<[u64; 2]>()
+            };
+            assert_eq!(words, reinterpreted, "byte order for {value}");
+        }
+    }
 }

@@ -17,19 +17,17 @@ pub mod deps {
 pub mod certora;
 
 use hypertree::trace;
+use pinocchio::{account::AccountView, address::Address, error::ProgramError, ProgramResult};
 use program::{
     batch_update::process_batch_update, claim_seat::process_claim_seat,
-    create_market::process_create_market, deposit::process_deposit,
+    create_market::process_create_market, defrag::process_defrag, deposit::process_deposit,
     expand_market::process_expand_market, global_add_trader::process_global_add_trader,
     global_clean::process_global_clean, global_create::process_global_create,
     global_deposit::process_global_deposit, global_evict::process_global_evict,
     global_withdraw::process_global_withdraw, process_swap, withdraw::process_withdraw,
     ManifestInstruction,
 };
-use solana_program::{
-    account_info::AccountInfo, declare_id, entrypoint::ProgramResult, program_error::ProgramError,
-    pubkey::Pubkey,
-};
+use solana_program::{declare_id, pubkey::Pubkey};
 
 #[cfg(not(feature = "no-entrypoint"))]
 use solana_security_txt::security_txt;
@@ -41,7 +39,7 @@ security_txt! {
     contacts: "email:dev@manifest.trade",
     policy: "",
     preferred_languages: "en",
-    source_code: "https://github.com/CKS-Systems/manifest",
+    source_code: "https://github.com/Bonasa-Tech/manifest",
     auditors: "Certora",
     formal_verification: "https://manifest.trade/audit.pdf"
 }
@@ -71,9 +69,15 @@ security_txt! {
 // If a bad actor were to place many orders that were not backed across many
 // markets, there is an added gas as well as input accounts cost for honest
 // actors cancelling or matching them. To combat this, there is a gas prepayment
-// of 5_000 lamports per order. Because of this, if there is ever multiple
-// unbacked or expired global orders, it is now profitable for a 3rd party to
-// run a cleanup job and claim the gas prepayment.
+// of 5_000 lamports per order, which funds removing them again.
+//
+// Cleaning is the fee collector's, not a third party's. It used to be open to
+// anyone, so unbacked and expired global orders were somebody's profit to
+// remove and the remedy ran itself. Restricting it to the collector makes the
+// prepayment fund the operator who already runs defrag, and makes the cleanup
+// a maintenance duty: until it is run, unbacked and expired global orders stay
+// on their books and honest traders keep paying the gas and account cost of
+// stepping over them.
 //
 // Global seat squatting
 // Because global accounts cannot be thrown away and started anew like markets,
@@ -96,13 +100,22 @@ security_txt! {
 declare_id!("MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms");
 
 #[cfg(not(feature = "no-entrypoint"))]
-solana_program::entrypoint!(process_instruction);
+pinocchio::program_entrypoint!(process_instruction, {
+    crate::state::constants::MAX_ACCOUNTS
+});
+// program_entrypoint! does not install a global allocator. Without one the
+// toolchain links the deprecated Solana allocator, which calls sol_alloc_free_,
+// a syscall the runtime does not register for SBPF v2. The resulting binary is
+// rejected at deploy time.
+#[cfg(not(feature = "no-entrypoint"))]
+pinocchio::default_allocator!();
 
 pub fn process_instruction(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id_raw: &Address,
+    accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    let program_id: &Pubkey = crate::validation::as_pubkey(program_id_raw);
     let (tag, data) = instruction_data
         .split_first()
         .ok_or(ProgramError::InvalidInstructionData)?;
@@ -151,6 +164,9 @@ pub fn process_instruction(
         }
         ManifestInstruction::GlobalEvict => {
             process_global_evict(program_id, accounts, data)?;
+        }
+        ManifestInstruction::Defrag => {
+            process_defrag(program_id, accounts, data)?;
         }
         ManifestInstruction::GlobalClean => {
             process_global_clean(program_id, accounts, data)?;

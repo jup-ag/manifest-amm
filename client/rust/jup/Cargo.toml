@@ -1,0 +1,26 @@
+[package]
+name = "manifest-jupiter"
+version = "0.3.0"
+edition = "2021"
+repository = "https://github.com/Bonasa-Tech/manifest"
+authors = ["Britt Cyr <britt@manifest.trade>"]
+description = "Jupiter AMM interface for Manifest exchange"
+license-file = "LICENSE"
+
+[lints]
+workspace = true
+
+[features]
+test = []
+
+[dependencies]
+pinocchio = { workspace = true }
+anyhow = { workspace = true }
+manifest-dex = { path = "../../../programs/manifest" }
+hypertree = { path = "../../../lib" }
+jupiter-amm-interface = "0.5.1"
+solana-program = { workspace = true }
+solana-account = { workspace = true }
+spl-token = { workspace = true }
+spl-token-2022 = { workspace = true }
+tokio = { workspace = true }

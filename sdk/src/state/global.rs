@@ -85,7 +85,7 @@ pub struct GlobalFixed {
     num_seats_claimed: u16,
 }
 
-impl Get for GlobalFixed {}
+unsafe impl Get for GlobalFixed {}
 
 impl GlobalFixed {
     pub fn new_empty(mint: &Pubkey) -> Self {
@@ -104,6 +104,10 @@ impl GlobalFixed {
             global_bump,
             num_seats_claimed: 0,
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn set_global_traders_root_index_for_test(&mut self, index: DataIndex) {
+        self.global_traders_root_index = index;
     }
     pub fn get_mint(&self) -> &Pubkey {
         &self.mint
@@ -140,6 +144,17 @@ pub struct GlobalDeposit {
     /// in trades stay in the market.
     balance_atoms: GlobalAtoms,
     _padding: u64,
+}
+
+#[cfg(test)]
+impl GlobalDeposit {
+    pub(crate) fn new_for_test(trader: &Pubkey, balance_atoms: GlobalAtoms) -> Self {
+        GlobalDeposit {
+            trader: *trader,
+            balance_atoms,
+            _padding: 0,
+        }
+    }
 }
 
 impl Ord for GlobalDeposit {

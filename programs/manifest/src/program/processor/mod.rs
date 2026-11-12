@@ -15,3 +15,5 @@ pub mod withdraw;
 
 pub use shared::*;
 pub use swap::*;
+
+pub mod defrag;

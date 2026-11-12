@@ -6,6 +6,7 @@ use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
 };
+use solana_sdk_ids::system_program;
 
 pub fn global_evict_instruction(
     mint: &Pubkey,
@@ -27,6 +28,7 @@ pub fn global_evict_instruction(
             AccountMeta::new(*trader_token_account, false),
             AccountMeta::new(*evictee_token_account, false),
             AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(system_program::id(), false),
         ],
         data: [
             ManifestInstruction::GlobalEvict.to_vec(),

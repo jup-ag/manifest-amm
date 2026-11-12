@@ -9,8 +9,26 @@ import { FillLog } from './manifest/accounts/FillLog';
 import { PROGRAM_ID } from './manifest';
 import { convertU128 } from './utils/numbers';
 import { genAccDiscriminator } from './utils/discriminator';
+import { hasTruncatedLogs } from './utils/solana';
+import { SLOT_DURATION_MS } from './constants';
+import {
+  inferFillsFromTransaction,
+  computeInferredRemainders,
+} from './utils/inferFills';
 import * as promClient from 'prom-client';
 import { FillLogResult } from './types';
+import { extractProgramDataLogs } from './utils/programLogs';
+import { recordManifestInstructionMetrics } from './utils/instructionMetrics';
+import {
+  detectAggregatorFromKeys,
+  resolveOriginatingProtocol,
+  getInvokedProgramIds,
+  resolveTakerFromSigners,
+} from './aggregators';
+
+const SIGNATURE_BATCH_SIZE = 10;
+const SIGNATURE_PAGE_SIZE = 1_000;
+const MAX_SIGNATURE_PAGES_PER_POLL = 10;
 
 // For live monitoring of the fill feed. For a more complete look at fill
 // history stats, need to index all trades.
@@ -19,17 +37,41 @@ const fills = new promClient.Counter({
   help: 'Number of fills',
   labelNames: ['market', 'isGlobal', 'takerIsBuy'] as const,
 });
+const fillLag = new promClient.Gauge({
+  name: 'fill_lag_seconds',
+  help: 'Lag in seconds between now and the block time of the most recent fill',
+});
+const truncatedTransactions = new promClient.Counter({
+  name: 'truncated_log_transactions',
+  help: 'Number of transactions with truncated logs',
+});
+const inferredFills = new promClient.Counter({
+  name: 'inferred_fills',
+  help: 'Number of fills inferred from token transfers due to truncated logs',
+  labelNames: ['market'] as const,
+});
 
 /**
  * FillFeed example implementation.
  */
+const TX_HISTORY_ERROR_THRESHOLD = 5;
+
 export class FillFeed {
   private wsManager: WebSocketManager;
   private shouldEnd: boolean = false;
   private ended: boolean = false;
   private lastUpdateUnix: number = Date.now();
+  private txHistoryErrorCount: number = 0;
+  /**
+   * Transactions skipped because this client could not decode their version.
+   * Surfaced so an operator can see silent fill loss instead of guessing.
+   */
+  private unsupportedVersionCount: number = 0;
 
-  constructor(private connection: Connection) {
+  constructor(
+    private connection: Connection,
+    private onTruncatedLogs?: (signature: string, slot: number) => void,
+  ) {
     this.wsManager = new WebSocketManager(1234, 30000);
   }
 
@@ -62,79 +104,126 @@ export class FillFeed {
    * Parse logs in an endless loop.
    */
   public async parseLogs(endEarly?: boolean) {
-    // Start with a hopefully recent signature.
-    const lastSignatureStatus = (
-      await this.connection.getSignaturesForAddress(
-        PROGRAM_ID,
-        { limit: 1 },
-        'finalized',
-      )
-    )[0];
-    let lastSignature: string | undefined = lastSignatureStatus.signature;
-    let lastSlot: number = lastSignatureStatus.slot;
-
-    // End early is 30 seconds, used for testing.
-    const endTime: Date = endEarly
-      ? new Date(Date.now() + 30_000)
-      : new Date(Date.now() + 1_000_000_000_000);
-
-    // TODO: remove endTime in favor of stopParseLogs for testing
-    while (!this.shouldEnd && new Date(Date.now()) < endTime) {
-      await new Promise((f) => setTimeout(f, 10_000));
-      const signatures: ConfirmedSignatureInfo[] =
+    try {
+      // Start with a hopefully recent signature.
+      const lastSignatureStatus = (
         await this.connection.getSignaturesForAddress(
           PROGRAM_ID,
-          {
-            until: lastSignature,
-          },
+          { limit: 1 },
           'finalized',
+        )
+      )[0];
+      let lastSignature: string | undefined = lastSignatureStatus?.signature;
+      let lastSlot: number = lastSignatureStatus?.slot ?? 0;
+
+      // End early is 30 seconds, used for testing.
+      const endTime: Date = endEarly
+        ? new Date(Date.now() + 30_000)
+        : new Date(Date.now() + 1_000_000_000_000);
+
+      // TODO: remove endTime in favor of stopParseLogs for testing
+      while (!this.shouldEnd && new Date(Date.now()) < endTime) {
+        // This sleep was originally implemented to wait until there was enough
+        // transactions to avoid just spamming the RPC. Reduced to just
+        // enough to avoid RPC spam, but not wait too long since the router
+        // integrations give us steady flow. One slot is the natural interval:
+        // polling faster than the cluster produces blocks only burns RPC
+        // budget.
+        await new Promise((f) => setTimeout(f, SLOT_DURATION_MS));
+
+        const signaturePages: ConfirmedSignatureInfo[][] = [];
+        let before: string | undefined;
+        for (
+          let pageNumber = 0;
+          pageNumber < MAX_SIGNATURE_PAGES_PER_POLL;
+          pageNumber++
+        ) {
+          const page = await this.connection.getSignaturesForAddress(
+            PROGRAM_ID,
+            {
+              ...(lastSignature ? { until: lastSignature } : {}),
+              ...(before ? { before } : {}),
+            },
+            'finalized',
+          );
+          signaturePages.push(page);
+          before = page.at(-1)?.signature;
+          if (
+            page.length < SIGNATURE_PAGE_SIZE ||
+            page.some((sig) => sig.signature === lastSignature)
+          ) {
+            break;
+          }
+          if (!before) break;
+        }
+
+        if (
+          signaturePages.length === MAX_SIGNATURE_PAGES_PER_POLL &&
+          signaturePages.at(-1)?.length === SIGNATURE_PAGE_SIZE
+        ) {
+          console.warn(
+            `Fill-feed backlog exceeded ${MAX_SIGNATURE_PAGES_PER_POLL * SIGNATURE_PAGE_SIZE} signatures; processing the newest bounded window`,
+          );
+        }
+
+        // Process the bounded window oldest-first without retaining an
+        // unbounded RPC history. If the cap is reached, older history is shed
+        // deliberately so live monitoring can recover with bounded memory.
+        const signatures = signaturePages.flat().reverse();
+
+        // Process even single signatures, but handle the edge case differently
+        if (signatures.length === 0) {
+          continue;
+        }
+
+        // If we only got back the same signature we already processed, skip it
+        if (
+          signatures.length === 1 &&
+          signatures[0].signature === lastSignature
+        ) {
+          continue;
+        }
+        const filteredSignatures = signatures.filter((sig) => {
+          // Failed transactions never emit a fill, and handleSignature only
+          // discards them after paying for a full getTransaction. Shed them
+          // here instead: roughly a third of this program's signatures are
+          // failed aggregator routes (slippage), so fetching them is pure RPC
+          // budget spent to learn nothing, and that budget is what bounds how
+          // far behind the feed runs.
+          return (
+            sig.err == null &&
+            sig.signature !== lastSignature &&
+            sig.slot >= lastSlot
+          );
+        });
+
+        for (
+          let i = 0;
+          i < filteredSignatures.length;
+          i += SIGNATURE_BATCH_SIZE
+        ) {
+          const batch = filteredSignatures.slice(i, i + SIGNATURE_BATCH_SIZE);
+          await Promise.all(batch.map((sig) => this.handleSignature(sig)));
+        }
+
+        console.log(
+          'New last signature:',
+          signatures[signatures.length - 1].signature,
+          'New last signature slot:',
+          signatures[signatures.length - 1].slot,
+          'num sigs',
+          signatures.length,
         );
-      // Flip it so we do oldest first.
-      signatures.reverse();
+        lastSignature = signatures[signatures.length - 1].signature;
+        lastSlot = signatures[signatures.length - 1].slot;
 
-      // Process even single signatures, but handle the edge case differently
-      if (signatures.length === 0) {
-        continue;
+        this.lastUpdateUnix = Date.now();
       }
-
-      // If we only got back the same signature we already processed, skip it
-      if (
-        signatures.length === 1 &&
-        signatures[0].signature === lastSignature
-      ) {
-        continue;
-      }
-      for (const signature of signatures) {
-        // Skip if we already processed this signature
-        if (signature.signature === lastSignature) {
-          continue;
-        }
-
-        // Separately track the last slot. This is necessary because sometimes
-        // gsfa ignores the until param and just gives 1_000 signatures.
-        if (signature.slot < lastSlot) {
-          continue;
-        }
-        await this.handleSignature(signature);
-      }
-
-      console.log(
-        'New last signature:',
-        signatures[signatures.length - 1].signature,
-        'New last signature slot:',
-        signatures[signatures.length - 1].slot,
-        'num sigs',
-        signatures.length,
-      );
-      lastSignature = signatures[signatures.length - 1].signature;
-      lastSlot = signatures[signatures.length - 1].slot;
-
-      this.lastUpdateUnix = Date.now();
+    } finally {
+      console.log('ended loop');
+      this.wsManager.close();
+      this.ended = true;
     }
-
-    console.log('ended loop');
-    this.wsManager.close();
-    this.ended = true;
   }
 
   /**
@@ -142,10 +231,59 @@ export class FillFeed {
    * notification.
    */
   private async handleSignature(signature: ConfirmedSignatureInfo) {
-    console.log('Handling', signature.signature, 'slot', signature.slot);
-    const tx = await this.connection.getTransaction(signature.signature, {
-      maxSupportedTransactionVersion: 0,
-    });
+    // Deliberately not logging per signature: at mainnet rates this ran well
+    // over a hundred lines a second into the log shipper, which throttles the
+    // very loop whose latency we care about. Fills and anomalies still log.
+    let tx: VersionedTransactionResponse | null;
+    try {
+      tx = await this.connection.getTransaction(signature.signature, {
+        maxSupportedTransactionVersion: 1,
+      });
+    } catch (e: unknown) {
+      // Skip transactions that are no longer available on this node (non-archival RPC)
+      // Error code -32011 = "Transaction history is not available from this node"
+      const error = e as { code?: number; message?: string };
+      // A transaction the client cannot decode must not take down the whole
+      // polling batch: parseLogs would unwind and resume from the newest
+      // signature, silently dropping every fill in the skipped window.
+      // Error code -32015 = "Transaction version ... is not supported by the
+      // requesting client", which also covers a future format this build
+      // predates.
+      if (
+        error.code === -32015 ||
+        error.message?.includes('is not supported by the requesting client')
+      ) {
+        this.unsupportedVersionCount++;
+        console.error(
+          `Unsupported transaction version, skipping (${this.unsupportedVersionCount} so far):`,
+          signature.signature,
+          'slot',
+          signature.slot,
+          error.message,
+        );
+        return;
+      }
+      if (
+        error.code === -32011 ||
+        error.message?.includes('Transaction history is not available')
+      ) {
+        this.txHistoryErrorCount++;
+        console.warn(
+          `Transaction history not available (${this.txHistoryErrorCount}/${TX_HISTORY_ERROR_THRESHOLD}), skipping:`,
+          signature.signature,
+        );
+        if (this.txHistoryErrorCount >= TX_HISTORY_ERROR_THRESHOLD) {
+          throw new Error(
+            `Too many transaction history errors (${this.txHistoryErrorCount}), RPC node may not support historical queries`,
+          );
+        }
+        return;
+      }
+      throw e;
+    }
+    // Reset error count on successful fetch
+    this.txHistoryErrorCount = 0;
+
     if (!tx?.meta?.logMessages) {
       console.log('No log messages');
       return;
@@ -183,31 +321,62 @@ export class FillFeed {
     }
 
     const aggregator: string | undefined = detectAggregator(tx);
-    const originatingProtocol: string | undefined =
-      detectOriginatingProtocol(tx);
+    const originatingProtocol: string | undefined = detectOriginatingProtocol(
+      tx,
+      signers,
+    );
 
     const messages: string[] = tx?.meta?.logMessages!;
-    const programDatas: string[] = messages.filter((message) => {
-      return message.includes('Program data:');
-    });
 
-    if (programDatas.length == 0) {
+    // Truncated logs drop Program data entries, so fills can be silently
+    // missing from the feed. Fills that survived are parsed below as usual;
+    // the missing remainder is inferred from the Swap CPI token transfers.
+    const truncated: boolean = hasTruncatedLogs(messages);
+    if (truncated) {
+      console.warn(
+        'Truncated logs detected for',
+        signature.signature,
+        'slot',
+        signature.slot,
+      );
+      truncatedTransactions.inc();
+      this.onTruncatedLogs?.(signature.signature, signature.slot);
+    }
+
+    // Count every Manifest instruction in the transaction, not only the ones
+    // that filled, so instruction rates and compute usage cover order
+    // placement as well as swaps.
+    recordManifestInstructionMetrics(tx);
+
+    // Attribute logs to the active invocation stack; any program can emit the
+    // same "Program data" bytes, so transaction account presence is not proof.
+    const programDatas = extractProgramDataLogs(
+      messages,
+      PROGRAM_ID.toBase58(),
+    );
+
+    if (programDatas.length == 0 && !truncated) {
       console.log('No program datas');
       return;
     }
 
+    const parsedFills: FillLogResult[] = [];
     for (const programDataEntry of programDatas) {
-      const programData = programDataEntry.split(' ')[2];
-      const byteArray: Uint8Array = Uint8Array.from(atob(programData), (c) =>
-        c.charCodeAt(0),
-      );
-      const buffer = Buffer.from(byteArray);
-      if (!buffer.subarray(0, 8).equals(fillDiscriminant)) {
+      let buffer: Buffer;
+      let deserializedFillLog: FillLog;
+      try {
+        buffer = Buffer.from(programDataEntry.data, 'base64');
+        if (
+          buffer.length < 8 + FillLog.byteSize ||
+          !buffer.subarray(0, 8).equals(fillDiscriminant)
+        ) {
+          continue;
+        }
+        deserializedFillLog = FillLog.deserialize(buffer.subarray(8))[0];
+      } catch (error) {
+        console.warn('Skipping malformed Manifest program data:', error);
         continue;
       }
-      const deserializedFillLog: FillLog = FillLog.deserialize(
-        buffer.subarray(8),
-      )[0];
       const fillResult = toFillLogResult(
         deserializedFillLog,
         signature.slot,
@@ -219,85 +388,46 @@ export class FillFeed {
         // ?? undefined because can be null or undefined
         signature.blockTime ?? undefined,
       );
+      fillResult.invocationIndex = programDataEntry.invocationIndex;
       const resultString: string = JSON.stringify(fillResult);
       console.log('Got a fill', resultString);
+      parsedFills.push(fillResult);
       fills.inc({
         market: deserializedFillLog.market.toString(),
         isGlobal: deserializedFillLog.isMakerGlobal.toString(),
         takerIsBuy: deserializedFillLog.takerIsBuy.toString(),
       });
       this.wsManager.broadcast(JSON.stringify(fillResult));
+      if (signature.blockTime) {
+        fillLag.set(Date.now() / 1000 - signature.blockTime);
+      }
+    }
+
+    if (truncated) {
+      const inferred: FillLogResult[] = computeInferredRemainders(
+        inferFillsFromTransaction(tx, signature.signature, signature.slot, {
+          originalSigner,
+          aggregator,
+          originatingProtocol,
+          signers,
+          blockTime: signature.blockTime ?? undefined,
+        }),
+        parsedFills,
+      );
+      for (const inferredFill of inferred) {
+        console.log('Inferred a fill', JSON.stringify(inferredFill));
+        inferredFills.inc({ market: inferredFill.market });
+        this.wsManager.broadcast(JSON.stringify(inferredFill));
+      }
     }
   }
-}
-
-// Constants for known aggregators and protocols
-export const AGGREGATOR_PROGRAM_IDS = {
-  MEXkeo4BPUCZuEJ4idUUwMPu4qvc9nkqtLn3yAyZLxg: 'Swissborg',
-  T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT: 'Titan',
-  '6m2CDdhRgxpH4WjvdzxAYbGxwdGUz5MziiL5jek2kBma': 'OKX',
-  proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u: 'OKX',
-  DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH: 'DFlow',
-  JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4: 'Jupiter',
-  SPURp82qAR9nvzy8j1gP31zmzGytrgDBKcpGzeGkka8: 'Spur',
-} as const;
-
-export const ORIGINATING_PROTOCOL_IDS = {
-  LiMoM9rMhrdYrfzUCxQppvxCSG1FcrUK9G8uLq4A1GF: 'kamino',
-  UMnFStVeG1ecZFc2gc5K3vFy3sMpotq8C91mXBQDGwh: 'cabana',
-  HU23r7UoZbqTUuh3vA7emAGztFtqwTeVips789vqxxBw: 'jupiter',
-  '9yj3zvLS3fDMqi1F8zhkaWfq8TZpZWHe6cz1Sgt7djXf': 'phantom',
-  '8psNvWTrdNTiVRNzAgsou9kETXNJm2SXZyaKuJraVRtf': 'phantom',
-} as const;
-
-// Helper function to detect aggregator from account keys
-export function detectAggregatorFromKeys(
-  accountKeys: string[],
-): string | undefined {
-  for (const account of accountKeys) {
-    const aggregator =
-      AGGREGATOR_PROGRAM_IDS[account as keyof typeof AGGREGATOR_PROGRAM_IDS];
-    if (aggregator) {
-      return aggregator;
-    }
-  }
-  return undefined;
-}
-
-// Helper function to detect originating protocol from account keys
-export function detectOriginatingProtocolFromKeys(
-  accountKeys: string[],
-): string | undefined {
-  for (const accountKey of accountKeys) {
-    const protocol =
-      ORIGINATING_PROTOCOL_IDS[
-        accountKey as keyof typeof ORIGINATING_PROTOCOL_IDS
-      ];
-    if (protocol) {
-      return protocol;
-    }
-  }
-  return undefined;
 }
 
 function detectAggregator(
   tx: VersionedTransactionResponse,
 ): string | undefined {
-  // Look for the aggregator program id from a list of known ids.
   try {
-    // For versioned transactions, we need to handle both static and resolved account keys
-    const message = tx.transaction.message;
-
-    // Handle both legacy and versioned transactions
-    if ('accountKeys' in message) {
-      // Legacy transaction
-      const accountKeysStr = message.accountKeys.map((k) => k.toBase58());
-      return detectAggregatorFromKeys(accountKeysStr);
-    } else {
-      // V0 transaction - use staticAccountKeys directly to avoid lookup resolution issues
-      const accountKeysStr = message.staticAccountKeys.map((k) => k.toBase58());
-      return detectAggregatorFromKeys(accountKeysStr);
-    }
+    return detectAggregatorFromKeys(getInvokedProgramIds(tx));
   } catch (error) {
     console.warn('Error detecting aggregator:', error);
     // Fall back to undefined if we can't detect the aggregator
@@ -307,20 +437,10 @@ function detectAggregator(
 
 function detectOriginatingProtocol(
   tx: VersionedTransactionResponse,
+  signers: string[] | undefined,
 ): string | undefined {
   try {
-    const message = tx.transaction.message;
-
-    // Handle both legacy and versioned transactions
-    if ('accountKeys' in message) {
-      // Legacy transaction
-      const accountKeysStr = message.accountKeys.map((k) => k.toBase58());
-      return detectOriginatingProtocolFromKeys(accountKeysStr);
-    } else {
-      // V0 transaction - use staticAccountKeys directly to avoid lookup resolution issues
-      const accountKeysStr = message.staticAccountKeys.map((k) => k.toBase58());
-      return detectOriginatingProtocolFromKeys(accountKeysStr);
-    }
+    return resolveOriginatingProtocol(getInvokedProgramIds(tx), signers);
   } catch (error) {
     console.warn('Error detecting originating protocol:', error);
     // Fall back to undefined if we can't detect the originating protocol
@@ -340,10 +460,17 @@ export function toFillLogResult(
   signers?: string[],
   blockTime?: number,
 ): FillLogResult {
+  // When a delegating signer (e.g. jupui) signed on behalf of the real taker,
+  // attribute the fill to the other signer instead of the on-chain taker.
+  const takerFromSigner: string | undefined = resolveTakerFromSigners(
+    signers,
+    originalSigner,
+  );
+
   const result: FillLogResult = {
     market: fillLog.market.toBase58(),
     maker: fillLog.maker.toBase58(),
-    taker: fillLog.taker.toBase58(),
+    taker: takerFromSigner ?? fillLog.taker.toBase58(),
     baseAtoms: fillLog.baseAtoms.inner.toString(),
     quoteAtoms: fillLog.quoteAtoms.inner.toString(),
     priceAtoms: convertU128(fillLog.price.inner),

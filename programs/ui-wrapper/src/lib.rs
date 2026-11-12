@@ -12,14 +12,13 @@ pub mod wrapper_user;
 
 use hypertree::trace;
 use instruction::ManifestWrapperInstruction;
+use pinocchio::{account::AccountView, error::ProgramError, ProgramResult};
 use processors::{
-    cancel_order::process_cancel_order, create_wrapper::process_create_wrapper,
-    place_order::process_place_order, settle_funds::process_settle_funds,
+    cancel_order::process_cancel_order, collect::process_collect,
+    create_wrapper::process_create_wrapper, place_order::process_place_order,
+    settle_funds::process_settle_funds,
 };
-use solana_program::{
-    account_info::AccountInfo, declare_id, entrypoint::ProgramResult, program_error::ProgramError,
-    pubkey::Pubkey,
-};
+use solana_program::{declare_id, pubkey::Pubkey};
 
 #[cfg(not(feature = "no-entrypoint"))]
 use solana_security_txt::security_txt;
@@ -31,20 +30,38 @@ security_txt! {
     contacts: "email:dev@manifest.trade",
     policy: "",
     preferred_languages: "en",
-    source_code: "https://github.com/CKS-Systems/manifest",
+    source_code: "https://github.com/Bonasa-Tech/manifest",
     auditors: ""
 }
 
 declare_id!("UMnFStVeG1ecZFc2gc5K3vFy3sMpotq8C91mXBQDGwh");
 
+/// Fee charged per fee-bearing ui-wrapper instruction, in lamports,
+/// transferred from the payer to the wrapper state.
+pub const UI_WRAPPER_FEE_LAMPORTS: u64 = 100_000;
+
+/// Program deployer, allowed to collect the accrued fees off a wrapper state.
+/// The same hardcoded collector as the core's and the wrapper's, re-exported
+/// so the key (and its `test` feature twin) exists in exactly one place.
+pub use manifest::program::processor::defrag::DEFRAG_COLLECTOR as COLLECTOR;
+
 #[cfg(not(feature = "no-entrypoint"))]
-solana_program::entrypoint!(process_instruction);
+pinocchio::program_entrypoint!(process_instruction, {
+    manifest::state::constants::MAX_ACCOUNTS
+});
+// program_entrypoint! does not install a global allocator. Without one the
+// toolchain links the deprecated Solana allocator, which calls sol_alloc_free_,
+// a syscall the runtime does not register for SBPF v2. The resulting binary is
+// rejected at deploy time.
+#[cfg(not(feature = "no-entrypoint"))]
+pinocchio::default_allocator!();
 
 pub fn process_instruction(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id_raw: &pinocchio::address::Address,
+    accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    let program_id: &Pubkey = manifest::validation::as_pubkey(program_id_raw);
     let (tag, data) = instruction_data
         .split_first()
         .ok_or(ProgramError::InvalidInstructionData)?;
@@ -72,6 +89,9 @@ pub fn process_instruction(
         }
         ManifestWrapperInstruction::SettleFunds => {
             process_settle_funds(program_id, accounts, data)?;
+        }
+        ManifestWrapperInstruction::Collect => {
+            process_collect(program_id, accounts, data)?;
         }
     }
 

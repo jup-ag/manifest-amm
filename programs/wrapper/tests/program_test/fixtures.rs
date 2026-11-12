@@ -4,22 +4,23 @@ use std::{
 };
 
 use manifest::{
-    program::{create_market_instructions, get_dynamic_value},
+    program::{create_market_instructions, get_dynamic_value_or},
     quantities::WrapperU64,
     state::{MarketFixed, MarketValue},
     validation::MintAccountInfo,
 };
 use solana_account::Account;
-use solana_program::{hash::Hash, pubkey::Pubkey, rent::Rent};
-use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_program::{
-    account_info::AccountInfo, instruction::Instruction, system_instruction::create_account,
+    account_info::AccountInfo, clock::Clock, hash::Hash, program_pack::Pack, pubkey::Pubkey,
+    rent::Rent,
 };
-use solana_program_pack::Pack;
+use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
 use solana_signer::Signer;
+use solana_system_interface::instruction::create_account;
 use solana_transaction::Transaction;
-use spl_token_2022_interface::state::Mint;
+use spl_token_2022::state::Mint;
 use std::rc::Rc;
 use wrapper::instruction_builders::{
     claim_seat_instruction, create_wrapper_instructions, deposit_instruction, withdraw_instruction,
@@ -61,25 +62,18 @@ pub struct TestFixture {
 
 impl TestFixture {
     pub async fn new() -> TestFixture {
-        let mut program: ProgramTest = ProgramTest::new(
-            "wrapper",
-            wrapper::ID,
-            processor!(wrapper::process_instruction),
-        );
-        program.add_program(
-            "manifest",
-            manifest::ID,
-            processor!(manifest::process_instruction),
-        );
+        let mut program: ProgramTest = ProgramTest::new("wrapper", wrapper::ID, None);
+        program.add_program("manifest", manifest::ID, None);
 
         let second_keypair: Keypair = Keypair::new();
         program.add_account(
             second_keypair.pubkey(),
-            solana_account::Account::new(
-                u32::MAX as u64,
-                0,
-                &solana_program::system_program::id(),
-            ),
+            solana_account::Account::new(u32::MAX as u64, 0, &solana_sdk_ids::system_program::id()),
+        );
+        let collector: Keypair = Keypair::new_from_array([42; 32]);
+        program.add_account(
+            collector.pubkey(),
+            solana_account::Account::new(SOL_UNIT_SIZE, 0, &solana_sdk_ids::system_program::id()),
         );
 
         let usdc_keypair: Keypair = Keypair::new();
@@ -167,6 +161,19 @@ impl TestFixture {
 
     pub fn payer_keypair(&self) -> Keypair {
         self.context.borrow().payer.insecure_clone()
+    }
+
+    pub async fn advance_time_seconds(&self, seconds: i64) {
+        let mut clock: Clock = self
+            .context
+            .borrow_mut()
+            .banks_client
+            .get_sysvar()
+            .await
+            .unwrap();
+        clock.unix_timestamp += seconds;
+        clock.slot += (seconds as u64) / 2;
+        self.context.borrow_mut().set_sysvar(&clock);
     }
 
     pub async fn claim_seat(&self) -> anyhow::Result<(), BanksClientError> {
@@ -278,7 +285,7 @@ impl TestFixture {
             amount_atoms,
             &trader_token_account,
             wrapper_state,
-            spl_token_interface::id(),
+            spl_token::id(),
         );
 
         send_tx_with_retry(
@@ -353,7 +360,7 @@ impl TestFixture {
             amount_atoms,
             &trader_token_account,
             &self.wrapper.key,
-            spl_token_interface::id(),
+            spl_token::id(),
         );
 
         send_tx_with_retry(
@@ -380,53 +387,15 @@ impl MarketFixture {
         let context_ref: Rc<RefCell<ProgramTestContext>> = Rc::clone(&context);
 
         // Just needed for storing the decimals. The rest can be blank.
-        let mut lamports: u64 = 0;
-        let base_mint: MintAccountInfo = MintAccountInfo {
-            mint: Mint {
-                mint_authority: None.into(),
-                supply: 0,
-                decimals: 6,
-                is_initialized: true,
-                freeze_authority: None.into(),
-            },
-            info: &AccountInfo {
-                key: &Pubkey::new_unique(),
-                lamports: Rc::new(RefCell::new(&mut lamports)),
-                data: Rc::new(RefCell::new(&mut [])),
-                owner: &Pubkey::new_unique(),
-                rent_epoch: 0,
-                is_signer: false,
-                is_writable: false,
-                executable: false,
-            },
-        };
-
-        let mut lamports: u64 = 0;
-        let quote_mint: MintAccountInfo = MintAccountInfo {
-            mint: Mint {
-                mint_authority: None.into(),
-                supply: 0,
-                decimals: 9,
-                is_initialized: true,
-                freeze_authority: None.into(),
-            },
-            info: &AccountInfo {
-                key: &Pubkey::new_unique(),
-                lamports: Rc::new(RefCell::new(&mut lamports)),
-                data: Rc::new(RefCell::new(&mut [])),
-                owner: &Pubkey::new_unique(),
-                rent_epoch: 0,
-                is_signer: false,
-                is_writable: false,
-                executable: false,
-            },
-        };
+        // Placeholder until the first reload, which reads the market back from
+        // the chain. Zeroed rather than built from fabricated accounts: the
+        // runtime's account type cannot be constructed off chain.
         // Dummy default value. Not valid until reload.
         MarketFixture {
             context: context_ref,
             key,
             market: MarketValue {
-                fixed: MarketFixed::new_empty(&base_mint, &quote_mint, &key),
+                fixed: bytemuck::Zeroable::zeroed(),
                 dynamic: Vec::new(),
             },
         }
@@ -442,7 +411,7 @@ impl MarketFixture {
             .unwrap()
             .unwrap();
 
-        let market: MarketValue = get_dynamic_value(market_account.data.as_slice());
+        let market: MarketValue = get_dynamic_value_or(market_account.data.as_slice()).unwrap();
         self.market = market;
     }
 
@@ -495,12 +464,12 @@ impl MintFixture {
         let init_account_ix: Instruction = create_account(
             &context.borrow().payer.pubkey(),
             &mint_keypair.pubkey(),
-            rent.minimum_balance(spl_token_interface::state::Mint::LEN),
-            spl_token_interface::state::Mint::LEN as u64,
-            &spl_token_interface::id(),
+            rent.minimum_balance(spl_token::state::Mint::LEN),
+            spl_token::state::Mint::LEN as u64,
+            &spl_token::id(),
         );
-        let init_mint_ix: Instruction = spl_token_interface::instruction::initialize_mint(
-            &spl_token_interface::id(),
+        let init_mint_ix: Instruction = spl_token::instruction::initialize_mint(
+            &spl_token::id(),
             &mint_keypair.pubkey(),
             &context.borrow().payer.pubkey(),
             None,
@@ -539,8 +508,8 @@ impl MintFixture {
 
     fn make_mint_to_ix(&self, dest: &Pubkey, amount: u64) -> Instruction {
         let context: Ref<ProgramTestContext> = self.context.borrow();
-        let mint_to_instruction: Instruction = spl_token_interface::instruction::mint_to(
-            &spl_token_interface::ID,
+        let mint_to_instruction: Instruction = spl_token::instruction::mint_to(
+            &spl_token::ID,
             &self.key,
             dest,
             &context.payer.pubkey(),
@@ -567,13 +536,13 @@ impl TokenAccountFixture {
         let init_account_ix: Instruction = create_account(
             payer_pk,
             &keypair.pubkey(),
-            rent.minimum_balance(spl_token_interface::state::Account::LEN),
-            spl_token_interface::state::Account::LEN as u64,
-            &spl_token_interface::id(),
+            rent.minimum_balance(spl_token::state::Account::LEN),
+            spl_token::state::Account::LEN as u64,
+            &spl_token::id(),
         );
 
-        let init_token_ix: Instruction = spl_token_interface::instruction::initialize_account(
-            &spl_token_interface::id(),
+        let init_token_ix: Instruction = spl_token::instruction::initialize_account(
+            &spl_token::id(),
             &keypair.pubkey(),
             mint_pk,
             owner_pk,

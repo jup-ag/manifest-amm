@@ -9,6 +9,8 @@ target
 dist
 **/nyc_output/*
 test-ledger
+manifest-replay-*
+replay-runs/
 idl/yarn.lock
 client/nyc_output
 **nyc_output
@@ -16,3 +18,8 @@ client/nyc_output
 
 .certora_internal
 certora_out
+__pycache__/
+
+# core-market defrag runner state (logs, plan cache, abort records)
+defrag-state/
+scripts/defrag/defrag-state/

@@ -1,3 +1,4 @@
+use pinocchio::ProgramResult;
 use std::mem::size_of;
 
 use crate::quantities::{
@@ -8,9 +9,8 @@ use crate::quantities::{QuoteAtoms, WrapperU64};
 use borsh::{BorshDeserialize, BorshSerialize};
 use bytemuck::{Pod, Zeroable};
 use hypertree::{DataIndex, PodBool};
-use num_enum::{IntoPrimitive, TryFromPrimitive};
+use pinocchio::error::ProgramError;
 use shank::ShankType;
-use solana_program::{entrypoint::ProgramResult, program_error::ProgramError};
 use static_assertions::const_assert_eq;
 use std::cmp::Ordering;
 
@@ -21,44 +21,45 @@ use super::{constants::NO_EXPIRATION_LAST_VALID_SLOT, RESTING_ORDER_SIZE};
     BorshDeserialize,
     BorshSerialize,
     PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
     Clone,
     Copy,
     ShankType,
-    IntoPrimitive,
-    TryFromPrimitive,
+    Zeroable,
+    Pod,
 )]
-#[repr(u8)]
-#[borsh(use_discriminant = true)]
-pub enum OrderType {
-    // Normal limit order.
-    Limit = 0,
+#[repr(transparent)]
+pub struct OrderType(u8);
 
-    // Does not rest. Take only.
-    ImmediateOrCancel = 1,
-
-    // Fails if would cross the orderbook.
-    PostOnly = 2,
-
-    // Global orders are post only but use funds from the global account.
-    Global = 3,
-
-    // Reverse orders behave like an AMM. When filled, they place an order on
-    // the other side of the book with a small fee (spread).
-    // Note: reverse orders can take but don't reverse when taking.
-    Reverse = 4,
-
-    // Same as a reverse order except that it much tighter, allowing for stables
-    // to have even smaller spreads.
-    ReverseTight = 5,
-}
-unsafe impl bytemuck::Zeroable for OrderType {}
-unsafe impl bytemuck::Pod for OrderType {}
 impl Default for OrderType {
     fn default() -> Self {
         OrderType::Limit
     }
 }
 impl OrderType {
+    #[allow(non_upper_case_globals)]
+    pub const Limit: Self = Self(0);
+    #[allow(non_upper_case_globals)]
+    pub const ImmediateOrCancel: Self = Self(1);
+    #[allow(non_upper_case_globals)]
+    pub const PostOnly: Self = Self(2);
+    #[allow(non_upper_case_globals)]
+    pub const Global: Self = Self(3);
+    #[allow(non_upper_case_globals)]
+    pub const Reverse: Self = Self(4);
+    #[allow(non_upper_case_globals)]
+    pub const ReverseTight: Self = Self(5);
+
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+
+    pub const fn is_valid(self) -> bool {
+        self.0 <= Self::ReverseTight.0
+    }
+
     pub fn is_reversible(self) -> bool {
         self == OrderType::Reverse || self == OrderType::ReverseTight
     }
@@ -69,6 +70,25 @@ impl OrderType {
             OrderType::ReverseTight => QuoteAtomsPerBaseAtom::MAX_EXP - 8,
             _ => QuoteAtomsPerBaseAtom::MAX_EXP,
         }
+    }
+}
+
+impl TryFrom<u8> for OrderType {
+    type Error = ProgramError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        let order_type: OrderType = Self(value);
+        if order_type.is_valid() {
+            Ok(order_type)
+        } else {
+            Err(ProgramError::InvalidInstructionData)
+        }
+    }
+}
+
+impl From<OrderType> for u8 {
+    fn from(value: OrderType) -> Self {
+        value.0
     }
 }
 
@@ -118,6 +138,9 @@ impl RestingOrder {
         is_bid: bool,
         order_type: OrderType,
     ) -> Result<Self, ProgramError> {
+        if !order_type.is_valid() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         // Reverse orders cannot have expiration. The purpose of those orders is to
         // be a permanent liquidity on the book.
         assert!(!(order_type.is_reversible() && last_valid_slot != NO_EXPIRATION_LAST_VALID_SLOT));
@@ -157,15 +180,19 @@ impl RestingOrder {
     }
 
     pub fn get_order_type(&self) -> OrderType {
+        debug_assert!(self.order_type.is_valid());
         self.order_type
     }
 
-    #[cfg(feature = "certora")]
-    pub fn is_global(&self) -> bool {
-        false
+    pub fn has_valid_order_type(&self) -> bool {
+        self.order_type.is_valid()
     }
 
-    #[cfg(not(feature = "certora"))]
+    /// Check the encoded boolean as well as the side before comparing orders.
+    pub fn has_valid_side(&self, is_bid: bool) -> bool {
+        self.is_bid == PodBool::from_bool(is_bid)
+    }
+
     pub fn is_global(&self) -> bool {
         self.order_type == OrderType::Global
     }
@@ -242,8 +269,10 @@ impl RestingOrder {
 
 impl Ord for RestingOrder {
     fn cmp(&self, other: &Self) -> Ordering {
-        // We only compare bids with bids or asks with asks. If you want to
-        // check if orders match, directly access their prices.
+        // Preserve the deployed market ordering for this compatibility
+        // upgrade: sequence, trader, and order type do not affect priority at
+        // an equal price. A later upgrade can introduce a total key together
+        // with the state/index changes needed to keep broad coalescing.
         debug_assert!(self.get_is_bid() == other.get_is_bid());
 
         if self.get_is_bid() {
@@ -307,7 +336,7 @@ mod test {
             OrderType::Limit,
         )
         .unwrap();
-        format!("{}", resting_order);
+        let _ = format!("{}", resting_order);
     }
 
     #[test]
@@ -357,6 +386,55 @@ mod test {
         .unwrap();
         assert!(resting_order_1 > resting_order_2);
         assert!(resting_order_1 != resting_order_2);
+    }
+
+    #[test]
+    fn same_price_orders_use_deployed_price_ordering() {
+        let first = RestingOrder::new(
+            1,
+            BaseAtoms::ONE,
+            1.0.try_into().unwrap(),
+            0,
+            NO_EXPIRATION_LAST_VALID_SLOT,
+            true,
+            OrderType::Reverse,
+        )
+        .unwrap();
+        let unrelated_same_price = RestingOrder::new(
+            2,
+            BaseAtoms::ONE,
+            first.get_price(),
+            0,
+            NO_EXPIRATION_LAST_VALID_SLOT,
+            true,
+            OrderType::Reverse,
+        )
+        .unwrap();
+        let unrelated_same_trader = RestingOrder::new(
+            1,
+            BaseAtoms::ONE,
+            first.get_price(),
+            0,
+            NO_EXPIRATION_LAST_VALID_SLOT,
+            true,
+            OrderType::ReverseTight,
+        )
+        .unwrap();
+
+        for unrelated in [unrelated_same_price, unrelated_same_trader] {
+            assert_ne!(first, unrelated);
+            assert_eq!(first.cmp(&unrelated), Ordering::Equal);
+        }
+    }
+
+    #[test]
+    fn invalid_order_type_byte_is_safe_and_detectable() {
+        let mut bytes: [u8; size_of::<RestingOrder>()] = [0_u8; size_of::<RestingOrder>()];
+        // order_type is byte 41 in the stable account layout.
+        bytes[41] = u8::MAX;
+        let order: RestingOrder = bytemuck::pod_read_unaligned::<RestingOrder>(&bytes);
+        assert!(!order.has_valid_order_type());
+        assert!(OrderType::try_from(u8::MAX).is_err());
     }
 
     #[test]

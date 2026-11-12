@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use borsh::BorshSerialize;
 use manifest::{
     program::{
         batch_update::BatchUpdateParams, deposit::DepositParams,
@@ -9,15 +10,16 @@ use manifest::{
     state::{MarketFixed, OrderType, NO_EXPIRATION_LAST_VALID_SLOT},
     validation::{get_global_address, get_global_vault_address, get_vault_address},
 };
+use solana_keypair::Keypair;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    system_instruction, system_program,
     sysvar::rent::Rent,
 };
 use solana_program_test::tokio;
-use solana_keypair::Keypair;
+use solana_sdk_ids::system_program;
 use solana_signer::Signer;
+use solana_system_interface::instruction as system_instruction;
 
 use crate::{
     send_tx_with_retry, GlobalFixture, MintFixture, Side, TestFixture, Token, TokenAccountFixture,
@@ -62,7 +64,7 @@ async fn bad_program_ids() -> anyhow::Result<()> {
                     AccountMeta::new(base_vault, false),
                     AccountMeta::new(quote_vault, false),
                     AccountMeta::new_readonly(Pubkey::new_unique(), false),
-                    AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
+                    AccountMeta::new_readonly(spl_token_2022::id(), false),
                 ],
                 data: [ManifestInstruction::CreateMarket.to_vec()].concat(),
             },
@@ -96,8 +98,8 @@ async fn bad_program_ids() -> anyhow::Result<()> {
                     AccountMeta::new_readonly(usdc_mint_key, false),
                     AccountMeta::new(base_vault, false),
                     AccountMeta::new(quote_vault, false),
-                    AccountMeta::new_readonly(spl_token_interface::id(), false),
-                    AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
+                    AccountMeta::new_readonly(spl_token::id(), false),
+                    AccountMeta::new_readonly(spl_token_2022::id(), false),
                 ],
                 data: [ManifestInstruction::CreateMarket.to_vec()].concat(),
             },
@@ -152,8 +154,8 @@ async fn create_market_wrong_vaults() -> anyhow::Result<()> {
                     AccountMeta::new_readonly(usdc_mint_key, false),
                     AccountMeta::new(fake_base_vault_keypair.pubkey(), false),
                     AccountMeta::new(quote_vault, false),
-                    AccountMeta::new_readonly(spl_token_interface::id(), false),
-                    AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
+                    AccountMeta::new_readonly(spl_token::id(), false),
+                    AccountMeta::new_readonly(spl_token_2022::id(), false),
                 ],
                 data: [ManifestInstruction::CreateMarket.to_vec()].concat(),
             },
@@ -188,8 +190,8 @@ async fn create_market_wrong_vaults() -> anyhow::Result<()> {
                     AccountMeta::new_readonly(usdc_mint_key, false),
                     AccountMeta::new(base_vault, false),
                     AccountMeta::new(fake_quote_vault_keypair.pubkey(), false),
-                    AccountMeta::new_readonly(spl_token_interface::id(), false),
-                    AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
+                    AccountMeta::new_readonly(spl_token::id(), false),
+                    AccountMeta::new_readonly(spl_token_2022::id(), false),
                 ],
                 data: [ManifestInstruction::CreateMarket.to_vec()].concat(),
             },
@@ -224,11 +226,12 @@ async fn deposit_fail_missing_signer() -> anyhow::Result<()> {
             AccountMeta::new(test_fixture.market_fixture.key, false),
             AccountMeta::new(user_token_account, false),
             AccountMeta::new(user_token_account, false),
-            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
         ],
         data: [
             ManifestInstruction::Deposit.to_vec(),
-            borsh::to_vec(&DepositParams::new(SOL_UNIT_SIZE, None))
+            DepositParams::new(SOL_UNIT_SIZE, None)
+                .try_to_vec()
                 .unwrap(),
         ]
         .concat(),
@@ -300,16 +303,16 @@ async fn swap_wrong_token_accounts() -> anyhow::Result<()> {
             accounts: vec![
                 AccountMeta::new(*payer, true),
                 AccountMeta::new(*market, false),
-                AccountMeta::new(system_program::id(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
                 AccountMeta::new(base_vault, false),
                 AccountMeta::new(*trader_quote_account, false),
                 AccountMeta::new(base_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new_readonly(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::Swap.to_vec(),
-                borsh::to_vec(&SwapParams::new(1_000, 0, true, true)).unwrap(),
+                SwapParams::new(1_000, 0, true, true).try_to_vec().unwrap(),
             ]
             .concat(),
         };
@@ -329,16 +332,16 @@ async fn swap_wrong_token_accounts() -> anyhow::Result<()> {
             accounts: vec![
                 AccountMeta::new(*payer, true),
                 AccountMeta::new(*market, false),
-                AccountMeta::new(system_program::id(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
                 AccountMeta::new(*trader_base_account, false),
                 AccountMeta::new(*trader_quote_account, false),
                 AccountMeta::new(*trader_base_account, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new_readonly(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::Swap.to_vec(),
-                borsh::to_vec(&SwapParams::new(1_000, 0, true, true)).unwrap(),
+                SwapParams::new(1_000, 0, true, true).try_to_vec().unwrap(),
             ]
             .concat(),
         };
@@ -358,16 +361,16 @@ async fn swap_wrong_token_accounts() -> anyhow::Result<()> {
             accounts: vec![
                 AccountMeta::new(*payer, true),
                 AccountMeta::new(*market, false),
-                AccountMeta::new(system_program::id(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
                 AccountMeta::new(*trader_base_account, false),
                 AccountMeta::new(*trader_quote_account, false),
                 AccountMeta::new(base_vault, false),
                 AccountMeta::new(*trader_quote_account, false),
-                AccountMeta::new_readonly(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::Swap.to_vec(),
-                borsh::to_vec(&SwapParams::new(1_000, 0, true, true)).unwrap(),
+                SwapParams::new(1_000, 0, true, true).try_to_vec().unwrap(),
             ]
             .concat(),
         };
@@ -390,18 +393,18 @@ async fn swap_wrong_token_accounts() -> anyhow::Result<()> {
             accounts: vec![
                 AccountMeta::new(*payer, true),
                 AccountMeta::new(*market, false),
-                AccountMeta::new(system_program::id(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
                 AccountMeta::new(*trader_base_account, false),
                 AccountMeta::new(*trader_quote_account, false),
                 AccountMeta::new(base_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new_readonly(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new(*global, false),
                 AccountMeta::new(global_vault, false),
             ],
             data: [
                 ManifestInstruction::Swap.to_vec(),
-                borsh::to_vec(&SwapParams::new(1_000, 0, true, true)).unwrap(),
+                SwapParams::new(1_000, 0, true, true).try_to_vec().unwrap(),
             ]
             .concat(),
         };
@@ -423,18 +426,18 @@ async fn swap_wrong_token_accounts() -> anyhow::Result<()> {
             accounts: vec![
                 AccountMeta::new(*payer, true),
                 AccountMeta::new(*market, false),
-                AccountMeta::new(system_program::id(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
                 AccountMeta::new(*trader_base_account, false),
                 AccountMeta::new(*trader_quote_account, false),
                 AccountMeta::new(base_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new_readonly(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new(*global, false),
                 AccountMeta::new(quote_vault, false),
             ],
             data: [
                 ManifestInstruction::Swap.to_vec(),
-                borsh::to_vec(&SwapParams::new(1_000, 0, true, true)).unwrap(),
+                SwapParams::new(1_000, 0, true, true).try_to_vec().unwrap(),
             ]
             .concat(),
         };
@@ -459,18 +462,18 @@ async fn swap_wrong_token_accounts() -> anyhow::Result<()> {
             accounts: vec![
                 AccountMeta::new(*payer, true),
                 AccountMeta::new(*market, false),
-                AccountMeta::new(system_program::id(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
                 AccountMeta::new(*trader_base_account, false),
                 AccountMeta::new(*trader_quote_account, false),
                 AccountMeta::new(base_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new_readonly(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new(*global, false),
                 AccountMeta::new(global_vault, false),
             ],
             data: [
                 ManifestInstruction::Swap.to_vec(),
-                borsh::to_vec(&SwapParams::new(1_000, 0, true, true)).unwrap(),
+                SwapParams::new(1_000, 0, true, true).try_to_vec().unwrap(),
             ]
             .concat(),
         };
@@ -494,18 +497,18 @@ async fn swap_wrong_token_accounts() -> anyhow::Result<()> {
             accounts: vec![
                 AccountMeta::new(*payer, true),
                 AccountMeta::new(*market, false),
-                AccountMeta::new(system_program::id(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
                 AccountMeta::new(*trader_base_account, false),
                 AccountMeta::new(*trader_quote_account, false),
                 AccountMeta::new(base_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new_readonly(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new(empty_global_keypair.pubkey(), false),
                 AccountMeta::new(empty_global_keypair.pubkey(), false),
             ],
             data: [
                 ManifestInstruction::Swap.to_vec(),
-                borsh::to_vec(&SwapParams::new(1_000, 0, true, true)).unwrap(),
+                SwapParams::new(1_000, 0, true, true).try_to_vec().unwrap(),
             ]
             .concat(),
         };
@@ -553,16 +556,17 @@ async fn batch_update_wrong_global_accounts() -> anyhow::Result<()> {
                 AccountMeta::new(base_global, false),
                 AccountMeta::new(base_global_vault, false),
                 AccountMeta::new(base_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new_readonly(quote_mint, false),
                 AccountMeta::new(quote_global, false),
                 AccountMeta::new(quote_global_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::BatchUpdate.to_vec(),
-                borsh::to_vec(&BatchUpdateParams::new(None, vec![], vec![]))
+                BatchUpdateParams::new(None, vec![], vec![])
+                    .try_to_vec()
                     .unwrap(),
             ]
             .concat(),
@@ -589,16 +593,17 @@ async fn batch_update_wrong_global_accounts() -> anyhow::Result<()> {
                 AccountMeta::new(base_global, false),
                 AccountMeta::new(base_global_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new_readonly(quote_mint, false),
                 AccountMeta::new(quote_global, false),
                 AccountMeta::new(quote_global_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::BatchUpdate.to_vec(),
-                borsh::to_vec(&BatchUpdateParams::new(None, vec![], vec![]))
+                BatchUpdateParams::new(None, vec![], vec![])
+                    .try_to_vec()
                     .unwrap(),
             ]
             .concat(),
@@ -624,16 +629,17 @@ async fn batch_update_wrong_global_accounts() -> anyhow::Result<()> {
                 AccountMeta::new(base_global, false),
                 AccountMeta::new(quote_global_vault, false),
                 AccountMeta::new(base_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new_readonly(quote_mint, false),
                 AccountMeta::new(quote_global, false),
                 AccountMeta::new(quote_global_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::BatchUpdate.to_vec(),
-                borsh::to_vec(&BatchUpdateParams::new(None, vec![], vec![]))
+                BatchUpdateParams::new(None, vec![], vec![])
+                    .try_to_vec()
                     .unwrap(),
             ]
             .concat(),
@@ -659,16 +665,17 @@ async fn batch_update_wrong_global_accounts() -> anyhow::Result<()> {
                 AccountMeta::new(base_global, false),
                 AccountMeta::new(base_global_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new_readonly(quote_mint, false),
                 AccountMeta::new(quote_global, false),
                 AccountMeta::new(quote_global_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::BatchUpdate.to_vec(),
-                borsh::to_vec(&BatchUpdateParams::new(None, vec![], vec![]))
+                BatchUpdateParams::new(None, vec![], vec![])
+                    .try_to_vec()
                     .unwrap(),
             ]
             .concat(),
@@ -699,16 +706,17 @@ async fn batch_update_wrong_global_accounts() -> anyhow::Result<()> {
                 AccountMeta::new(base_global, false),
                 AccountMeta::new(base_global_vault, false),
                 AccountMeta::new(base_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new_readonly(quote_mint, false),
                 AccountMeta::new(*global, false),
                 AccountMeta::new(global_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::BatchUpdate.to_vec(),
-                borsh::to_vec(&BatchUpdateParams::new(None, vec![], vec![]))
+                BatchUpdateParams::new(None, vec![], vec![])
+                    .try_to_vec()
                     .unwrap(),
             ]
             .concat(),
@@ -738,16 +746,17 @@ async fn batch_update_wrong_global_accounts() -> anyhow::Result<()> {
                 AccountMeta::new(base_global, false),
                 AccountMeta::new(base_global_vault, false),
                 AccountMeta::new(base_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new_readonly(quote_mint, false),
                 AccountMeta::new(empty_global_keypair.pubkey(), false),
                 AccountMeta::new(empty_global_keypair.pubkey(), false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::BatchUpdate.to_vec(),
-                borsh::to_vec(&BatchUpdateParams::new(None, vec![], vec![]))
+                BatchUpdateParams::new(None, vec![], vec![])
+                    .try_to_vec()
                     .unwrap(),
             ]
             .concat(),
@@ -785,12 +794,12 @@ async fn global_deposit_fail_incorrect_vault_test() -> anyhow::Result<()> {
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new(trader_token_account, false),
             AccountMeta::new(trader_token_account, false),
-            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
         ],
         data: [
             ManifestInstruction::GlobalDeposit.to_vec(),
             // 0 atoms, so would succeed otherwise.
-            borsh::to_vec(&GlobalDepositParams::new(0)).unwrap(),
+            GlobalDepositParams::new(0).try_to_vec().unwrap(),
         ]
         .concat(),
     };
@@ -826,12 +835,12 @@ async fn global_withdraw_fail_incorrect_vault_test() -> anyhow::Result<()> {
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new(trader_token_account, false),
             AccountMeta::new(trader_token_account, false),
-            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
         ],
         data: [
             ManifestInstruction::GlobalWithdraw.to_vec(),
             // 0 atoms, so would succeed otherwise.
-            borsh::to_vec(&GlobalWithdrawParams::new(0)).unwrap(),
+            GlobalWithdrawParams::new(0).try_to_vec().unwrap(),
         ]
         .concat(),
     };
@@ -892,11 +901,11 @@ async fn global_evict_loader() -> anyhow::Result<()> {
                 AccountMeta::new(wrong_global_vault, false),
                 AccountMeta::new(evictor_account_fixture.key, false),
                 AccountMeta::new(evictee_account_fixture.key, false),
-                AccountMeta::new_readonly(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::GlobalEvict.to_vec(),
-                borsh::to_vec(&GlobalDepositParams::new(1_000_000)).unwrap(),
+                GlobalDepositParams::new(1_000_000).try_to_vec().unwrap(),
             ]
             .concat(),
         }],
@@ -940,16 +949,17 @@ async fn loader_helpers() -> anyhow::Result<()> {
                 AccountMeta::new(base_global, false),
                 AccountMeta::new(base_global_vault, false),
                 AccountMeta::new(base_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
                 AccountMeta::new_readonly(quote_mint, false),
                 AccountMeta::new(quote_global, false),
                 AccountMeta::new(quote_global_vault, false),
                 AccountMeta::new(quote_vault, false),
-                AccountMeta::new(spl_token_interface::id(), false),
+                AccountMeta::new_readonly(spl_token::id(), false),
             ],
             data: [
                 ManifestInstruction::BatchUpdate.to_vec(),
-                borsh::to_vec(&BatchUpdateParams::new(None, vec![], vec![]))
+                BatchUpdateParams::new(None, vec![], vec![])
+                    .try_to_vec()
                     .unwrap(),
             ]
             .concat(),

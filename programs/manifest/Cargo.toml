@@ -1,11 +1,14 @@
 [package]
 name = "manifest-dex"
-version = "3.0.9"
+version = "3.1.0"
 edition = "2021"
-repository = "https://github.com/CKS-systems/manifest"
-authors = ["Britt Cyr <britt@cks.systems>"]
+repository = "https://github.com/Bonasa-Tech/manifest"
+authors = ["Britt Cyr <britt@manifest.trade>"]
 description = "Onchain orderbook optimized for space and accounts"
 license-file = "LICENSE"
+
+[lints]
+workspace = true
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -16,67 +19,62 @@ no-entrypoint = []
 cpi = ["no-entrypoint"]
 default = []
 test = []
+test-sbf = []
 fuzz = []
 trace = ["hypertree/trace"]
 no-clock = []
-certora = [
-    "no-entrypoint",
-    "dep:cvt",
-    "dep:nondet",
-    "dep:cvt-macros",
-    "dep:early-panic",
-    "dep:calltrace",
-    "dep:solana_cvt",
-    "dep:vectors",
-    "dep:hook_macro",
-    "hypertree/certora",
-    "dep:cvlr",
-]
-certora-test = ["certora"]
+certora = ["no-entrypoint", "dep:cvt", "dep:nondet", "dep:cvt-macros", "dep:early-panic", "dep:calltrace", "dep:solana_cvt", "dep:vectors", "dep:hook_macro",
+           "hypertree/certora", "dep:cvlr"]
 certora_vacuity = ["cvt/vacuity"]
-
-[lints]
-workspace = true
 
 [dependencies]
 hypertree = { path = "../../lib" }
 # Cannot use workspace because the generator needs to see a version here
 shank = "0.4.2"
-spl-token-interface = { workspace = true }
+spl-token = { workspace = true, features = ["no-entrypoint"] }
+spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
 spl-token-2022-interface = { workspace = true }
 solana-program = { workspace = true }
+solana-sdk-ids = { workspace = true }
+solana-system-interface = { workspace = true }
 borsh = { workspace = true }
 bytemuck = { workspace = true }
 num_enum = { workspace = true }
 thiserror = { workspace = true }
 solana-security-txt = { workspace = true }
 static_assertions = { workspace = true }
-nondet = { workspace = true, optional = true }
-cvt = { workspace = true, optional = true }
-cvt-macros = { workspace = true, optional = true }
-early-panic = { workspace = true, optional = true }
-calltrace = { workspace = true, optional = true }
-solana_cvt = { workspace = true, optional = true }
-vectors = { workspace = true, optional = true }
-hook_macro = { workspace = true, optional = true }
+nondet = { workspace = true, optional = true, features = ["pinocchio_accounts"] }
+cvt = { workspace = true, optional = true}
+cvt-macros = { workspace = true, optional = true}
+early-panic = { workspace = true, optional = true}
+calltrace = { workspace = true, optional = true}
+solana_cvt = { workspace = true, optional = true}
+vectors = { workspace = true, optional = true}
+hook_macro = { workspace = true, optional = true}
+arrayref = { workspace = true}
 solana-invoke = { workspace = true }
-cvlr = { workspace = true, optional = true }
+pinocchio = { workspace = true }
+pinocchio-system = { workspace = true }
+pinocchio-token = { workspace = true }
+solana-curve25519 = { workspace = true }
+cvlr = { version = "0.4", optional = true } 
 
 [dev-dependencies]
 anyhow = { workspace = true }
-solana-account = { workspace = true }
-solana-account-info = { workspace = true }
-solana-compute-budget-interface = { workspace = true }
-solana-keypair = { workspace = true }
-solana-program-pack = { workspace = true }
-solana-pubkey = { workspace = true }
 solana-program-test = { workspace = true }
 solana-logger = { workspace = true }
+solana-account = { workspace = true }
+solana-keypair = { workspace = true }
 solana-signer = { workspace = true }
 solana-transaction = { workspace = true }
+solana-clock = { workspace = true }
+solana-instruction = { workspace = true }
+solana-compute-budget-interface = { workspace = true }
+base64 = "0.21"
 tokio = { workspace = true }
 serde_json = "1.0.86"
-spl-associated-token-account-interface = { workspace = true }
+five8_core = { workspace = true }
+spl-associated-token-account = { version = "8", features = ["no-entrypoint"] }
 
 [package.metadata.certora]
 sources = ["src/**/*.rs"]

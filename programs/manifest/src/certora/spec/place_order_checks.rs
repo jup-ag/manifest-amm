@@ -1,9 +1,9 @@
-use crate::*;
-use cvt::cvt::{cvt_assume, cvt_vacuity_check};
+use crate::{validation::AccountViewExt, *};
+use cvt::cvt_assume;
 use cvt_macros::rule;
 use nondet::*;
 
-use solana_program::account_info::AccountInfo;
+use pinocchio::account::AccountView;
 
 use state::main_trader_index;
 
@@ -15,21 +15,36 @@ use crate::{
         market::market_helpers::{AddOrderStatus, AddOrderToMarketInnerResult, AddSingleOrderCtx},
         AddOrderToMarketArgs, DynamicAccount, MarketRefMut,
     },
+    validation::loaders::GlobalTradeAccounts,
 };
 use hypertree::DataIndex;
 
-pub fn place_single_order_nondet_inputs<const IS_BID: bool>(
-    market_info: &AccountInfo,
-) -> (AddOrderToMarketArgs<'static, 'static>, BaseAtoms, u32) {
+pub fn place_single_order_nondet_inputs<'a, const IS_BID: bool>(
+    market_info: &'a AccountView,
+) -> (AddOrderToMarketArgs<'a>, BaseAtoms, u32) {
+    place_single_order_nondet_inputs_with_type::<IS_BID>(
+        market_info,
+        state::OrderType::Limit,
+        &[None, None],
+    )
+}
+
+/// Nondeterministic inputs for a taker of the given order type, matching
+/// against whatever the global accounts allow.
+pub fn place_single_order_nondet_inputs_with_type<'a, const IS_BID: bool>(
+    market_info: &'a AccountView,
+    order_type: state::OrderType,
+    global_trade_accounts_opts: &'a [Option<GlobalTradeAccounts<'a>>; 2],
+) -> (AddOrderToMarketArgs<'a>, BaseAtoms, u32) {
     let args: AddOrderToMarketArgs = AddOrderToMarketArgs {
-        market: *market_info.key,
+        market: market_info.pubkey(),
         trader_index: main_trader_index(),
         num_base_atoms: nondet(),
         price: QuoteAtomsPerBaseAtom::nondet_price_u32(),
         is_bid: IS_BID,
         last_valid_slot: nondet(),
-        order_type: state::OrderType::Limit,
-        global_trade_accounts_opts: &[None, None],
+        order_type,
+        global_trade_accounts_opts,
         current_slot: Some(nondet()),
     };
     let remaining_base_atoms: BaseAtoms = nondet();
@@ -40,12 +55,12 @@ pub fn place_single_order_nondet_inputs<const IS_BID: bool>(
 pub fn place_single_order_canceled_check<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
-    let trader: &AccountInfo = &acc_infos[0];
-    let market_info: &AccountInfo = &acc_infos[1];
-    let maker_trader: &AccountInfo = &acc_infos[7];
-    let vault_base_token: &AccountInfo = &acc_infos[8];
-    let vault_quote_token: &AccountInfo = &acc_infos[9];
+    let acc_infos: [AccountView; 16] = account_views_with_mem_layout!();
+    let trader: &AccountView = &acc_infos[0];
+    let market_info: &AccountView = &acc_infos[1];
+    let maker_trader: &AccountView = &acc_infos[7];
+    let vault_base_token: &AccountView = &acc_infos[8];
+    let vault_quote_token: &AccountView = &acc_infos[9];
 
     // -- market preconditions
     let maker_order_index: DataIndex = cvt_assume_market_preconditions::<IS_BID>(
@@ -112,13 +127,13 @@ pub fn rule_place_single_order_canceled_ask() {
 pub fn place_single_order_unmatched_check<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
-    let trader: &AccountInfo = &acc_infos[0];
-    let market_info: &AccountInfo = &acc_infos[1];
+    let acc_infos: [AccountView; 16] = account_views_with_mem_layout!();
+    let trader: &AccountView = &acc_infos[0];
+    let market_info: &AccountView = &acc_infos[1];
 
-    let maker_trader: &AccountInfo = &acc_infos[7];
-    let vault_base_token: &AccountInfo = &acc_infos[8];
-    let vault_quote_token: &AccountInfo = &acc_infos[9];
+    let maker_trader: &AccountView = &acc_infos[7];
+    let vault_base_token: &AccountView = &acc_infos[8];
+    let vault_quote_token: &AccountView = &acc_infos[9];
 
     let maker_order_index: DataIndex = cvt_assume_market_preconditions::<IS_BID>(
         market_info,
@@ -186,13 +201,13 @@ pub fn rule_place_single_order_unmatched_ask() {
 pub fn place_single_order_full_match_check<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
-    let trader: &AccountInfo = &acc_infos[0];
-    let market_info: &AccountInfo = &acc_infos[1];
+    let acc_infos: [AccountView; 16] = account_views_with_mem_layout!();
+    let trader: &AccountView = &acc_infos[0];
+    let market_info: &AccountView = &acc_infos[1];
 
-    let maker_trader: &AccountInfo = &acc_infos[7];
-    let vault_base_token: &AccountInfo = &acc_infos[8];
-    let vault_quote_token: &AccountInfo = &acc_infos[9];
+    let maker_trader: &AccountView = &acc_infos[7];
+    let vault_base_token: &AccountView = &acc_infos[8];
+    let vault_quote_token: &AccountView = &acc_infos[9];
 
     // -- market assumptions
 
@@ -203,6 +218,9 @@ pub fn place_single_order_full_match_check<const IS_BID: bool>() {
         vault_quote_token,
         maker_trader,
     );
+
+    // -- the exact deltas below only hold for a maker that does not reverse
+    cvt_assume_maker_not_reversible(maker_order_index);
 
     // -- record balances before place_single_order
 
@@ -267,13 +285,13 @@ pub fn rule_place_single_order_full_match_ask() {
 pub fn place_single_order_partial_match_check<const IS_BID: bool>() {
     cvt_static_initializer!();
 
-    let acc_infos: [AccountInfo; 16] = solana_cvt::acc_infos_with_mem_layout!();
-    let trader: &AccountInfo = &acc_infos[0];
-    let market_info: &AccountInfo = &acc_infos[1];
+    let acc_infos: [AccountView; 16] = account_views_with_mem_layout!();
+    let trader: &AccountView = &acc_infos[0];
+    let market_info: &AccountView = &acc_infos[1];
 
-    let maker_trader: &AccountInfo = &acc_infos[7];
-    let vault_base_token: &AccountInfo = &acc_infos[8];
-    let vault_quote_token: &AccountInfo = &acc_infos[9];
+    let maker_trader: &AccountView = &acc_infos[7];
+    let vault_base_token: &AccountView = &acc_infos[8];
+    let vault_quote_token: &AccountView = &acc_infos[9];
 
     // -- market preconditions
     let maker_order_index: DataIndex = cvt_assume_market_preconditions::<IS_BID>(
@@ -283,6 +301,9 @@ pub fn place_single_order_partial_match_check<const IS_BID: bool>() {
         vault_quote_token,
         maker_trader,
     );
+
+    // -- the exact deltas below only hold for a maker that does not reverse
+    cvt_assume_maker_not_reversible(maker_order_index);
 
     // -- record balances before place_single_order
     let balances_old: AllBalances = record_all_balances(

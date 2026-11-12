@@ -2,11 +2,15 @@ pub mod batch_update_checks;
 pub mod cancel_order_checks;
 pub mod deposit_checks;
 pub mod funds_checks;
+pub mod global_checks;
 pub mod market_checks;
 pub mod matching_checks;
 pub mod no_funds_loss_util;
+pub mod no_revert_checks;
+pub mod order_type_checks;
 pub mod place_order_checks;
 pub mod rbtree_checks;
+pub mod seat_pubkey_checks;
 pub mod swap_checks;
 pub mod withdraw_checks;
 
@@ -20,6 +24,7 @@ pub(crate) mod verification_utils {
     pub(crate) fn init_static() {
         crate::state::init_mock();
         crate::certora::hooks::initialize_hooks();
+        crate::certora::summaries::token::init_transfer_fee();
     }
 }
 

@@ -8,121 +8,171 @@ export type RedBlackTreeNodeHeader = {
   right: bignum;
   parent: bignum;
   color: bignum;
+  payloadType: bignum;
+  padding: bignum;
 };
+
 const NUM_TREE_HEADER_BYTES = 16;
+const TREE_NODE_ALIGNMENT = 8;
+
+export type RedBlackTreeParseContext = {
+  claimedBytes: Uint8Array;
+  parsedNodes: number;
+  maxNodes: number;
+};
+
+export type IndexedRedBlackTreeValue<Value> = {
+  index: number;
+  value: Value;
+};
+
+export function createRedBlackTreeParseContext(
+  dataLength: number,
+): RedBlackTreeParseContext {
+  return {
+    claimedBytes: new Uint8Array(dataLength),
+    parsedNodes: 0,
+    maxNodes: Math.floor(dataLength / NUM_TREE_HEADER_BYTES),
+  };
+}
 
 /**
- * Deserializes a RedBlackTree from a given buffer into a list
- * @description This deserializes the RedBlackTree defined in https://github.com/CKS-Systems/manifest/blob/main/src/state/red_black_tree.rs
- *
- * @param data The data buffer to deserialize
- * @param rootIndex Index in the buffer for the root
- * @param valueDeserializer The deserializer for the tree value
+ * Deserializes an account-backed red-black tree after validating every
+ * reachable node. RPC account bytes are untrusted, so malformed offsets and
+ * cycles must fail closed instead of reading truncated buffers or looping.
  */
 export function deserializeRedBlackTree<Value>(
   data: Buffer,
   rootIndex: number,
   valueDeserializer: BeetArgsStruct<Value>,
+  context: RedBlackTreeParseContext = createRedBlackTreeParseContext(
+    data.length,
+  ),
 ): Value[] {
-  const result: Value[] = [];
-  const [rootHeaderValue] = redBlackTreeHeaderBeet.deserialize(
-    data.subarray(rootIndex, rootIndex + NUM_TREE_HEADER_BYTES),
-  );
-
-  // Find the min
-  let currentHeader = rootHeaderValue;
-  let currentIndex = rootIndex;
-  while (toNum(currentHeader.left) != NIL) {
-    currentIndex = toNum(currentHeader.left);
-
-    const [currentHeaderTemp] = redBlackTreeHeaderBeet.deserialize(
-      data.subarray(currentIndex, currentIndex + NUM_TREE_HEADER_BYTES),
-    );
-    currentHeader = currentHeaderTemp;
-  }
-
-  // Keep going while there is a successor.
-  const [currentValue] = valueDeserializer.deserialize(
-    data.subarray(
-      currentIndex + NUM_TREE_HEADER_BYTES,
-      currentIndex + NUM_TREE_HEADER_BYTES + valueDeserializer.byteSize,
-    ),
-  );
-
-  result.push(currentValue);
-  while (getSuccessorIndex(data, currentIndex) != NIL) {
-    currentIndex = getSuccessorIndex(data, currentIndex);
-    const [currentValue] = valueDeserializer.deserialize(
-      data.subarray(
-        currentIndex + NUM_TREE_HEADER_BYTES,
-        currentIndex + NUM_TREE_HEADER_BYTES + valueDeserializer.byteSize,
-      ),
-    );
-    result.push(currentValue);
-  }
-
-  return result;
+  return deserializeRedBlackTreeWithIndices(
+    data,
+    rootIndex,
+    valueDeserializer,
+    context,
+  ).map(({ value }: IndexedRedBlackTreeValue<Value>): Value => value);
 }
 
-function getSuccessorIndex(data: Buffer, index: number) {
-  if (index == NIL) {
-    return NIL;
-  }
-  let [currentHeader] = redBlackTreeHeaderBeet.deserialize(
-    data.subarray(index, index + NUM_TREE_HEADER_BYTES),
-  );
-  let currentIndex = index;
-
-  // Successor is below, go right then all the way to the left.
-  if (toNum(currentHeader.right) != NIL) {
-    currentIndex = toNum(currentHeader.right);
-    currentHeader = redBlackTreeHeaderBeet.deserialize(
-      data.subarray(currentIndex, currentIndex + NUM_TREE_HEADER_BYTES),
-    )[0];
-    while (toNum(currentHeader.left) != NIL) {
-      currentIndex = toNum(currentHeader.left);
-      currentHeader = redBlackTreeHeaderBeet.deserialize(
-        data.subarray(currentIndex, currentIndex + NUM_TREE_HEADER_BYTES),
-      )[0];
-    }
-    return currentIndex;
+/**
+ * Deserializes a tree while retaining each value's dynamic-account offset.
+ * Cross-tree references must be matched against these validated node offsets;
+ * reading a payload directly from an otherwise in-bounds byte offset is unsafe.
+ */
+export function deserializeRedBlackTreeWithIndices<Value>(
+  data: Buffer,
+  rootIndex: number,
+  valueDeserializer: BeetArgsStruct<Value>,
+  context: RedBlackTreeParseContext = createRedBlackTreeParseContext(
+    data.length,
+  ),
+): IndexedRedBlackTreeValue<Value>[] {
+  if (rootIndex === NIL) {
+    return [];
   }
 
-  if (currentHeader.parent == NIL) {
-    return NIL;
+  const nodeSize = NUM_TREE_HEADER_BYTES + valueDeserializer.byteSize;
+  const headers = new Map<number, RedBlackTreeNodeHeader>();
+  const visiting = new Set<number>();
+  const visited = new Set<number>();
+
+  const readHeader = (index: number): RedBlackTreeNodeHeader => {
+    if (
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      index % TREE_NODE_ALIGNMENT !== 0 ||
+      index + nodeSize > data.length
+    ) {
+      throw new Error(`Invalid red-black tree node offset: ${index}`);
+    }
+    const cached = headers.get(index);
+    if (cached) return cached;
+    if (context.claimedBytes.length !== data.length) {
+      throw new Error('Red-black tree parse context has the wrong size');
+    }
+    for (let byte = index; byte < index + nodeSize; byte += 1) {
+      if (context.claimedBytes[byte] !== 0) {
+        throw new Error(
+          `Red-black tree node overlaps a previously parsed node at offset ${index}`,
+        );
+      }
+    }
+    if (context.parsedNodes >= context.maxNodes) {
+      throw new Error('Red-black tree aggregate node budget exceeded');
+    }
+    context.claimedBytes.fill(1, index, index + nodeSize);
+    context.parsedNodes += 1;
+    const [header] = redBlackTreeHeaderBeet.deserialize(
+      data.subarray(index, index + NUM_TREE_HEADER_BYTES),
+    );
+    const color = toNum(header.color);
+    if (color !== 0 && color !== 1) {
+      throw new Error(`Invalid red-black tree color at offset ${index}`);
+    }
+    headers.set(index, header);
+    return header;
+  };
+
+  // Avoid recursion: account data controls the number of reachable nodes, so
+  // a malformed but acyclic tree must not be able to exhaust the JS stack.
+  const validationStack: Array<{
+    index: number;
+    expectedParent: number;
+    complete: boolean;
+  }> = [{ index: rootIndex, expectedParent: NIL, complete: false }];
+  while (validationStack.length > 0) {
+    const { index, expectedParent, complete } = validationStack.pop()!;
+    if (index === NIL) continue;
+
+    if (complete) {
+      visiting.delete(index);
+      visited.add(index);
+      continue;
+    }
+    if (visiting.has(index) || visited.has(index)) {
+      throw new Error(
+        `Cycle or duplicate red-black tree node at offset ${index}`,
+      );
+    }
+
+    visiting.add(index);
+    const header = readHeader(index);
+    if (toNum(header.parent) !== expectedParent) {
+      throw new Error(`Invalid red-black tree parent at offset ${index}`);
+    }
+    validationStack.push({ index, expectedParent, complete: true });
+    validationStack.push({
+      index: toNum(header.right),
+      expectedParent: index,
+      complete: false,
+    });
+    validationStack.push({
+      index: toNum(header.left),
+      expectedParent: index,
+      complete: false,
+    });
   }
-  let [parentHeader] = redBlackTreeHeaderBeet.deserialize(
-    data.subarray(
-      toNum(currentHeader.parent),
-      toNum(currentHeader.parent) + NUM_TREE_HEADER_BYTES,
-    ),
-  );
-  // Successor is above, keep going up while we are the right child
-  while (toNum(parentHeader.right) == currentIndex) {
-    currentIndex = toNum(currentHeader.parent);
-    if (currentIndex == NIL) {
-      return NIL;
+
+  const result: IndexedRedBlackTreeValue<Value>[] = [];
+  const stack: number[] = [];
+  let current = rootIndex;
+  while (current !== NIL || stack.length > 0) {
+    while (current !== NIL) {
+      stack.push(current);
+      current = toNum(readHeader(current).left);
     }
-    currentHeader = redBlackTreeHeaderBeet.deserialize(
-      data.subarray(currentIndex, currentIndex + NUM_TREE_HEADER_BYTES),
-    )[0];
-    if (currentHeader.parent == NIL) {
-      return NIL;
-    }
-    parentHeader = redBlackTreeHeaderBeet.deserialize(
+    const index = stack.pop()!;
+    const [value] = valueDeserializer.deserialize(
       data.subarray(
-        toNum(currentHeader.parent),
-        toNum(currentHeader.parent) + NUM_TREE_HEADER_BYTES,
+        index + NUM_TREE_HEADER_BYTES,
+        index + NUM_TREE_HEADER_BYTES + valueDeserializer.byteSize,
       ),
-    )[0];
+    );
+    result.push({ index, value });
+    current = toNum(readHeader(index).right);
   }
-
-  // Go up once more.
-  currentHeader = redBlackTreeHeaderBeet.deserialize(
-    data.subarray(currentIndex, currentIndex + NUM_TREE_HEADER_BYTES),
-  )[0];
-  if (currentHeader.parent == NIL) {
-    return NIL;
-  }
-  return toNum(currentHeader.parent);
+  return result;
 }

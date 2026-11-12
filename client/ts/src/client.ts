@@ -1,3 +1,4 @@
+import { createDefragInstruction } from './manifest/instructions/Defrag';
 import { bignum } from '@metaplex-foundation/beet';
 import {
   PublicKey,
@@ -48,6 +49,7 @@ import { getVaultAddress } from './utils/market';
 import { genAccDiscriminator } from './utils/discriminator';
 import { getGlobalAddress, getGlobalVaultAddress } from './utils/global';
 import { Global } from './global';
+import { toBigInt, tokenAmountToAtoms } from './utils/numbers';
 
 export interface SetupData {
   setupNeeded: boolean;
@@ -64,6 +66,12 @@ const marketDiscriminator: Buffer = genAccDiscriminator(
   'manifest::state::market::MarketFixed',
 );
 
+export function isToken2022Program(programId: PublicKey): boolean {
+  if (programId.equals(TOKEN_2022_PROGRAM_ID)) return true;
+  if (programId.equals(TOKEN_PROGRAM_ID)) return false;
+  throw new Error(`Unsupported token program: ${programId}`);
+}
+
 export class ManifestClient {
   public isBase22: boolean;
   public isQuote22: boolean;
@@ -74,19 +82,23 @@ export class ManifestClient {
     public market: Market,
     private payer: PublicKey | null,
     private baseMint: Mint,
+    baseTokenProgram: PublicKey,
     private quoteMint: Mint,
+    quoteTokenProgram: PublicKey,
     // Globals are public. The expectation is that users will directly access
     // them, similar to the market.
     public baseGlobal: Global | null,
     public quoteGlobal: Global | null,
   ) {
-    // If no extension data then the mint is not Token2022
-    this.isBase22 = baseMint.tlvData.length > 0;
-    this.isQuote22 = quoteMint.tlvData.length > 0;
+    // The mint account owner is authoritative. Token-2022 mints are valid
+    // without extensions, so TLV length cannot identify their token program.
+    this.isBase22 = isToken2022Program(baseTokenProgram);
+    this.isQuote22 = isToken2022Program(quoteTokenProgram);
   }
 
   /**
-   * fetches all user wrapper accounts and returns the first or null if none are found
+   * fetches all user wrapper accounts and returns the first or null if none are found.
+   * First tries the stats server API for faster lookup, falls back to getProgramAccounts.
    *
    * @param connection Connection
    * @param payerPub PublicKey of the trader
@@ -97,6 +109,39 @@ export class ManifestClient {
     connection: Connection,
     payerPub: PublicKey,
   ): Promise<WrapperResponse | null> {
+    // First try the stats server API for faster lookup
+    try {
+      const response = await fetch(
+        `https://mfx-stats-mainnet.fly.dev/wrapper?owner=${payerPub.toBase58()}`,
+        { signal: AbortSignal.timeout(5_000) },
+      );
+      if (response.ok) {
+        const data = (await response.json()) as {
+          owner: string;
+          wrapper: string;
+        };
+        const wrapperPubkey = new PublicKey(data.wrapper);
+        const accountInfo = await connection.getAccountInfo(wrapperPubkey);
+        if (accountInfo?.owner.equals(WRAPPER_PROGRAM_ID)) {
+          const wrapperData = Wrapper.deserializeWrapperBuffer(
+            accountInfo.data,
+          );
+          if (!wrapperData.trader.equals(payerPub)) {
+            throw new Error(
+              'Stats service returned a wrapper for another trader',
+            );
+          }
+          return {
+            pubkey: wrapperPubkey,
+            account: accountInfo,
+          };
+        }
+      }
+    } catch {
+      // API call failed, fall back to getProgramAccounts
+    }
+
+    // Fall back to getProgramAccounts
     const existingWrappers = await connection.getProgramAccounts(
       WRAPPER_PROGRAM_ID,
       {
@@ -208,13 +253,16 @@ export class ManifestClient {
    * Get all market program accounts. This is expensive RPC load..
    *
    * @param connection Connection
+   * @param dataSlice Optional account-data slice for fixed-field consumers.
    * @returns GetProgramAccountsResponse
    */
   public static async getMarketProgramAccounts(
     connection: Connection,
+    dataSlice?: { offset: number; length: number },
   ): Promise<GetProgramAccountsResponse> {
     const accounts: GetProgramAccountsResponse =
       await connection.getProgramAccounts(PROGRAM_ID, {
+        ...(dataSlice === undefined ? {} : { dataSlice }),
         filters: [
           {
             memcmp: {
@@ -312,6 +360,7 @@ export class ManifestClient {
         connection,
         address: wrapperKeypair.publicKey,
       });
+      await marketObject.reload(connection);
 
       return new ManifestClient(
         connection,
@@ -319,7 +368,9 @@ export class ManifestClient {
         marketObject,
         payerKeypair.publicKey,
         baseMint,
+        baseMintAccountInfo.owner,
         quoteMint,
+        quoteMintAccountInfo.owner,
         baseGlobal,
         quoteGlobal,
       );
@@ -329,11 +380,21 @@ export class ManifestClient {
     const wrapperData: WrapperData = Wrapper.deserializeWrapperBuffer(
       userWrapper.account.data,
     );
+    if (!wrapperData.trader.equals(payerKeypair.publicKey)) {
+      throw new Error('Loaded wrapper does not belong to the requested payer');
+    }
     const existingMarketInfos: WrapperMarketInfo[] =
       wrapperData.marketInfos.filter((marketInfo: WrapperMarketInfo) => {
         return marketInfo.market.toBase58() == marketPk.toBase58();
       });
-    if (existingMarketInfos.length > 0) {
+    if (
+      existingMarketInfos.length > 0 &&
+      ManifestClient.hasCurrentSeat(
+        marketObject,
+        payerKeypair.publicKey,
+        existingMarketInfos[0],
+      )
+    ) {
       const wrapper = await Wrapper.loadFromAddress({
         connection,
         address: userWrapper.pubkey,
@@ -344,13 +405,15 @@ export class ManifestClient {
         marketObject,
         payerKeypair.publicKey,
         baseMint,
+        baseMintAccountInfo.owner,
         quoteMint,
+        quoteMintAccountInfo.owner,
         baseGlobal,
         quoteGlobal,
       );
     }
 
-    // There is a wrapper, but need to claim a seat.
+    // ClaimSeat also refreshes cached indices after a seat is moved or harvested.
     const claimSeatIx: TransactionInstruction = createClaimSeatInstruction({
       manifestProgram: MANIFEST_PROGRAM_ID,
       owner: payerKeypair.publicKey,
@@ -363,6 +426,7 @@ export class ManifestClient {
       connection,
       address: userWrapper.pubkey,
     });
+    await marketObject.reload(connection);
 
     return new ManifestClient(
       connection,
@@ -370,7 +434,9 @@ export class ManifestClient {
       marketObject,
       payerKeypair.publicKey,
       baseMint,
+      baseMintAccountInfo.owner,
       quoteMint,
+      quoteMintAccountInfo.owner,
       baseGlobal,
       quoteGlobal,
     );
@@ -443,11 +509,19 @@ export class ManifestClient {
         return marketInfo.market.toBase58() == marketPk.toBase58();
       });
     if (existingMarketInfos.length > 0) {
-      setupData.setupNeeded = false;
-      return setupData;
+      const market = await Market.loadFromAddress({
+        connection,
+        address: marketPk,
+      });
+      if (
+        ManifestClient.hasCurrentSeat(market, trader, existingMarketInfos[0])
+      ) {
+        setupData.setupNeeded = false;
+        return setupData;
+      }
     }
 
-    // There is a wrapper, but need to claim a seat.
+    // ClaimSeat also refreshes cached indices after a seat is moved or harvested.
     const claimSeatIx: TransactionInstruction = createClaimSeatInstruction({
       manifestProgram: MANIFEST_PROGRAM_ID,
       owner: trader,
@@ -457,6 +531,19 @@ export class ManifestClient {
     setupData.instructions.push(claimSeatIx);
 
     return setupData;
+  }
+
+  private static hasCurrentSeat(
+    market: Market,
+    trader: PublicKey,
+    marketInfo: WrapperMarketInfo,
+  ): boolean {
+    const seat = market
+      .claimedSeats()
+      .find((seat) => seat.publicKey.equals(trader));
+    return (
+      seat?.dataIndex !== undefined && seat.dataIndex === marketInfo.traderIndex
+    );
   }
 
   /**
@@ -534,7 +621,9 @@ export class ManifestClient {
       marketObject,
       trader,
       baseMint,
+      baseMintAccountInfo.owner,
       quoteMint,
+      quoteMintAccountInfo.owner,
       baseGlobal,
       quoteGlobal,
     );
@@ -576,15 +665,22 @@ export class ManifestClient {
         quoteGlobalPk,
       ]);
 
+    if (baseMintAccountInfo === null || quoteMintAccountInfo === null) {
+      const missingMintPk: PublicKey =
+        baseMintAccountInfo === null ? baseMintPk : quoteMintPk;
+      throw new Error(
+        `Mint ${missingMintPk.toBase58()} for market ${marketPk.toBase58()} does not exist. The mint account may have been closed by its issuer.`,
+      );
+    }
     const baseMint: Mint = unpackMint(
       baseMintPk,
       baseMintAccountInfo,
-      baseMintAccountInfo!.owner,
+      baseMintAccountInfo.owner,
     );
     const quoteMint: Mint = unpackMint(
       quoteMintPk,
       quoteMintAccountInfo,
-      quoteMintAccountInfo!.owner,
+      quoteMintAccountInfo.owner,
     );
 
     // Global accounts are optional
@@ -619,7 +715,9 @@ export class ManifestClient {
       marketObject,
       null,
       baseMint,
+      baseMintAccountInfo!.owner,
       quoteMint,
+      quoteMintAccountInfo!.owner,
       baseGlobal,
       quoteGlobal,
     );
@@ -744,7 +842,9 @@ export class ManifestClient {
         m,
         null,
         baseMint,
+        baseMintAccountInfo!.owner,
         quoteMint,
+        quoteMintAccountInfo!.owner,
         baseGlobal,
         quoteGlobal,
       );
@@ -756,21 +856,9 @@ export class ManifestClient {
    */
   public async reload(): Promise<void> {
     await Promise.all([
-      () => {
-        if (this.wrapper) {
-          return this.wrapper.reload(this.connection);
-        }
-      },
-      () => {
-        if (this.baseGlobal) {
-          return this.baseGlobal.reload(this.connection);
-        }
-      },
-      () => {
-        if (this.quoteGlobal) {
-          return this.quoteGlobal.reload(this.connection);
-        }
-      },
+      this.wrapper?.reload(this.connection),
+      this.baseGlobal?.reload(this.connection),
+      this.quoteGlobal?.reload(this.connection),
       this.market.reload(this.connection),
     ]);
   }
@@ -806,11 +894,53 @@ export class ManifestClient {
   }
 
   /**
+   * Collector-only atomic market compaction and rent recovery. May close an
+   * empty market.
+   *
+   * @param limit How many nodes this run relocates; omit for unbounded. An
+   * explicit 0 relocates nothing and only reclaims empty seats, which is
+   * never capped. Every bounded run leaves a valid market no larger than the
+   * one it started from, so a market too big to compact in one transaction is
+   * compacted by repeating the call. Simulate against current state to pick a
+   * value that fits the compute budget.
+   */
+  public defragIx(
+    collector: PublicKey,
+    limit?: number,
+  ): TransactionInstruction {
+    const ix: TransactionInstruction = createDefragInstruction({
+      collector,
+      market: this.market.address,
+      baseVault: getVaultAddress(this.market.address, this.baseMint.address),
+      quoteVault: getVaultAddress(this.market.address, this.quoteMint.address),
+      baseTokenProgram: this.isBase22
+        ? TOKEN_2022_PROGRAM_ID
+        : TOKEN_PROGRAM_ID,
+      quoteTokenProgram: this.isQuote22
+        ? TOKEN_2022_PROGRAM_ID
+        : TOKEN_PROGRAM_ID,
+    });
+    if (limit === undefined) {
+      return ix;
+    }
+    // The core reads an optional little endian u32 after the discriminator.
+    const budget: Buffer = Buffer.alloc(4);
+    budget.writeUInt32LE(limit);
+    return new TransactionInstruction({
+      programId: ix.programId,
+      keys: ix.keys,
+      data: Buffer.concat([ix.data, budget]),
+    });
+  }
+
+  /**
    * Deposit instruction
    *
    * @param payer PublicKey of the trader
    * @param mint PublicKey for deposit mint. Must be either the base or quote
-   * @param amountTokens Number of tokens to deposit.
+   * @param amountTokens Number of tokens to deposit. Values between atom
+   * boundaries are rounded to the nearest atom; use depositAtomsIx for exact
+   * integer sizing.
    *
    * @returns TransactionInstruction
    */
@@ -818,6 +948,24 @@ export class ManifestClient {
     payer: PublicKey,
     mint: PublicKey,
     amountTokens: number,
+  ): TransactionInstruction {
+    const mintDecimals: number =
+      this.market.quoteMint().toBase58() === mint.toBase58()
+        ? this.market.quoteDecimals()
+        : this.market.baseDecimals();
+    const amountAtoms: bignum = tokenAmountToAtoms(
+      amountTokens,
+      mintDecimals,
+      'round',
+    );
+    return this.depositAtomsIx(payer, mint, amountAtoms);
+  }
+
+  /** Build a deposit from an exact integer atom amount. */
+  public depositAtomsIx(
+    payer: PublicKey,
+    mint: PublicKey,
+    amountAtoms: bignum,
   ): TransactionInstruction {
     if (!this.wrapper || !this.payer) {
       throw new Error('Read only');
@@ -832,12 +980,6 @@ export class ManifestClient {
       true,
       is22 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
     );
-    const mintDecimals =
-      this.market.quoteMint().toBase58() === mint.toBase58()
-        ? this.market.quoteDecimals()
-        : this.market.baseDecimals();
-    const amountAtoms = Math.ceil(amountTokens * 10 ** mintDecimals);
-
     return createDepositInstruction(
       {
         market: this.market.address,
@@ -862,7 +1004,8 @@ export class ManifestClient {
    *
    * @param payer PublicKey of the trader
    * @param mint PublicKey for withdraw mint. Must be either the base or quote
-   * @param amountTokens Number of tokens to withdraw.
+   * @param amountTokens Number of tokens to withdraw. Values between atom
+   * boundaries are rounded down; use withdrawAtomsIx for exact integer sizing.
    *
    * @returns TransactionInstruction
    */
@@ -870,6 +1013,24 @@ export class ManifestClient {
     payer: PublicKey,
     mint: PublicKey,
     amountTokens: number,
+  ): TransactionInstruction {
+    const mintDecimals: number =
+      this.market.quoteMint().toBase58() === mint.toBase58()
+        ? this.market.quoteDecimals()
+        : this.market.baseDecimals();
+    const amountAtoms: bignum = tokenAmountToAtoms(
+      amountTokens,
+      mintDecimals,
+      'floor',
+    );
+    return this.withdrawAtomsIx(payer, mint, amountAtoms);
+  }
+
+  /** Build a withdrawal from an exact integer atom amount. */
+  public withdrawAtomsIx(
+    payer: PublicKey,
+    mint: PublicKey,
+    amountAtoms: bignum,
   ): TransactionInstruction {
     if (!this.wrapper || !this.payer) {
       throw new Error('Read only');
@@ -884,12 +1045,6 @@ export class ManifestClient {
       true,
       is22 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
     );
-    const mintDecimals =
-      this.market.quoteMint().toBase58() === mint.toBase58()
-        ? this.market.quoteDecimals()
-        : this.market.baseDecimals();
-    const amountAtoms = Math.floor(amountTokens * 10 ** mintDecimals);
-
     return createWithdrawInstruction(
       {
         market: this.market.address,
@@ -920,28 +1075,28 @@ export class ManifestClient {
     }
     const withdrawInstructions: TransactionInstruction[] = [];
 
-    const baseBalance = this.market.getWithdrawableBalanceTokens(
+    const baseBalanceAtoms: bignum = this.market.getWithdrawableBalanceAtoms(
       this.payer,
       true,
     );
-    if (baseBalance > 0) {
-      const baseWithdrawIx = this.withdrawIx(
+    if (toBigInt(baseBalanceAtoms) > 0n) {
+      const baseWithdrawIx: TransactionInstruction = this.withdrawAtomsIx(
         this.payer,
         this.market.baseMint(),
-        baseBalance,
+        baseBalanceAtoms,
       );
       withdrawInstructions.push(baseWithdrawIx);
     }
 
-    const quoteBalance = this.market.getWithdrawableBalanceTokens(
+    const quoteBalanceAtoms: bignum = this.market.getWithdrawableBalanceAtoms(
       this.payer,
       false,
     );
-    if (quoteBalance > 0) {
-      const quoteWithdrawIx = this.withdrawIx(
+    if (toBigInt(quoteBalanceAtoms) > 0n) {
+      const quoteWithdrawIx: TransactionInstruction = this.withdrawAtomsIx(
         this.payer,
         this.market.quoteMint(),
-        quoteBalance,
+        quoteBalanceAtoms,
       );
       withdrawInstructions.push(quoteWithdrawIx);
     }
@@ -968,7 +1123,83 @@ export class ManifestClient {
     if (!this.wrapper || !this.payer) {
       throw new Error('Read only');
     }
+
+    // Check if global accounts exist for this market
+    const hasQuoteGlobal = this.quoteGlobal !== null;
+    const hasBaseGlobal = this.baseGlobal !== null;
+
+    // For non-Global order types, we might still need to include global accounts
+    // because the counterparty (maker) might be using a global order
     if (params.orderType != OrderType.Global) {
+      // Bid (buy) orders need base global (sellers might use base global)
+      if (params.isBid && hasBaseGlobal) {
+        const global: PublicKey = getGlobalAddress(this.baseMint.address);
+        const globalVault: PublicKey = getGlobalVaultAddress(
+          this.baseMint.address,
+        );
+        const vault: PublicKey = getVaultAddress(
+          this.market.address,
+          this.baseMint.address,
+        );
+        return createBatchUpdateBaseGlobalInstruction(
+          {
+            market: this.market.address,
+            manifestProgram: MANIFEST_PROGRAM_ID,
+            owner: this.payer,
+            wrapperState: this.wrapper.address,
+            baseMint: this.baseMint.address,
+            baseGlobal: global,
+            baseGlobalVault: globalVault,
+            baseMarketVault: vault,
+            baseTokenProgram: this.isBase22
+              ? TOKEN_2022_PROGRAM_ID
+              : TOKEN_PROGRAM_ID,
+          },
+          {
+            params: {
+              cancels: [],
+              cancelAll: false,
+              orders: [toWrapperPlaceOrderParams(this.market, params)],
+            },
+          },
+        );
+      }
+
+      // Ask (sell) orders need quote global (buyers might use quote global)
+      if (!params.isBid && hasQuoteGlobal) {
+        const global: PublicKey = getGlobalAddress(this.quoteMint.address);
+        const globalVault: PublicKey = getGlobalVaultAddress(
+          this.quoteMint.address,
+        );
+        const vault: PublicKey = getVaultAddress(
+          this.market.address,
+          this.quoteMint.address,
+        );
+        return createBatchUpdateQuoteGlobalInstruction(
+          {
+            market: this.market.address,
+            manifestProgram: MANIFEST_PROGRAM_ID,
+            owner: this.payer,
+            wrapperState: this.wrapper.address,
+            quoteMint: this.quoteMint.address,
+            quoteGlobal: global,
+            quoteGlobalVault: globalVault,
+            quoteMarketVault: vault,
+            quoteTokenProgram: this.isQuote22
+              ? TOKEN_2022_PROGRAM_ID
+              : TOKEN_PROGRAM_ID,
+          },
+          {
+            params: {
+              cancels: [],
+              cancelAll: false,
+              orders: [toWrapperPlaceOrderParams(this.market, params)],
+            },
+          },
+        );
+      }
+
+      // No global accounts exist or not needed - use regular batch update
       return createBatchUpdateInstruction(
         {
           market: this.market.address,
@@ -1243,7 +1474,7 @@ export class ManifestClient {
     pks.add(baseGlobalVault.toString());
 
     const quoteGlobalVault: PublicKey = getGlobalVaultAddress(
-      this.baseMint.address,
+      this.quoteMint.address,
     );
     pks.add(quoteGlobalVault.toString());
 
@@ -1295,6 +1526,9 @@ export class ManifestClient {
    * @param params WrapperCancelOrderParams[] includes the clientOrderId of the
    * order to cancel.
    *
+   * A batch that places any global or reverse order pays a flat 5000-lamport
+   * fee to the market on top of rent and gas prepayments.
+   *
    * @returns TransactionInstruction
    */
   public batchUpdateIx(
@@ -1308,24 +1542,46 @@ export class ManifestClient {
     if (!this.wrapper || !this.payer) {
       throw new Error('Read only');
     }
-    const baseGlobalRequired: boolean = placeParams.some(
-      (
-        placeParams:
-          | WrapperPlaceOrderParamsExternal
-          | WrapperPlaceOrderReverseParamsExternal,
-      ) => {
-        return !placeParams.isBid && placeParams.orderType == OrderType.Global;
-      },
-    );
-    const quoteGlobalRequired: boolean = placeParams.some(
-      (
-        placeParams:
-          | WrapperPlaceOrderParamsExternal
-          | WrapperPlaceOrderReverseParamsExternal,
-      ) => {
-        return placeParams.isBid && placeParams.orderType == OrderType.Global;
-      },
-    );
+    // Check if base global is needed:
+    // 1. Bid orders (non-Global) might match with makers using base global
+    // 2. Ask orders with Global orderType use their own base global
+    // 3. Any cancel may remove an existing base-funded Global order
+    const baseGlobalRequired: boolean =
+      this.baseGlobal !== null &&
+      (cancelAll ||
+        cancelParams.length > 0 ||
+        placeParams.some(
+          (
+            placeParams:
+              | WrapperPlaceOrderParamsExternal
+              | WrapperPlaceOrderReverseParamsExternal,
+          ) => {
+            return (
+              placeParams.isBid ||
+              (!placeParams.isBid && placeParams.orderType === OrderType.Global)
+            );
+          },
+        ));
+    // Check if quote global is needed:
+    // 1. Ask orders (non-Global) might match with makers using quote global
+    // 2. Bid orders with Global orderType use their own quote global
+    // 3. Any cancel may remove an existing quote-funded Global order
+    const quoteGlobalRequired: boolean =
+      this.quoteGlobal !== null &&
+      (cancelAll ||
+        cancelParams.length > 0 ||
+        placeParams.some(
+          (
+            placeParams:
+              | WrapperPlaceOrderParamsExternal
+              | WrapperPlaceOrderReverseParamsExternal,
+          ) => {
+            return (
+              !placeParams.isBid ||
+              (placeParams.isBid && placeParams.orderType === OrderType.Global)
+            );
+          },
+        ));
     if (!baseGlobalRequired && !quoteGlobalRequired) {
       return createBatchUpdateInstruction(
         {
@@ -1480,11 +1736,10 @@ export class ManifestClient {
   }
 
   /**
-   * CancelAll instruction. Cancels all orders on a market. This is discouraged
-   * outside of circuit breaker usage because it is less efficient and does not
-   * cancel global cleanly. Use batchUpdate instead. This also does not cancel
-   * any orders not placed through the wrapper, which includes reverse orders
-   * that were reversed.
+   * CancelAll instruction. Cancels wrapper-tracked orders and searches the
+   * full core book for this trader's direct-core orders. This matches the
+   * deployed wrapper behavior; very large books can consume substantial CU.
+   * Global cancellation can abandon its gas prepayment.
    *
    * @returns TransactionInstruction
    */
@@ -1513,12 +1768,49 @@ export class ManifestClient {
   }
 
   /**
-   * CancelAllOnCore instruction. Cancels all orders on a market directly on the core program,
-   * including reverse orders and global orders with rent prepayment.
+   * Whether the wrapper's latest reloaded view has no tracked orders left for
+   * this market. This does not prove that every direct-core order was removed
+   * if the instruction failed or the market changed after confirmation.
    *
+   * Call reload() after confirming cancelAllIx() before reading this value.
+   */
+  public isCancelAllScanComplete(): boolean {
+    if (!this.wrapper) {
+      throw new Error('Read only');
+    }
+    const marketInfo: WrapperMarketInfo | null =
+      this.wrapper.marketInfoForMarket(this.market.address);
+    if (marketInfo === null) {
+      throw new Error('Wrapper has no market info for this market');
+    }
+    return marketInfo.orders.length === 0;
+  }
+
+  /**
+   * CancelAllOnCore instruction. Cancels all orders visible in the currently
+   * loaded market snapshot directly on the core program, including reverse
+   * orders and global orders with rent prepayment. Reload the market first when
+   * completeness matters.
+   * Snapshot index hints avoid a full book scan. Reload and rebuild the batch
+   * if intervening fills/cancels invalidate it; both hinted and unhinted
+   * cancels reject missing orders. Stale hints return WrongIndexHintParams
+   * (0xa); the unhinted scan returns InvalidCancel (0x3). Pass false to use it.
+   * Hints add four bytes per cancel. Send returned instructions separately or
+   * pack by serialized transaction size; the whole array may not fit one tx.
+   *
+   * @deprecated Since SDK 0.2.49. The deployed wrapper's `cancel_all` now
+   * searches the full core book, including flipped reverse and direct-core
+   * orders (https://github.com/Bonasa-Tech/manifest/pull/732). Use
+   * `cancelAllIx()` for cancellation only, or
+   * `batchUpdateIx(placeParams, [], true)` for an atomic cancel-and-replace.
+   * This snapshot-based escape hatch bypasses wrapper bookkeeping and can
+   * produce stale duplicate cancels when combined with wrapper placements.
+   * @param useOrderIndexHints Use validated node offsets from the snapshot.
    * @returns TransactionInstruction[]
    */
-  public async cancelAllOnCoreIx(): Promise<TransactionInstruction[]> {
+  public async cancelAllOnCoreIx(
+    useOrderIndexHints = true,
+  ): Promise<TransactionInstruction[]> {
     if (!this.payer) {
       throw new Error('Read only');
     }
@@ -1526,7 +1818,7 @@ export class ManifestClient {
     const openOrders: RestingOrder[] = this.market.openOrders();
     const ordersToCancel: {
       orderSequenceNumber: bignum;
-      orderIndexHint: null;
+      orderIndexHint: number | null;
     }[] = [];
 
     for (const openOrder of openOrders) {
@@ -1534,7 +1826,9 @@ export class ManifestClient {
         const seqNum: bignum = openOrder.sequenceNumber;
         ordersToCancel.push({
           orderSequenceNumber: seqNum,
-          orderIndexHint: null,
+          orderIndexHint: useOrderIndexHints
+            ? (openOrder.dataIndex ?? null)
+            : null,
         });
       }
     }
@@ -1593,10 +1887,17 @@ export class ManifestClient {
   /**
    * CancelBidsOnCore instruction. Cancels all bid orders on a market directly on the core program,
    * including reverse orders and global orders with rent prepayment.
+   * Snapshot hints avoid a full book scan. Reload and rebuild stale batches;
+   * both paths reject missing orders (hinted: 0xa, unhinted: 0x3).
+   * Pass false to retain the original scan and save four bytes per cancel.
+   * Send returned instructions separately or pack by serialized transaction size.
    *
+   * @param useOrderIndexHints Use validated node offsets from the snapshot.
    * @returns TransactionInstruction[]
    */
-  public async cancelBidsOnCoreIx(): Promise<TransactionInstruction[]> {
+  public async cancelBidsOnCoreIx(
+    useOrderIndexHints = true,
+  ): Promise<TransactionInstruction[]> {
     if (!this.payer) {
       throw new Error('Read only');
     }
@@ -1604,7 +1905,7 @@ export class ManifestClient {
     const bidOrders: RestingOrder[] = this.market.bidsL2();
     const ordersToCancel: {
       orderSequenceNumber: bignum;
-      orderIndexHint: null;
+      orderIndexHint: number | null;
     }[] = [];
 
     for (const bidOrder of bidOrders) {
@@ -1612,7 +1913,9 @@ export class ManifestClient {
         const seqNum: bignum = bidOrder.sequenceNumber;
         ordersToCancel.push({
           orderSequenceNumber: seqNum,
-          orderIndexHint: null,
+          orderIndexHint: useOrderIndexHints
+            ? (bidOrder.dataIndex ?? null)
+            : null,
         });
       }
     }
@@ -1671,10 +1974,17 @@ export class ManifestClient {
   /**
    * CancelAsksOnCore instruction. Cancels all ask orders on a market directly on the core program,
    * including reverse orders and global orders with rent prepayment.
+   * Snapshot hints avoid a full book scan. Reload and rebuild stale batches;
+   * both paths reject missing orders (hinted: 0xa, unhinted: 0x3).
+   * Pass false to retain the original scan and save four bytes per cancel.
+   * Send returned instructions separately or pack by serialized transaction size.
    *
+   * @param useOrderIndexHints Use validated node offsets from the snapshot.
    * @returns TransactionInstruction[]
    */
-  public async cancelAsksOnCoreIx(): Promise<TransactionInstruction[]> {
+  public async cancelAsksOnCoreIx(
+    useOrderIndexHints = true,
+  ): Promise<TransactionInstruction[]> {
     if (!this.payer) {
       throw new Error('Read only');
     }
@@ -1682,7 +1992,7 @@ export class ManifestClient {
     const askOrders: RestingOrder[] = this.market.asksL2();
     const ordersToCancel: {
       orderSequenceNumber: bignum;
-      orderIndexHint: null;
+      orderIndexHint: number | null;
     }[] = [];
 
     for (const askOrder of askOrders) {
@@ -1690,7 +2000,9 @@ export class ManifestClient {
         const seqNum: bignum = askOrder.sequenceNumber;
         ordersToCancel.push({
           orderSequenceNumber: seqNum,
-          orderIndexHint: null,
+          orderIndexHint: useOrderIndexHints
+            ? (askOrder.dataIndex ?? null)
+            : null,
         });
       }
     }
@@ -1844,7 +2156,8 @@ export class ManifestClient {
    * @param connection Connection to pull mint info
    * @param payer PublicKey of the trader
    * @param globalMint PublicKey for global mint deposit.
-   * @param amountTokens Number of tokens to deposit.
+   * @param amountTokens Number of tokens to deposit. Values between atom
+   * boundaries are rounded to the nearest atom.
    *
    * @returns Promise<TransactionInstruction>
    */
@@ -1870,8 +2183,12 @@ export class ManifestClient {
       true,
       is22 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
     );
-    const mintDecimals = mint.decimals;
-    const amountAtoms = Math.ceil(amountTokens * 10 ** mintDecimals);
+    const mintDecimals: number = mint.decimals;
+    const amountAtoms: bignum = tokenAmountToAtoms(
+      amountTokens,
+      mintDecimals,
+      'round',
+    );
 
     return createGlobalDepositInstruction(
       {
@@ -1896,7 +2213,8 @@ export class ManifestClient {
    * @param connection Connection to pull mint info
    * @param payer PublicKey of the trader
    * @param globalMint PublicKey for global mint withdraw.
-   * @param amountTokens Number of tokens to withdraw.
+   * @param amountTokens Number of tokens to withdraw. Values between atom
+   * boundaries are rounded to the nearest atom.
    *
    * @returns Promise<TransactionInstruction>
    */
@@ -1922,8 +2240,12 @@ export class ManifestClient {
       true,
       is22 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID,
     );
-    const mintDecimals = mint.decimals;
-    const amountAtoms = Math.ceil(amountTokens * 10 ** mintDecimals);
+    const mintDecimals: number = mint.decimals;
+    const amountAtoms: bignum = tokenAmountToAtoms(
+      amountTokens,
+      mintDecimals,
+      'round',
+    );
 
     return createGlobalWithdrawInstruction(
       {
@@ -2024,8 +2346,13 @@ function toWrapperPlaceOrderParams(
     priceQuoteAtomsPerBaseAtoms,
     maxExponent,
   );
-  const numBaseAtoms: bignum = Math.floor(
-    wrapperPlaceOrderParamsExternal.numBaseTokens * baseAtomsPerToken,
+  // Preserve the SDK's historical order-sizing behavior explicitly: a UI
+  // amount between atom boundaries sizes down rather than placing more base
+  // than the caller's budget-derived value requested.
+  const numBaseAtoms: bignum = tokenAmountToAtoms(
+    wrapperPlaceOrderParamsExternal.numBaseTokens,
+    market.baseDecimals(),
+    'floor',
   );
 
   return {

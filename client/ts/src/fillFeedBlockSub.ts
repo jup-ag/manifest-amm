@@ -3,13 +3,21 @@ import { Connection } from '@solana/web3.js';
 import { FillLog } from './manifest/accounts/FillLog';
 import { PROGRAM_ID } from './manifest';
 import * as promClient from 'prom-client';
+import { fillDiscriminant, toFillLogResult } from './fillFeed';
 import {
-  fillDiscriminant,
-  toFillLogResult,
   detectAggregatorFromKeys,
-  detectOriginatingProtocolFromKeys,
-} from './fillFeed';
+  resolveOriginatingProtocol,
+  getInvokedProgramIds,
+} from './aggregators';
 import { WebSocketManager } from './utils/WebSocketManager';
+import { hasTruncatedLogs } from './utils/solana';
+import {
+  inferFillsFromTransaction,
+  computeInferredRemainders,
+} from './utils/inferFills';
+import { FillLogResult } from './types';
+import { extractProgramDataLogs } from './utils/programLogs';
+import { recordManifestInstructionMetrics } from './utils/instructionMetrics';
 
 // For live monitoring of the fill feed. For a more complete look at fill
 // history stats, need to index all trades.
@@ -18,6 +26,17 @@ const fills = new promClient.Counter({
   help: 'Number of fills from block processing',
   labelNames: ['market', 'isGlobal', 'takerIsBuy'] as const,
 });
+const truncatedTransactions = new promClient.Counter({
+  name: 'truncated_log_transactions_block',
+  help: 'Number of transactions with truncated logs from block processing',
+});
+const inferredFills = new promClient.Counter({
+  name: 'inferred_fills_block',
+  help: 'Number of fills inferred from token transfers due to truncated logs',
+  labelNames: ['market'] as const,
+});
+const SLOT_PAGE_SIZE = 32;
+const MAX_SLOT_LAG = 10_000;
 
 /**
  * FillFeedBlockSub - Processes blocks sequentially using getBlock to find Manifest program transactions
@@ -33,6 +52,7 @@ export class FillFeedBlockSub {
   constructor(
     private connection: Connection,
     wsPort: number = 1234,
+    private onTruncatedLogs?: (signature: string, slot: number) => void,
   ) {
     this.wsManager = new WebSocketManager(wsPort, 30000);
   }
@@ -78,25 +98,43 @@ export class FillFeedBlockSub {
           // Get the latest finalized slot
           const latestSlot = await this.connection.getSlot('finalized');
 
-          // Determine which slots need to be processed
+          if (latestSlot - this.currentSlot > MAX_SLOT_LAG) {
+            const clampedSlot = latestSlot - MAX_SLOT_LAG;
+            console.warn(
+              `Clamping block-feed lag from ${this.currentSlot} to ${clampedSlot}`,
+            );
+            this.currentSlot = clampedSlot;
+          }
+
+          // Process a bounded page so an RPC-reported jump cannot allocate or
+          // fetch an unbounded slot range in one Promise.all.
+          const pageEnd = Math.min(
+            latestSlot,
+            this.currentSlot + SLOT_PAGE_SIZE - 1,
+          );
           const slotsToProcess: number[] = [];
-          for (let slot = this.currentSlot; slot <= latestSlot; slot++) {
+          for (let slot = this.currentSlot; slot <= pageEnd; slot++) {
             slotsToProcess.push(slot);
           }
 
           if (slotsToProcess.length === 0) {
-            // No new slots to process, continue immediately
+            // Being caught up is the normal idle state. Apply the same loop
+            // delay here so successful empty polls do not busy-loop against
+            // the finalized-slot RPC endpoint.
+            await new Promise<void>((resolve: () => void) =>
+              setTimeout(resolve, this.blockProcessingDelay),
+            );
             continue;
           }
 
           console.log(
-            `Fetching ${slotsToProcess.length} blocks in parallel (${this.currentSlot} to ${latestSlot})`,
+            `Fetching ${slotsToProcess.length} blocks in parallel (${this.currentSlot} to ${pageEnd})`,
           );
 
           // Fetch all blocks in parallel
           const blockPromises = slotsToProcess.map((slot) =>
             this.connection.getBlock(slot, {
-              maxSupportedTransactionVersion: 0,
+              maxSupportedTransactionVersion: 1,
               transactionDetails: 'full',
               commitment: 'finalized',
             }),
@@ -138,7 +176,7 @@ export class FillFeedBlockSub {
           }
 
           // Update current slot to continue from the next unprocessed slot
-          this.currentSlot = latestSlot + 1;
+          this.currentSlot = pageEnd + 1;
         } catch (error) {
           console.error(
             `Error processing blocks from ${this.currentSlot}:`,
@@ -240,14 +278,15 @@ export class FillFeedBlockSub {
     // Extract signers from the transaction
     let originalSigner: string | undefined;
     let signers: string[] = [];
-    let accountKeysStr: string[] = [];
 
     try {
       const message = tx.transaction.message;
 
       if ('accountKeys' in message) {
         // Legacy transaction
-        accountKeysStr = message.accountKeys.map((key: any) => key.toBase58());
+        const accountKeysStr = message.accountKeys.map((key: any) =>
+          key.toBase58(),
+        );
         originalSigner = accountKeysStr[0];
         // Extract all signers using isAccountSigner method
         signers = message.accountKeys
@@ -256,7 +295,7 @@ export class FillFeedBlockSub {
           .map(({ key }: any) => key.toBase58());
       } else {
         // Versioned transaction (v0) - use staticAccountKeys
-        accountKeysStr = message.staticAccountKeys.map((key: any) =>
+        const accountKeysStr = message.staticAccountKeys.map((key: any) =>
           key.toBase58(),
         );
         originalSigner = accountKeysStr[0];
@@ -271,32 +310,58 @@ export class FillFeedBlockSub {
       return;
     }
 
-    const aggregator = detectAggregatorFromKeys(accountKeysStr);
-    const originatingProtocol =
-      detectOriginatingProtocolFromKeys(accountKeysStr);
+    const invokedProgramIds = getInvokedProgramIds(tx);
+    const aggregator = detectAggregatorFromKeys(invokedProgramIds);
+    const originatingProtocol = resolveOriginatingProtocol(
+      invokedProgramIds,
+      signers,
+    );
 
     const messages: string[] = tx.meta.logMessages;
-    const programDatas: string[] = messages.filter((message) => {
-      return message.includes('Program data:');
-    });
 
-    if (programDatas.length === 0) {
+    // Truncated logs drop Program data entries, so fills can be silently
+    // missing from the feed. Fills that survived are parsed below as usual;
+    // the missing remainder is inferred from the Swap CPI token transfers.
+    const truncated: boolean = hasTruncatedLogs(messages);
+    if (truncated) {
+      console.warn('Truncated logs detected for', signature, 'slot', slot);
+      truncatedTransactions.inc();
+      this.onTruncatedLogs?.(signature, slot);
+    }
+
+    // Count every Manifest instruction in the transaction, not only the ones
+    // that filled, so instruction rates and compute usage cover order
+    // placement as well as swaps.
+    recordManifestInstructionMetrics(tx);
+
+    // Do not deserialize spoofable data emitted by unrelated CPI programs.
+    const programDatas = extractProgramDataLogs(
+      messages,
+      PROGRAM_ID.toBase58(),
+    );
+
+    if (programDatas.length === 0 && !truncated) {
       console.log('No program datas');
       return;
     }
 
+    const parsedFills: FillLogResult[] = [];
     for (const programDataEntry of programDatas) {
-      const programData = programDataEntry.split(' ')[2];
-      const byteArray: Uint8Array = Uint8Array.from(atob(programData), (c) =>
-        c.charCodeAt(0),
-      );
-      const buffer = Buffer.from(byteArray);
-      if (!buffer.subarray(0, 8).equals(fillDiscriminant)) {
+      let buffer: Buffer;
+      let deserializedFillLog: FillLog;
+      try {
+        buffer = Buffer.from(programDataEntry.data, 'base64');
+        if (
+          buffer.length < 8 + FillLog.byteSize ||
+          !buffer.subarray(0, 8).equals(fillDiscriminant)
+        ) {
+          continue;
+        }
+        deserializedFillLog = FillLog.deserialize(buffer.subarray(8))[0];
+      } catch (error) {
+        console.warn('Skipping malformed Manifest program data:', error);
         continue;
       }
-      const deserializedFillLog: FillLog = FillLog.deserialize(
-        buffer.subarray(8),
-      )[0];
       const fillResult = toFillLogResult(
         deserializedFillLog,
         slot,
@@ -307,8 +372,10 @@ export class FillFeedBlockSub {
         signers,
         blockTime ?? undefined,
       );
+      fillResult.invocationIndex = programDataEntry.invocationIndex;
       const resultString: string = JSON.stringify(fillResult);
       console.log('Got a fill', resultString);
+      parsedFills.push(fillResult);
       fills.inc({
         market: deserializedFillLog.market.toString(),
         isGlobal: deserializedFillLog.isMakerGlobal.toString(),
@@ -317,6 +384,24 @@ export class FillFeedBlockSub {
 
       // Send to all connected clients
       this.wsManager.broadcast(JSON.stringify(fillResult));
+    }
+
+    if (truncated) {
+      const inferred: FillLogResult[] = computeInferredRemainders(
+        inferFillsFromTransaction(tx, signature, slot, {
+          originalSigner,
+          aggregator,
+          originatingProtocol,
+          signers,
+          blockTime: blockTime ?? undefined,
+        }),
+        parsedFills,
+      );
+      for (const inferredFill of inferred) {
+        console.log('Inferred a fill', JSON.stringify(inferredFill));
+        inferredFills.inc({ market: inferredFill.market });
+        this.wsManager.broadcast(JSON.stringify(inferredFill));
+      }
     }
   }
 }

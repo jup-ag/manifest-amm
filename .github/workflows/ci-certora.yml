@@ -4,30 +4,92 @@ on:
     branches:
       - main
   pull_request:
-    branches:
-      - main
+    paths:
+      - 'programs/manifest/**'
+      - 'lib/**'
+      - 'certora/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-certora.yml'
   workflow_dispatch:
 jobs:
- submit_verification_jobs:
+ build_verification_program:
+    name: Build and validate Certora v3 ELF
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      statuses: write
-      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check prover ELF preparation
+        run: python3 -m unittest discover -s certora -p 'test_prepare_elf.py'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned verification tools
+        run: |
+          rustup toolchain install 1.93.0
+          cargo +1.93.0 install cargo-certora-sbf --version 0.3.5 --locked
+          python3 -m pip install certora-cli==8.19.2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: 'certora-v1.53-v3-${{ github.job }}'
+      - name: Compile the actual prover configurations without submitting jobs
+        # This uses Certora platform-tools v1.53's Rust 1.89, enforcing the
+        # verification compiler ceiling on PRs (including forks) without keys.
+        working-directory: programs/manifest/src/certora/confs
+        run: |
+          for conf in rules.conf rules-defrag.conf rules-global.conf rules-reverse.conf rules-seat-integrity.conf hypertree.conf; do
+            certoraSolanaProver "$conf" --compilation_steps_only
+            ../../../../../scripts/assert-sbpf-v3.sh ../../../../../target/sbpfv3-solana-solana/release/manifest.so
+          done
+ submit_verification_jobs:
+    name: Verify ${{ matrix.configuration }}
+    if: github.event_name != 'pull_request'
+    needs: build_verification_program
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    # Separate runners keep Cargo and the post-build ELF preparation from racing.
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration:
+          - rules.conf
+          - rules-defrag.conf
+          - rules-global.conf
+          - rules-reverse.conf
+          - rules-seat-integrity.conf
+          - hypertree.conf
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Submit verification jobs to Certora Prover
-        uses: Certora/certora-run-action@v1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          configurations: |-
-            rules.conf --commit_sha1 7a4ffb7d0a9fb99d9367ea77975885c1dea85d0f
-            hypertree.conf --commit_sha1 7a4ffb7d0a9fb99d9367ea77975885c1dea85d0f
-          job-name:  "manifest rules"
-          ecosystem: solana
-          working-directory: programs/manifest/src/certora/confs
-          certora-key: ${{ secrets.CERTORAKEY }}
-          certora-sbf-options: "-vvv --tools-version=v1.43"
+          python-version: '3.12'
+      - name: Install pinned verification tools
+        run: |
+          rustup toolchain install 1.93.0
+          cargo +1.93.0 install cargo-certora-sbf --version 0.3.5 --locked
+          python3 -m pip install certora-cli==8.19.2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: 'certora-v1.53-v3-${{ github.job }}'
+      - name: Submit verification rules and wait for proof results
+        # The submission action forces --wait_for_results none. Call the CLI
+        # directly for every configuration so failed proofs fail the matrix job.
+        working-directory: programs/manifest/src/certora/confs
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+          CERTORAKEY: ${{ secrets.CERTORAKEY }}
+          CONFIGURATION: ${{ matrix.configuration }}
+        run: |
+          set -o pipefail
+          certoraSolanaProver "$CONFIGURATION" --wait_for_results all \
+            --msg "manifest $CONFIGURATION $GITHUB_SHA" \
+            2>&1 | tee "$RUNNER_TEMP/certora-proof.log"
+      - name: Save proof results
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: certora-${{ matrix.configuration }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/certora-proof.log

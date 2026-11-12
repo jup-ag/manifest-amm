@@ -1,0 +1,372 @@
+import { FillLogResult, Market } from '../../client/ts/src';
+import { sendDiscordNotification } from './utils';
+import { SOL_MINT, STABLECOIN_MINTS } from './constants';
+import { fillIdentity } from './fillRetention';
+
+// Volume decrease threshold (90% decrease to trigger alert)
+const VOLUME_DECREASE_THRESHOLD: number = 0.9;
+// Volume increase threshold (10x increase = 900% change)
+const VOLUME_INCREASE_THRESHOLD: number = 9.0;
+
+// Large fill threshold in USDC ($1 million)
+const LARGE_FILL_THRESHOLD_USDC: number = 1_000_000;
+
+// Time to wait before finalizing a transaction's fills (ms)
+const TRANSACTION_FINALIZE_DELAY_MS: number = 5_000;
+const TRANSACTION_MAX_AGE_MS: number = 30_000;
+const MAX_FILLS_PER_TRANSACTION: number = 256;
+const MAX_BUFFERED_TRANSACTIONS: number = 10_000;
+
+// Type for hourly volume snapshot
+interface HourlyVolumeSnapshot {
+  timestamp: number;
+  totalVolumeUsdc: number;
+}
+
+// Type for fill value calculation result
+interface FillValueResult {
+  valueUsdc: number;
+  symbol: string;
+}
+
+// Type for buffered transaction fills
+interface TransactionFillBuffer {
+  fills: FillLogResult[];
+  fillIdentities: Set<string>;
+  totalValueUsdc: number;
+  createdAtMs: number;
+  lastSeenMs: number;
+  markets: Set<string>;
+  taker: string;
+  aggregator?: string;
+}
+
+export class VolumeMonitor {
+  private readonly discordWebhookUrl: string | undefined;
+  private previousHourlyVolume: HourlyVolumeSnapshot | null = null;
+  private currentHourVolumeUsdc: number = 0;
+  private currentHourStartTime: number = Date.now();
+
+  // Buffer for aggregating fills by transaction signature
+  private transactionBuffer: Map<string, TransactionFillBuffer> = new Map();
+
+  // Callback to get SOL price from stats server
+  private readonly getSolPrice: () => number;
+
+  // Callback to get market object from stats server
+  private readonly getMarket: (marketPk: string) => Market | undefined;
+
+  // Callback to get ticker symbols from stats server
+  private readonly getTicker: (
+    marketPk: string,
+  ) => [string, string] | undefined;
+
+  constructor(
+    discordWebhookUrl: string | undefined,
+    getSolPrice: () => number,
+    getMarket: (marketPk: string) => Market | undefined,
+    getTicker: (marketPk: string) => [string, string] | undefined,
+  ) {
+    this.discordWebhookUrl = discordWebhookUrl;
+    this.getSolPrice = getSolPrice;
+    this.getMarket = getMarket;
+    this.getTicker = getTicker;
+  }
+
+  /**
+   * Process a fill and check for large fill alerts.
+   * Aggregates fills by transaction signature before checking threshold.
+   * Also accumulates volume for hourly tracking.
+   */
+  async processFill(fill: FillLogResult): Promise<void> {
+    const market: Market | undefined = this.getMarket(fill.market);
+    if (!market) {
+      return;
+    }
+
+    const fillValue: FillValueResult | null = this.calculateFillValueUsdc(
+      fill,
+      market,
+    );
+    if (!fillValue) {
+      return;
+    }
+
+    // Accepted operational tradeoff: finalization is driven by later fills.
+    // Production markets trade continuously, so an isolated final transaction
+    // is not expected to remain buffered for a meaningful period. Add a timer
+    // and shutdown flush if this monitor is ever used on an illiquid market.
+    await this.finalizeOldTransactions();
+
+    // Buffer this fill by transaction signature
+    const signature: string = fill.signature;
+    const identity: string = fillIdentity(fill);
+    const existing: TransactionFillBuffer | undefined =
+      this.transactionBuffer.get(signature);
+
+    if (existing) {
+      if (existing.fillIdentities.has(identity)) return;
+      if (existing.fills.length >= MAX_FILLS_PER_TRANSACTION) {
+        throw new Error(`too many fills for transaction ${signature}`);
+      }
+      existing.fills.push(fill);
+      existing.fillIdentities.add(identity);
+      existing.totalValueUsdc += fillValue.valueUsdc;
+      existing.lastSeenMs = Date.now();
+      existing.markets.add(fillValue.symbol);
+    } else {
+      if (this.transactionBuffer.size >= MAX_BUFFERED_TRANSACTIONS) {
+        throw new Error('too many buffered fill transactions');
+      }
+      const now: number = Date.now();
+      this.transactionBuffer.set(signature, {
+        fills: [fill],
+        fillIdentities: new Set([identity]),
+        totalValueUsdc: fillValue.valueUsdc,
+        createdAtMs: now,
+        lastSeenMs: now,
+        markets: new Set([fillValue.symbol]),
+        taker: fill.taker,
+        aggregator: fill.aggregator,
+      });
+    }
+
+    // Count only fills admitted to the bounded, deduplicated buffer.
+    this.currentHourVolumeUsdc += fillValue.valueUsdc;
+  }
+
+  /**
+   * Finalize transactions that haven't received new fills recently.
+   * Sends alerts for transactions exceeding the threshold.
+   */
+  private async finalizeOldTransactions(): Promise<void> {
+    const now: number = Date.now();
+    const signaturestoFinalize: string[] = [];
+
+    this.transactionBuffer.forEach((buffer, signature) => {
+      if (
+        now - buffer.lastSeenMs >= TRANSACTION_FINALIZE_DELAY_MS ||
+        now - buffer.createdAtMs >= TRANSACTION_MAX_AGE_MS
+      ) {
+        signaturestoFinalize.push(signature);
+      }
+    });
+
+    for (const signature of signaturestoFinalize) {
+      const buffer: TransactionFillBuffer | undefined =
+        this.transactionBuffer.get(signature);
+      if (buffer && buffer.totalValueUsdc >= LARGE_FILL_THRESHOLD_USDC) {
+        await this.sendLargeTransactionAlert(signature, buffer);
+      }
+      this.transactionBuffer.delete(signature);
+    }
+  }
+
+  /**
+   * Calculate the USDC equivalent value of a fill
+   */
+  private calculateFillValueUsdc(
+    fill: FillLogResult,
+    market: Market,
+  ): FillValueResult | null {
+    const quoteMint: string = market.quoteMint().toBase58();
+    const quoteDecimals: number = market.quoteDecimals();
+    const quoteAtoms: number = Number(fill.quoteAtoms);
+    const quoteTokens: number = quoteAtoms / 10 ** quoteDecimals;
+
+    // Get ticker symbol for display
+    const ticker: [string, string] | undefined = this.getTicker(fill.market);
+    const symbol: string = ticker
+      ? `${ticker[0]}/${ticker[1]}`
+      : fill.market.slice(0, 8);
+
+    // If quote is a stablecoin, use 1:1 conversion
+    if (STABLECOIN_MINTS.has(quoteMint)) {
+      return { valueUsdc: quoteTokens, symbol };
+    }
+
+    // If quote is SOL, convert using SOL price
+    if (quoteMint === SOL_MINT) {
+      const solPrice: number = this.getSolPrice();
+      if (solPrice > 0) {
+        return { valueUsdc: quoteTokens * solPrice, symbol };
+      }
+    }
+
+    // Cannot determine USDC value for other quote mints
+    return null;
+  }
+
+  /**
+   * Send alert for a large transaction (aggregated fills)
+   */
+  private async sendLargeTransactionAlert(
+    signature: string,
+    buffer: TransactionFillBuffer,
+  ): Promise<void> {
+    if (!this.discordWebhookUrl) {
+      return;
+    }
+
+    const formattedValue: string = this.formatUsdValue(buffer.totalValueUsdc);
+    const marketsStr: string = Array.from(buffer.markets).join(', ');
+    const fillCount: number = buffer.fills.length;
+
+    // Determine overall side from first fill (all fills in aggregator tx have same direction)
+    const firstFill: FillLogResult = buffer.fills[0];
+    const side: string = firstFill.takerIsBuy ? 'BUY' : 'SELL';
+
+    // Get original signer if available
+    const originalSigner: string | undefined = (firstFill as any)
+      .originalSigner;
+    const signerDisplay: string = originalSigner
+      ? `\`${originalSigner.slice(0, 8)}...\``
+      : `\`${buffer.taker.slice(0, 8)}...\``;
+
+    // Build links
+    const solscanLink: string = `https://solscan.io/tx/${signature}`;
+    const marketLink: string = `https://manifest.trade/market/${firstFill.market}`;
+
+    const message: string[] = [
+      `**${side} across ${fillCount} fills**`,
+      `Total Value: ${formattedValue}`,
+      `Markets: ${marketsStr}`,
+      `Signer: ${signerDisplay}`,
+    ];
+
+    if (buffer.aggregator) {
+      message.push(`Aggregator: ${buffer.aggregator}`);
+    }
+
+    message.push(
+      `[View on Solscan](${solscanLink}) | [View Market](${marketLink})`,
+    );
+
+    try {
+      await sendDiscordNotification(
+        this.discordWebhookUrl,
+        message.join('\n'),
+        {
+          title: '💰 Large Transaction Alert',
+          color: 0xffd700, // Gold color
+          timestamp: true,
+        },
+      );
+    } catch (error: unknown) {
+      // Monitoring state must advance even when Discord rate-limits or is
+      // unavailable. The fill has already been observed and should not poison
+      // the transaction aggregation loop.
+      console.error('Failed to send large transaction alert:', error);
+    }
+  }
+
+  /**
+   * Check hourly volume change and send alert if threshold exceeded.
+   * Should be called every hour.
+   */
+  async checkHourlyVolumeChange(): Promise<void> {
+    const currentSnapshot: HourlyVolumeSnapshot = {
+      timestamp: Date.now(),
+      totalVolumeUsdc: this.currentHourVolumeUsdc,
+    };
+
+    if (
+      this.previousHourlyVolume &&
+      this.previousHourlyVolume.totalVolumeUsdc > 0
+    ) {
+      const previousVolume: number = this.previousHourlyVolume.totalVolumeUsdc;
+      const currentVolume: number = currentSnapshot.totalVolumeUsdc;
+      const percentChange: number =
+        (currentVolume - previousVolume) / previousVolume;
+
+      // Alert on decreases of more than 90% or increases of more than 10x
+      if (
+        percentChange < -VOLUME_DECREASE_THRESHOLD ||
+        percentChange > VOLUME_INCREASE_THRESHOLD
+      ) {
+        await this.sendVolumeChangeAlert(
+          previousVolume,
+          currentVolume,
+          percentChange,
+        );
+      }
+    }
+
+    // Reset for next hour
+    this.previousHourlyVolume = currentSnapshot;
+    this.currentHourVolumeUsdc = 0;
+    this.currentHourStartTime = Date.now();
+  }
+
+  /**
+   * Send alert for hourly volume change
+   */
+  private async sendVolumeChangeAlert(
+    previousVolume: number,
+    currentVolume: number,
+    percentChange: number,
+  ): Promise<void> {
+    if (!this.discordWebhookUrl) {
+      return;
+    }
+
+    const direction: string = percentChange > 0 ? 'increased' : 'decreased';
+    const emoji: string = percentChange > 0 ? '📈' : '📉';
+    const percentChangeAbs: number = Math.abs(percentChange);
+
+    const message: string = [
+      `**Hourly volume ${direction} by ${(percentChangeAbs * 100).toFixed(1)}%**`,
+      `Previous hour: ${this.formatUsdValue(previousVolume)}`,
+      `Current hour: ${this.formatUsdValue(currentVolume)}`,
+      `Change: ${percentChange > 0 ? '+' : ''}${(percentChange * 100).toFixed(1)}%`,
+    ].join('\n');
+
+    try {
+      await sendDiscordNotification(this.discordWebhookUrl, message, {
+        title: `${emoji} Hourly Volume Alert`,
+        color: percentChange > 0 ? 0x00ff00 : 0xff0000,
+        timestamp: true,
+      });
+    } catch (error: unknown) {
+      // Do not retain the previous hour merely because alert delivery failed;
+      // doing so would make later deltas span multiple hours and re-alert.
+      console.error('Failed to send hourly volume alert:', error);
+    }
+  }
+
+  /**
+   * Format USD value with appropriate suffix (K, M, B)
+   */
+  private formatUsdValue(value: number): string {
+    if (value >= 1_000_000_000) {
+      return `$${(value / 1_000_000_000).toFixed(2)}B`;
+    }
+    if (value >= 1_000_000) {
+      return `$${(value / 1_000_000).toFixed(2)}M`;
+    }
+    if (value >= 1_000) {
+      return `$${(value / 1_000).toFixed(2)}K`;
+    }
+    return `$${value.toFixed(2)}`;
+  }
+
+  /**
+   * Format number with commas
+   */
+  private formatNumber(value: number): string {
+    if (value >= 1_000_000) {
+      return `${(value / 1_000_000).toFixed(2)}M`;
+    }
+    if (value >= 1_000) {
+      return `${(value / 1_000).toFixed(2)}K`;
+    }
+    return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
+  }
+
+  /**
+   * Get current hour's accumulated volume (for debugging/monitoring)
+   */
+  getCurrentHourVolume(): number {
+    return this.currentHourVolumeUsdc;
+  }
+}

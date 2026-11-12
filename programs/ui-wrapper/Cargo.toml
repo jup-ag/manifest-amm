@@ -2,10 +2,13 @@
 name = "ui-wrapper"
 version = "0.1.4"
 edition = "2021"
-repository = "https://github.com/CKS-systems/manifest"
+repository = "https://github.com/Bonasa-Tech/manifest"
 authors = ["Maximilian Schneider <max@mango.markets>"]
 description = "UI Wrapper for Manifest"
 license-file = "LICENSE"
+
+[lints]
+workspace = true
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -14,18 +17,22 @@ name = "ui_wrapper"
 [features]
 no-entrypoint = []
 cpi = ["no-entrypoint"]
-default = ["trace"] 
+default = ["trace"]
 trace = [ "hypertree/fuzz", "hypertree/trace", "manifest-dex/trace" ]
-test = []
+test = ["manifest-dex/test"]
+test-sbf = []
 
 [dependencies]
 manifest-dex = { path = "../manifest", features = ["no-entrypoint"]  }
 hypertree = { path = "../../lib" }
 # Cannot use workspace because the generator needs to see a version here
 shank = "0.4.2"
-spl-token-interface = { workspace = true }
-spl-token-2022-interface = { workspace = true }
+spl-token = { workspace = true, features = ["no-entrypoint"] }
+spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
 solana-program = { workspace = true }
+solana-sdk-ids = { workspace = true }
+solana-system-interface = { workspace = true }
+pinocchio = { workspace = true }
 borsh = { workspace = true }
 bytemuck = { workspace = true }
 num_enum = { workspace = true }
@@ -37,12 +44,12 @@ solana-invoke = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
-solana-account = { workspace = true }
-solana-account-info = { workspace = true }
-solana-keypair = { workspace = true }
-solana-program-pack = { workspace = true }
+spl-token-2022-interface = { workspace = true }
 solana-program-test = { workspace = true }
 solana-logger = { workspace = true }
+solana-account = { workspace = true }
+solana-keypair = { workspace = true }
 solana-signer = { workspace = true }
 solana-transaction = { workspace = true }
+solana-instruction = { workspace = true }
 tokio = { workspace = true }

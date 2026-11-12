@@ -5,8 +5,9 @@ use manifest::{
     program::{batch_update::CancelOrderParams, batch_update_instruction},
     state::{OrderType, MARKET_BLOCK_SIZE},
 };
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
-use solana_program::{instruction::Instruction, pubkey::Pubkey};
+use solana_program::pubkey::Pubkey;
 use solana_program_test::tokio;
 use solana_signer::Signer;
 

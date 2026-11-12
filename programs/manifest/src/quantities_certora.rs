@@ -36,7 +36,7 @@ impl QuoteAtomsPerBaseAtom {
         Ok(Self::from_mantissa_and_exponent_(mantissa, exponent))
     }
 
-    #[inline(always)]
+    #[inline(never)]
     pub fn checked_base_for_quote(
         self,
         quote_atoms: QuoteAtoms,
@@ -61,7 +61,12 @@ impl QuoteAtomsPerBaseAtom {
         Ok(BaseAtoms::new(base_atoms))
     }
 
-    #[inline(always)]
+    /// Not inlined: with `#[inline(always)]` the compiler merges the writes
+    /// that build the Result, and the prover then cannot read the payload back
+    /// off the stack ("[3002] stack location is not accessible"). That only
+    /// bites rules which keep the error path alive rather than unwrapping it,
+    /// i.e. the no-revert rules.
+    #[inline(never)]
     fn checked_quote_for_base_(
         self,
         base_atoms: BaseAtoms,
@@ -79,14 +84,21 @@ impl QuoteAtomsPerBaseAtom {
         Ok(quote_atoms)
     }
 
-    #[inline(always)]
+    /// Written as a match rather than `.map(..)`. The prover's static analysis
+    /// cannot follow the Result payload back off the stack through the closure,
+    /// which shows up as "[3002] stack location is not accessible" in any rule
+    /// that keeps the error path alive instead of unwrapping it -- that is, in
+    /// the no-revert rules.
+    #[inline(never)]
     pub fn checked_quote_for_base(
         self,
         other: BaseAtoms,
         round_up: bool,
     ) -> Result<QuoteAtoms, ProgramError> {
-        self.checked_quote_for_base_(other, round_up)
-            .map(|r| QuoteAtoms::new(r))
+        match self.checked_quote_for_base_(other, round_up) {
+            Ok(r) => Ok(QuoteAtoms::new(r)),
+            Err(e) => Err(e),
+        }
     }
 
     #[inline(always)]
@@ -105,12 +117,31 @@ impl QuoteAtomsPerBaseAtom {
         Self { inner: [x, 0] }
     }
 
+    /// `self * numerator / denominator` on the single-limb certora price.
+    ///
+    /// This derives the price a reverse order comes back at. It has to be a
+    /// real function of its inputs, not a nondet summary, because the reverse
+    /// coalesce rule computes the reverse price twice (once in the rule and
+    /// once inside the matching code) and the two have to agree. The product
+    /// cannot overflow: the price fits u32 and the numerator is at most 10^8,
+    /// so the product is at most ~4*10^17 < u64::MAX.
     pub fn checked_multiply_rational(
         self,
-        _numerator: u32,
-        _denominator: u32,
-        _round_up: bool,
+        numerator: u32,
+        denominator: u32,
+        round_up: bool,
     ) -> Result<Self, PriceConversionError> {
-        todo!("")
+        if denominator == 0 {
+            return Err(PriceConversionError(0x9));
+        }
+        let product: u64 = self.inner[0]
+            .checked_mul(numerator as u64)
+            .ok_or(PriceConversionError(0xa))?;
+        let result: u64 = if round_up {
+            product.div_ceil(denominator as u64)
+        } else {
+            product.div(denominator as u64)
+        };
+        Ok(Self { inner: [result, 0] })
     }
 }

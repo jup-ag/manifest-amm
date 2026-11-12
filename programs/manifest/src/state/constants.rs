@@ -1,4 +1,5 @@
 use hypertree::RBTREE_OVERHEAD_BYTES;
+use static_assertions::const_assert_eq;
 
 pub const MARKET_FIXED_SIZE: usize = 256;
 pub const GLOBAL_FIXED_SIZE: usize = 96;
@@ -37,6 +38,13 @@ pub const GLOBAL_FIXED_DISCRIMINANT: u64 = 10787423733276977665;
 // capital on the exchange to prevent that.
 pub const GAS_DEPOSIT_LAMPORTS: u64 = 5_000;
 
+// Flat fee a batch update pays to the market when it places any global or
+// reverse order. These order types cost the market maintenance work beyond
+// their own placement: globals get cleaned and evicted by third parties and
+// reverses re-rest on every fill. The fee sits on the market account above
+// the rent minimum until a defrag run sweeps it to the collector.
+pub const ADVANCED_ORDER_FEE_LAMPORTS: u64 = 5_000;
+
 /// Limit on the number of global seats available. Set so that this is hit
 /// before the global account starts running into account size limits, but is
 /// generous enough that it really should only matter in deterring spam.  Sized
@@ -47,3 +55,26 @@ pub const GAS_DEPOSIT_LAMPORTS: u64 = 5_000;
 pub const MAX_GLOBAL_SEATS: u16 = 4;
 #[cfg(not(feature = "test"))]
 pub const MAX_GLOBAL_SEATS: u16 = 999;
+
+// Given Solana's eight-byte-aligned account-data base, these block sizes
+// preserve alignment at every node boundary. Safe byte-slice helpers still
+// validate their effective address because arbitrary slices need not share
+// that base alignment.
+const_assert_eq!(MARKET_BLOCK_SIZE % 8, 0);
+const_assert_eq!(GLOBAL_BLOCK_SIZE % 8, 0);
+
+/// Most accounts an instruction is deserialized for.
+///
+/// Manifest instructions take at most 14 accounts, the wrapper 15 and the ui
+/// wrapper 20. Instructions carrying more than this are rejected by the
+/// runtime rather than silently truncated.
+///
+/// This is all that remains of a hand written entrypoint. `solana_program`'s
+/// macro decoded the runtime's input into a heap allocated `Vec<AccountInfo>`,
+/// reading every field through a running offset; replacing it with a fixed
+/// size stack array and a bump allocator brought that to 185 CU plus 72 per
+/// account, of which about 58 per account was the `Rc<RefCell<_>>` pairs the
+/// `solana_program` account type itself needs. Getting below that needed a
+/// zero copy account type, which is what pinocchio's entrypoint uses: 126 CU
+/// plus 47 per account, measured by `entrypoint_only` in `tests/cases/cu.rs`.
+pub const MAX_ACCOUNTS: usize = 64;

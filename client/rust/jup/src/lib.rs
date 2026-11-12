@@ -1,0 +1,919 @@
+use anyhow::{Error, Result};
+use jupiter_amm_interface::{
+    AccountMap, Amm, AmmContext, ClockRef, KeyedAccount, Quote, QuoteParams, Side, Swap,
+    SwapAndAccountMetas, SwapParams,
+};
+
+use hypertree::{
+    get_helper, get_mut_helper, validate_red_black_tree, DataIndex, GetRedBlackTreeReadOnlyData,
+    HyperTreeValueIteratorTrait,
+};
+use manifest::{
+    quantities::{BaseAtoms, QuoteAtoms, WrapperU64},
+    state::{
+        claimed_seat::ClaimedSeat, validate_global_dynamic, BooksideReadOnly,
+        ClaimedSeatTreeReadOnly, DynamicAccount, GlobalFixed, GlobalValue, MarketFixed,
+        MarketValue, RestingOrder, GLOBAL_FIXED_SIZE,
+    },
+    validation::{
+        get_global_address, get_global_vault_address, get_vault_address,
+        loaders::GlobalTradeAccounts, ManifestAccount, ManifestAccountInfo, OwnedAccount,
+    },
+};
+use solana_program::{instruction::AccountMeta, pubkey::Pubkey, system_program};
+use spl_token_2022::{
+    extension::{transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions},
+    state::Mint,
+};
+use std::{collections::HashSet, mem::size_of, sync::atomic::Ordering};
+
+/// Lays out an account the way the runtime would, so this quoter can run the
+/// program's own matching code over bytes it fetched rather than a copy of
+/// that logic.
+///
+/// The program reads accounts as pointers into the runtime's memory, so there
+/// is nothing to build a view from off chain until one is laid out; that is
+/// what `OwnedAccount` does. Two bindings come out: the owned buffer, which
+/// has to stay alive, and the view into it.
+macro_rules! dynamic_value_opt_to_account_info {
+    ( $owned:ident, $name:ident, $value_opt:expr, $fixed_size:expr, $type:ident, $key:expr ) => {
+        let mut data_vec: Vec<u8> = Vec::new();
+        if $value_opt.is_some() {
+            let mut header_bytes: [u8; $fixed_size] = [0; $fixed_size];
+            *get_mut_helper::<$type>(&mut header_bytes, 0_u32) = $value_opt.as_ref().unwrap().fixed;
+            data_vec.extend_from_slice(&header_bytes);
+            data_vec.append(&mut $value_opt.as_ref().unwrap().dynamic.clone());
+        }
+
+        let $owned: OwnedAccount = OwnedAccount::new(&$key, &manifest::ID, 0, &data_vec);
+        // SAFETY: `$owned` is bound in the same scope and outlives `$name`.
+        let $name = unsafe { $owned.view() };
+    };
+}
+
+/// Convert provider-supplied market bytes only after re-establishing every
+/// invariant required by quote traversal. Both construction and refresh use
+/// this path so a later update cannot replace a validated market with raw RPC
+/// bytes.
+fn validated_market_value(market_account: &solana_account::Account) -> Result<MarketValue> {
+    if market_account.owner != manifest::ID {
+        anyhow::bail!("market account has an invalid owner");
+    }
+    if market_account.data.len() < size_of::<MarketFixed>() {
+        anyhow::bail!("market account data is truncated");
+    }
+
+    let (header_bytes, dynamic_data) = market_account.data.split_at(size_of::<MarketFixed>());
+    let market_fixed: &MarketFixed = get_helper::<MarketFixed>(header_bytes, 0_u32);
+    market_fixed
+        .verify_discriminant()
+        .map_err(|error| anyhow::anyhow!("market account is invalid: {error}"))?;
+
+    let market = DynamicAccount {
+        fixed: market_fixed,
+        dynamic: dynamic_data,
+    };
+    let claimed_seats: ClaimedSeatTreeReadOnly<'_> = market.get_claimed_seats();
+    validate_red_black_tree::<ClaimedSeat>(
+        dynamic_data,
+        claimed_seats.root_index(),
+        claimed_seats.max_index(),
+    )
+    .map_err(|error| anyhow::anyhow!("market claimed-seat tree is invalid: {error}"))?;
+    let claimed_seat_indices: HashSet<DataIndex> = claimed_seats
+        .iter::<ClaimedSeat>()
+        .map(|(index, _)| index)
+        .collect();
+
+    let books: [BooksideReadOnly<'_>; 2] = [market.get_bids(), market.get_asks()];
+    for book in books {
+        validate_red_black_tree::<RestingOrder>(dynamic_data, book.root_index(), book.max_index())
+            .map_err(|error| anyhow::anyhow!("market order book is invalid: {error}"))?;
+        for item in book.iter::<RestingOrder>() {
+            let (_order_index, order): (DataIndex, &RestingOrder) = item;
+            if !order.has_valid_order_type() {
+                anyhow::bail!("market order book contains an invalid order type");
+            }
+            if !claimed_seat_indices.contains(&order.get_trader_index()) {
+                anyhow::bail!("market order points to an invalid claimed seat");
+            }
+        }
+    }
+    market_fixed
+        .validate_free_list(dynamic_data)
+        .map_err(|error| anyhow::anyhow!("market free list is invalid: {error}"))?;
+
+    Ok(DynamicAccount::<MarketFixed, Vec<u8>> {
+        fixed: *market_fixed,
+        dynamic: dynamic_data.to_vec(),
+    })
+}
+
+/// Read a mint's `TransferFeeConfig` if it is a Token-2022 mint that has one.
+///
+/// Only Token-2022 mints can carry transfer fees, so an SPL Token mint is
+/// reported as fee free without parsing. A Token-2022 mint that does not parse
+/// is an error rather than a silent no-fee, because treating a fee bearing
+/// mint as fee free overstates the quote.
+fn mint_transfer_fee_config(
+    mint_account: &solana_account::Account,
+) -> Result<Option<TransferFeeConfig>> {
+    if mint_account.owner != spl_token_2022::id() {
+        return Ok(None);
+    }
+    let mint_state: StateWithExtensions<'_, Mint> =
+        StateWithExtensions::<Mint>::unpack(&mint_account.data)
+            .map_err(|error| anyhow::anyhow!("mint account is invalid: {error}"))?;
+    Ok(mint_state
+        .get_extension::<TransferFeeConfig>()
+        .ok()
+        .copied())
+}
+
+/// Net `amount` of the transfer fee that Token-2022 withholds this epoch, the
+/// same way the program's `calculate_post_fee_amount` does on chain.
+fn post_transfer_fee_amount(
+    transfer_fee_config_opt: &Option<TransferFeeConfig>,
+    epoch: u64,
+    amount: u64,
+) -> Result<u64> {
+    let Some(transfer_fee_config) = transfer_fee_config_opt else {
+        return Ok(amount);
+    };
+    transfer_fee_config
+        .get_epoch_fee(epoch)
+        .calculate_post_fee_amount(amount)
+        .ok_or_else(|| anyhow::anyhow!("transfer fee calculation overflowed"))
+}
+
+#[derive(Clone)]
+pub struct ManifestMarket {
+    market: MarketValue,
+    key: Pubkey,
+    label: String,
+    base_global: Option<GlobalValue>,
+    quote_global: Option<GlobalValue>,
+    base_token_program: Pubkey,
+    quote_token_program: Pubkey,
+    base_transfer_fee_config: Option<TransferFeeConfig>,
+    quote_transfer_fee_config: Option<TransferFeeConfig>,
+    /// Transfer fees are keyed by epoch, not slot, so the quote needs the
+    /// current epoch. Jupiter keeps this up to date for every Amm.
+    clock_ref: ClockRef,
+}
+
+impl ManifestMarket {
+    pub fn get_base_mint(&self) -> Pubkey {
+        *self.market.get_base_mint()
+    }
+    pub fn get_quote_mint(&self) -> Pubkey {
+        *self.market.get_quote_mint()
+    }
+    pub fn get_base_global_address(&self) -> Pubkey {
+        get_global_address(self.market.get_base_mint()).0
+    }
+    pub fn get_quote_global_address(&self) -> Pubkey {
+        get_global_address(self.market.get_quote_mint()).0
+    }
+}
+
+impl Amm for ManifestMarket {
+    fn label(&self) -> String {
+        self.label.clone()
+    }
+
+    fn key(&self) -> Pubkey {
+        self.key
+    }
+
+    fn program_id(&self) -> Pubkey {
+        manifest::id()
+    }
+
+    fn get_reserve_mints(&self) -> Vec<Pubkey> {
+        vec![self.get_base_mint(), self.get_quote_mint()]
+    }
+
+    fn get_accounts_to_update(&self) -> Vec<Pubkey> {
+        vec![
+            self.key,
+            self.get_base_mint(),
+            self.get_quote_mint(),
+            self.get_base_global_address(),
+            self.get_quote_global_address(),
+        ]
+    }
+
+    fn from_keyed_account(keyed_account: &KeyedAccount, amm_context: &AmmContext) -> Result<Self> {
+        Ok(ManifestMarket {
+            market: validated_market_value(&keyed_account.account)?,
+            key: keyed_account.key,
+            label: "Manifest".into(),
+            // Gets updated on the first iter
+            base_token_program: spl_token::id(),
+            quote_token_program: spl_token::id(),
+            base_transfer_fee_config: None,
+            quote_transfer_fee_config: None,
+            base_global: None,
+            quote_global: None,
+            clock_ref: amm_context.clock_ref.clone(),
+        })
+    }
+
+    fn update(&mut self, account_map: &AccountMap) -> Result<()> {
+        // Every optional RPC account is independently untrusted and may be
+        // absent or truncated during a slot transition.
+        if let Some(mint) = account_map.get(&self.get_base_mint()) {
+            self.base_token_program = mint.owner;
+            self.base_transfer_fee_config = mint_transfer_fee_config(mint)?;
+        };
+        if let Some(mint) = account_map.get(&self.get_quote_mint()) {
+            self.quote_token_program = mint.owner;
+            self.quote_transfer_fee_config = mint_transfer_fee_config(mint)?;
+        };
+        if let Some(global) = account_map.get(&self.get_quote_global_address()) {
+            if global.owner != manifest::ID {
+                anyhow::bail!("quote global account has an invalid owner");
+            }
+            if global.data.len() < size_of::<GlobalFixed>() {
+                anyhow::bail!("quote global account data is truncated");
+            }
+            let (header_bytes, dynamic_data) = global.data.split_at(size_of::<GlobalFixed>());
+            let global_fixed: &GlobalFixed = get_helper::<GlobalFixed>(header_bytes, 0_u32);
+            global_fixed
+                .verify_discriminant()
+                .map_err(|error| anyhow::anyhow!("quote global account is invalid: {error}"))?;
+            validate_global_dynamic(global_fixed, dynamic_data)
+                .map_err(|error| anyhow::anyhow!("quote global account is invalid: {error}"))?;
+            self.quote_global = Some(DynamicAccount::<GlobalFixed, Vec<u8>> {
+                fixed: *global_fixed,
+                dynamic: dynamic_data.to_vec(),
+            });
+        };
+        if let Some(global) = account_map.get(&self.get_base_global_address()) {
+            if global.owner != manifest::ID {
+                anyhow::bail!("base global account has an invalid owner");
+            }
+            if global.data.len() < size_of::<GlobalFixed>() {
+                anyhow::bail!("base global account data is truncated");
+            }
+            let (header_bytes, dynamic_data) = global.data.split_at(size_of::<GlobalFixed>());
+            let global_fixed: &GlobalFixed = get_helper::<GlobalFixed>(header_bytes, 0_u32);
+            global_fixed
+                .verify_discriminant()
+                .map_err(|error| anyhow::anyhow!("base global account is invalid: {error}"))?;
+            validate_global_dynamic(global_fixed, dynamic_data)
+                .map_err(|error| anyhow::anyhow!("base global account is invalid: {error}"))?;
+            self.base_global = Some(DynamicAccount::<GlobalFixed, Vec<u8>> {
+                fixed: *global_fixed,
+                dynamic: dynamic_data.to_vec(),
+            });
+        };
+
+        let market_account: &solana_account::Account = account_map
+            .get(&self.key)
+            .ok_or_else(|| anyhow::anyhow!("market account missing from update"))?;
+        self.market = validated_market_value(market_account)?;
+        Ok(())
+    }
+
+    fn quote(&self, quote_params: &QuoteParams) -> Result<Quote> {
+        let market: DynamicAccount<MarketFixed, Vec<u8>> = self.market.clone();
+
+        // The reason for checking can_expand is that jup does not want the
+        // payer to be responsible for gas for the market expansion on a partial
+        // fill against a reversible order. This solution is more restrictive
+        // than it really needs to be because there are many cases where trading
+        // against a reversible will work without the ability to expand, like
+        // filling an order completely, or reversing into a coalescing order. Or
+        // there just might not be reversible orders on the book.
+        let can_expand = market.has_two_free_blocks();
+        if !can_expand {
+            return Ok(Quote {
+                out_amount: 0,
+                ..Quote::default()
+            });
+        }
+
+        dynamic_value_opt_to_account_info!(
+            quote_global_account_info_owned,
+            quote_global_account_info,
+            self.quote_global,
+            GLOBAL_FIXED_SIZE,
+            GlobalFixed,
+            self.get_quote_global_address()
+        );
+
+        let quote_global_trade_accounts_opt: Option<GlobalTradeAccounts> =
+            if self.quote_global.is_some() {
+                Some(GlobalTradeAccounts {
+                    mint_opt: None,
+                    global: ManifestAccountInfo::new(&quote_global_account_info)?,
+                    global_vault_opt: None,
+                    market_vault_opt: None,
+                    token_program_opt: None,
+                    system_program: None,
+                    gas_payer_opt: None,
+                    gas_receiver_opt: None,
+                    market: self.key.clone(),
+                    num_deferred_gas_refunds: std::cell::Cell::new(0),
+                })
+            } else {
+                None
+            };
+
+        dynamic_value_opt_to_account_info!(
+            base_global_account_info_owned,
+            base_global_account_info,
+            self.base_global,
+            GLOBAL_FIXED_SIZE,
+            GlobalFixed,
+            self.get_base_global_address()
+        );
+
+        let base_global_trade_accounts_opt: Option<GlobalTradeAccounts> =
+            if self.base_global.is_some() {
+                Some(GlobalTradeAccounts {
+                    mint_opt: None,
+                    global: ManifestAccountInfo::new(&base_global_account_info)?,
+                    global_vault_opt: None,
+                    market_vault_opt: None,
+                    token_program_opt: None,
+                    system_program: None,
+                    gas_payer_opt: None,
+                    gas_receiver_opt: None,
+                    market: self.key.clone(),
+                    num_deferred_gas_refunds: std::cell::Cell::new(0),
+                })
+            } else {
+                None
+            };
+
+        let global_trade_accounts: &[Option<GlobalTradeAccounts>; 2] = &[
+            base_global_trade_accounts_opt,
+            quote_global_trade_accounts_opt,
+        ];
+
+        // Token-2022 transfer fees are withheld on the way in and on the way
+        // out, so the book only ever sees the post fee input and the taker only
+        // ever receives the post fee output. Quoting the gross amounts would
+        // overstate the fill by exactly the fees the swap will pay.
+        let is_base_in: bool = quote_params.input_mint == self.get_base_mint();
+        let (input_transfer_fee_config, output_transfer_fee_config): (
+            &Option<TransferFeeConfig>,
+            &Option<TransferFeeConfig>,
+        ) = if is_base_in {
+            (
+                &self.base_transfer_fee_config,
+                &self.quote_transfer_fee_config,
+            )
+        } else {
+            (
+                &self.quote_transfer_fee_config,
+                &self.base_transfer_fee_config,
+            )
+        };
+        let epoch: u64 = self.clock_ref.epoch.load(Ordering::Relaxed);
+        let in_amount_after_transfer_fees: u64 =
+            post_transfer_fee_amount(input_transfer_fee_config, epoch, quote_params.amount)?;
+
+        let out_amount: u64 = if is_base_in {
+            let in_atoms: BaseAtoms = BaseAtoms::new(in_amount_after_transfer_fees);
+            market
+                .impact_quote_atoms_with_slot(false, in_atoms, global_trade_accounts, u32::MAX)?
+                .as_u64()
+        } else {
+            let in_atoms: QuoteAtoms = QuoteAtoms::new(in_amount_after_transfer_fees);
+            market
+                .impact_base_atoms_with_slot(true, in_atoms, global_trade_accounts, u32::MAX)?
+                .as_u64()
+        };
+        let out_amount_after_transfer_fees: u64 =
+            post_transfer_fee_amount(output_transfer_fee_config, epoch, out_amount)?;
+
+        Ok(Quote {
+            // Artificially penalize by 1 atom to be worse than the non-global version.
+            // This ensures that routes that can be filled without global accounts cause less
+            // lock contention on the global accounts, which will allow them to be included
+            // the block earlier. The UX improvement should be worth at least 1 atom.
+            out_amount: out_amount_after_transfer_fees.saturating_sub(1),
+            ..Quote::default()
+        })
+    }
+
+    fn get_swap_and_account_metas(&self, swap_params: &SwapParams) -> Result<SwapAndAccountMetas> {
+        let SwapParams {
+            destination_mint,
+            source_mint,
+            source_token_account,
+            destination_token_account,
+            token_transfer_authority,
+            ..
+        } = swap_params;
+
+        let (side, base_account, quote_account) = if source_mint == &self.get_base_mint() {
+            if destination_mint != &self.get_quote_mint() {
+                return Err(Error::msg("Invalid quote mint"));
+            }
+            (Side::Ask, source_token_account, destination_token_account)
+        } else {
+            if destination_mint != &self.get_base_mint() {
+                return Err(Error::msg("Invalid base mint"));
+            }
+            (Side::Bid, destination_token_account, source_token_account)
+        };
+
+        let (base_vault, _base_bump) = get_vault_address(&self.key, &self.get_base_mint());
+        let (quote_vault, _quote_bump) = get_vault_address(&self.key, &self.get_quote_mint());
+        let (global, _global_bump) = get_global_address(destination_mint);
+        let (global_vault, _global_vault_bump) = get_global_vault_address(destination_mint);
+
+        let account_metas: Vec<AccountMeta> = vec![
+            AccountMeta::new_readonly(manifest::id(), false),
+            // This account is intended to be the payer of rent for the tx in
+            // the case of a swap that partially fills a global order and needs
+            // to expand the market. It is not checked to be a signer until it
+            // is required to expand the market.
+            AccountMeta::new(*token_transfer_authority, true),
+            AccountMeta::new(*token_transfer_authority, true),
+            AccountMeta::new(self.key, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new(*base_account, false),
+            AccountMeta::new(*quote_account, false),
+            AccountMeta::new(base_vault, false),
+            AccountMeta::new(quote_vault, false),
+            AccountMeta::new_readonly(self.base_token_program, false),
+            AccountMeta::new_readonly(self.get_base_mint(), false),
+            AccountMeta::new_readonly(self.quote_token_program, false),
+            AccountMeta::new_readonly(self.get_quote_mint(), false),
+            AccountMeta::new(global, false),
+            AccountMeta::new(global_vault, false),
+        ];
+
+        Ok(SwapAndAccountMetas {
+            swap: Swap::Openbook { side },
+            account_metas,
+        })
+    }
+
+    fn clone_amm(&self) -> Box<dyn Amm + Send + Sync> {
+        Box::new(self.clone())
+    }
+
+    fn has_dynamic_accounts(&self) -> bool {
+        false
+    }
+
+    fn unidirectional(&self) -> bool {
+        false
+    }
+
+    fn program_dependencies(&self) -> Vec<(Pubkey, String)> {
+        std::vec![]
+    }
+
+    fn get_accounts_len(&self) -> usize {
+        // 1   Program
+        // 2   Payer
+        // 3   Owner
+        // 4   Market
+        // 5   System Program
+        // 6   User Base
+        // 7   User Quote
+        // 8   Vault Base
+        // 9   Vault Quote
+        // 10  Base Token Program
+        // 11  Base Mint
+        // 12  Quote Token Program
+        // 13  Quote Mint
+        // 14  Global
+        // 15  Global Vault
+        15
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use hypertree::{get_mut_helper, DataIndex};
+    use jupiter_amm_interface::SwapMode;
+    use manifest::{
+        quantities::{BaseAtoms, GlobalAtoms},
+        state::{
+            constants::NO_EXPIRATION_LAST_VALID_SLOT, AddOrderToMarketArgs, OrderType,
+            GLOBAL_BLOCK_SIZE, MARKET_BLOCK_SIZE, MARKET_FIXED_SIZE,
+        },
+        validation::{MintAccountInfo, Signer},
+    };
+    use solana_account::Account;
+    use solana_program::pubkey;
+    use spl_token_2022::extension::{
+        transfer_fee::TransferFee, BaseStateWithExtensionsMut, ExtensionType,
+        StateWithExtensionsMut,
+    };
+    use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicU64, sync::Arc};
+
+    const BASE_MINT_KEY: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
+    const QUOTE_MINT_KEY: Pubkey = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+    const MARKET_KEY: Pubkey = pubkey!("GPPda3ZQZannxp3AK8bSishVqvhHAxogiWdhw1mvmoZr");
+    const TRADER_KEY: Pubkey = pubkey!("GCtjtH2ehL6BZTjismuZ8JhQnuM6U3bmtxVoFyiHMHGc");
+
+    macro_rules! mint_account_info {
+        ($owned:ident, $name:ident, $decimals:expr) => {
+            let key: Pubkey = if $decimals == 9 {
+                BASE_MINT_KEY
+            } else {
+                QUOTE_MINT_KEY
+            };
+            let $owned: OwnedAccount = OwnedAccount::new(&key, &spl_token::id(), 0, &[]);
+            // SAFETY: `$owned` is bound in the same scope and outlives `view`.
+            let view = unsafe { $owned.view() };
+            let $name: MintAccountInfo = MintAccountInfo {
+                mint: Mint {
+                    mint_authority: None.into(),
+                    supply: 0,
+                    decimals: $decimals,
+                    is_initialized: true,
+                    freeze_authority: None.into(),
+                },
+                info: &view,
+            };
+        };
+    }
+
+    macro_rules! dynamic_value_to_account {
+        ( $name:ident, $value:expr, $fixed_size:expr, $type:ident ) => {
+            let mut header_bytes: [u8; $fixed_size] = [0; $fixed_size];
+            *get_mut_helper::<$type>(&mut header_bytes, 0_u32) = $value.fixed;
+
+            let mut data_vec: Vec<u8> = Vec::new();
+            data_vec.extend_from_slice(&header_bytes);
+            data_vec.append(&mut $value.dynamic);
+
+            let $name: Account = Account {
+                lamports: 0,
+                data: data_vec,
+                owner: manifest::id(),
+                executable: false,
+                rent_epoch: 0,
+            };
+        };
+    }
+
+    macro_rules! signer {
+        ( $owned:ident, $name:ident) => {
+            let mut $owned: OwnedAccount = OwnedAccount::new(
+                &TRADER_KEY,
+                &solana_program::system_program::id(),
+                1_000_000_000,
+                &[],
+            );
+            $owned.set_signer(true);
+            // SAFETY: `$owned` is bound in the same scope and outlives `view`.
+            let view = unsafe { $owned.view() };
+            let $name = Signer::new(&view).expect("valid signer");
+        };
+    }
+
+    #[test]
+    fn test_jupiter_global_with_global_orders() {
+        mint_account_info!(base_mint_owned, base_mint, 9);
+        mint_account_info!(quote_mint_owned, quote_mint, 6);
+        let quote_global_key: Pubkey = get_global_address(&QUOTE_MINT_KEY).0;
+
+        let mut quote_global_value: DynamicAccount<GlobalFixed, Vec<u8>> = GlobalValue {
+            fixed: GlobalFixed::new_empty(&QUOTE_MINT_KEY),
+            // 2 because 1 deposit, 1 seat
+            dynamic: vec![0; GLOBAL_BLOCK_SIZE * 2],
+        };
+        // Claim a seat and deposit plenty of quote atoms.
+        quote_global_value.global_expand().expect("global expand");
+        quote_global_value
+            .add_trader(&TRADER_KEY)
+            .expect("claim global seat");
+        quote_global_value
+            .deposit_global(&TRADER_KEY, GlobalAtoms::new(1_000_000_000))
+            .expect("deposit quote global");
+
+        // Clone so the consumed bytes are available for the global trade
+        // accounts later when quoting.
+        dynamic_value_opt_to_account_info!(
+            quote_global_account_info_owned,
+            quote_global_account_info,
+            Some(quote_global_value.clone()),
+            GLOBAL_FIXED_SIZE,
+            GlobalFixed,
+            quote_global_key
+        );
+        signer!(gas_payer_account_info_owned, gas_payer_account_info);
+
+        let quote_global_trade_accounts: Option<GlobalTradeAccounts<'_>> =
+            Some(GlobalTradeAccounts {
+                mint_opt: None,
+                global: ManifestAccountInfo::new(&quote_global_account_info).unwrap(),
+                global_vault_opt: None,
+                market_vault_opt: None,
+                token_program_opt: None,
+                system_program: None,
+                gas_payer_opt: Some(gas_payer_account_info),
+                gas_receiver_opt: None,
+                market: MARKET_KEY,
+                num_deferred_gas_refunds: std::cell::Cell::new(0),
+            });
+
+        dynamic_value_to_account!(
+            quote_global_account,
+            quote_global_value,
+            GLOBAL_FIXED_SIZE,
+            GlobalFixed
+        );
+
+        let mut market_value: DynamicAccount<MarketFixed, Vec<u8>> = MarketValue {
+            fixed: MarketFixed::new_empty(&base_mint, &quote_mint, &MARKET_KEY),
+            // 5 because 2 extra, 1 seat, 2 orders.
+            dynamic: vec![0; MARKET_BLOCK_SIZE * 5],
+        };
+        // Claim a seat and deposit plenty on both sides.
+        market_value.market_expand().unwrap();
+        market_value.claim_seat(&TRADER_KEY).unwrap();
+        let trader_index: DataIndex = market_value.get_trader_index(&TRADER_KEY);
+        market_value
+            .deposit(trader_index, 1_000_000_000_000, true)
+            .unwrap();
+        market_value
+            .deposit(trader_index, 1_000_000_000_000, false)
+            .unwrap();
+
+        // Bid for 10 SOL@ 150USDC/SOL global
+        market_value.market_expand().unwrap();
+        market_value
+            .place_order(AddOrderToMarketArgs {
+                market: &MARKET_KEY,
+                trader_index,
+                num_base_atoms: BaseAtoms::new(10_000),
+                price: 0.150.try_into().unwrap(),
+                is_bid: true,
+                last_valid_slot: NO_EXPIRATION_LAST_VALID_SLOT,
+                order_type: OrderType::Global,
+                global_trade_accounts_opts: &[None, quote_global_trade_accounts],
+                current_slot: None,
+            })
+            .unwrap();
+
+        // Ask 10 SOL @ 180USDC/SOL
+        market_value.market_expand().unwrap();
+        market_value
+            .place_order(AddOrderToMarketArgs {
+                market: &MARKET_KEY,
+                trader_index,
+                num_base_atoms: BaseAtoms::new(10_000),
+                price: 0.180.try_into().unwrap(),
+                is_bid: false,
+                last_valid_slot: NO_EXPIRATION_LAST_VALID_SLOT,
+                order_type: OrderType::Limit,
+                global_trade_accounts_opts: &[None, None],
+                current_slot: None,
+            })
+            .unwrap();
+
+        // Expand for the second extra for the case of reverse orders.
+        market_value.market_expand().unwrap();
+        market_value.market_expand().unwrap();
+
+        dynamic_value_to_account!(market_account, market_value, MARKET_FIXED_SIZE, MarketFixed);
+
+        let market_keyed_account: KeyedAccount = KeyedAccount {
+            key: MARKET_KEY,
+            account: market_account.clone(),
+            params: None,
+        };
+
+        let amm_context: AmmContext = AmmContext {
+            clock_ref: ClockRef::default(),
+        };
+
+        let mut manifest_market: ManifestMarket =
+            ManifestMarket::from_keyed_account(&market_keyed_account, &amm_context).unwrap();
+
+        let accounts_map = AccountMap::from_iter([
+            (MARKET_KEY, market_account),
+            (quote_global_key, quote_global_account),
+            (
+                BASE_MINT_KEY,
+                Account {
+                    lamports: 0,
+                    data: Vec::new(),
+                    owner: spl_token::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            ),
+            (
+                QUOTE_MINT_KEY,
+                Account {
+                    lamports: 0,
+                    data: Vec::new(),
+                    owner: spl_token::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            ),
+        ]);
+        manifest_market.update(&accounts_map).unwrap();
+
+        let (base_mint, quote_mint) = {
+            let reserves: Vec<Pubkey> = manifest_market.get_reserve_mints();
+            (reserves[0], reserves[1])
+        };
+
+        // Ask for 1 SOL, Bid for 180 USDC
+        for (side, in_amount) in [(Side::Ask, 1_000_000_000), (Side::Bid, 180_000_000)] {
+            let (input_mint, output_mint) = match side {
+                Side::Ask => (base_mint, quote_mint),
+                Side::Bid => (quote_mint, base_mint),
+            };
+
+            let quote_params: QuoteParams = QuoteParams {
+                amount: in_amount,
+                swap_mode: SwapMode::ExactIn,
+                input_mint,
+                output_mint,
+            };
+
+            let quote: Quote = manifest_market.quote(&quote_params).unwrap();
+
+            match side {
+                Side::Ask => {
+                    assert_eq!(quote.out_amount, 1_499);
+                }
+                Side::Bid => {
+                    assert_eq!(quote.out_amount, 9_999);
+                }
+            };
+        }
+    }
+
+    /// Build a Token-2022 mint account whose `TransferFeeConfig` charges
+    /// `transfer_fee_basis_points` in every epoch.
+    fn token_2022_mint_with_transfer_fee(decimals: u8, transfer_fee_basis_points: u16) -> Account {
+        let account_len: usize =
+            ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::TransferFeeConfig])
+                .expect("mint account len");
+        let mut data: Vec<u8> = vec![0; account_len];
+        {
+            let mut mint_state: StateWithExtensionsMut<'_, Mint> =
+                StateWithExtensionsMut::<Mint>::unpack_uninitialized(&mut data)
+                    .expect("uninitialized mint");
+            let transfer_fee: TransferFee = TransferFee {
+                epoch: 0.into(),
+                maximum_fee: u64::MAX.into(),
+                transfer_fee_basis_points: transfer_fee_basis_points.into(),
+            };
+            let transfer_fee_config: &mut TransferFeeConfig = mint_state
+                .init_extension::<TransferFeeConfig>(true)
+                .expect("init transfer fee config");
+            transfer_fee_config.older_transfer_fee = transfer_fee;
+            transfer_fee_config.newer_transfer_fee = transfer_fee;
+            mint_state.base = Mint {
+                mint_authority: None.into(),
+                supply: 0,
+                decimals,
+                is_initialized: true,
+                freeze_authority: None.into(),
+            };
+            mint_state.pack_base();
+            mint_state.init_account_type().expect("init account type");
+        }
+        Account {
+            lamports: 0,
+            data,
+            owner: spl_token_2022::id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    /// The book fills the same way with or without transfer fees, so the quote
+    /// has to shrink on both sides: the vault only receives the post fee input
+    /// and the taker only receives the post fee output.
+    #[test]
+    fn test_jupiter_quote_nets_token_2022_transfer_fees() {
+        mint_account_info!(base_mint_owned, base_mint, 9);
+        mint_account_info!(quote_mint_owned, quote_mint, 6);
+
+        let mut market_value: DynamicAccount<MarketFixed, Vec<u8>> = MarketValue {
+            fixed: MarketFixed::new_empty(&base_mint, &quote_mint, &MARKET_KEY),
+            // 5 because 2 extra, 1 seat, 2 orders.
+            dynamic: vec![0; MARKET_BLOCK_SIZE * 5],
+        };
+        market_value.market_expand().unwrap();
+        market_value.claim_seat(&TRADER_KEY).unwrap();
+        let trader_index: DataIndex = market_value.get_trader_index(&TRADER_KEY);
+        market_value
+            .deposit(trader_index, 1_000_000_000_000, true)
+            .unwrap();
+        market_value
+            .deposit(trader_index, 1_000_000_000_000, false)
+            .unwrap();
+
+        // Bid for 10 SOL @ 150USDC/SOL
+        market_value.market_expand().unwrap();
+        market_value
+            .place_order(AddOrderToMarketArgs {
+                market: &MARKET_KEY,
+                trader_index,
+                num_base_atoms: BaseAtoms::new(10_000),
+                price: 0.150.try_into().unwrap(),
+                is_bid: true,
+                last_valid_slot: NO_EXPIRATION_LAST_VALID_SLOT,
+                order_type: OrderType::Limit,
+                global_trade_accounts_opts: &[None, None],
+                current_slot: None,
+            })
+            .unwrap();
+
+        // Ask 10 SOL @ 180USDC/SOL
+        market_value.market_expand().unwrap();
+        market_value
+            .place_order(AddOrderToMarketArgs {
+                market: &MARKET_KEY,
+                trader_index,
+                num_base_atoms: BaseAtoms::new(10_000),
+                price: 0.180.try_into().unwrap(),
+                is_bid: false,
+                last_valid_slot: NO_EXPIRATION_LAST_VALID_SLOT,
+                order_type: OrderType::Limit,
+                global_trade_accounts_opts: &[None, None],
+                current_slot: None,
+            })
+            .unwrap();
+
+        market_value.market_expand().unwrap();
+        market_value.market_expand().unwrap();
+
+        dynamic_value_to_account!(market_account, market_value, MARKET_FIXED_SIZE, MarketFixed);
+
+        let market_keyed_account: KeyedAccount = KeyedAccount {
+            key: MARKET_KEY,
+            account: market_account.clone(),
+            params: None,
+        };
+
+        let amm_context: AmmContext = AmmContext {
+            clock_ref: ClockRef {
+                epoch: Arc::new(AtomicU64::new(7)),
+                ..ClockRef::default()
+            },
+        };
+
+        let mut manifest_market: ManifestMarket =
+            ManifestMarket::from_keyed_account(&market_keyed_account, &amm_context).unwrap();
+
+        // 10% on the base mint, 20% on the quote mint.
+        let accounts_map = AccountMap::from_iter([
+            (MARKET_KEY, market_account),
+            (BASE_MINT_KEY, token_2022_mint_with_transfer_fee(9, 1_000)),
+            (QUOTE_MINT_KEY, token_2022_mint_with_transfer_fee(6, 2_000)),
+        ]);
+        manifest_market.update(&accounts_map).unwrap();
+
+        // Selling 1 SOL sweeps the whole bid either way, so only the 20% fee on
+        // the quote payout moves the quote: 1_500 gross becomes 1_200, less the
+        // 1 atom penalty.
+        let ask_quote: Quote = manifest_market
+            .quote(&QuoteParams {
+                amount: 1_000_000_000,
+                swap_mode: SwapMode::ExactIn,
+                input_mint: BASE_MINT_KEY,
+                output_mint: QUOTE_MINT_KEY,
+            })
+            .unwrap();
+        assert_eq!(ask_quote.out_amount, 1_199);
+
+        // Buying with 180 USDC sweeps the whole ask either way, so only the 10%
+        // fee on the base payout moves the quote: 10_000 gross becomes 9_000.
+        let bid_quote: Quote = manifest_market
+            .quote(&QuoteParams {
+                amount: 180_000_000,
+                swap_mode: SwapMode::ExactIn,
+                input_mint: QUOTE_MINT_KEY,
+                output_mint: BASE_MINT_KEY,
+            })
+            .unwrap();
+        assert_eq!(bid_quote.out_amount, 8_999);
+
+        // A buy small enough that the 20% fee on the input changes the fill
+        // shows the input side is netted too: 1_000 quote atoms reach the book
+        // as 800, which buys 4_444 base atoms at 0.180, and the 10% base fee
+        // leaves 3_999 before the 1 atom penalty.
+        let small_bid_quote: Quote = manifest_market
+            .quote(&QuoteParams {
+                amount: 1_000,
+                swap_mode: SwapMode::ExactIn,
+                input_mint: QUOTE_MINT_KEY,
+                output_mint: BASE_MINT_KEY,
+            })
+            .unwrap();
+        assert_eq!(small_bid_quote.out_amount, 3_998);
+    }
+}

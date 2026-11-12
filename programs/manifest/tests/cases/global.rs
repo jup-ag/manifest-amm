@@ -5,8 +5,9 @@ use manifest::{
     program::{
         batch_update::{CancelOrderParams, PlaceOrderParams},
         batch_update_instruction, global_add_trader_instruction, global_clean_instruction,
+        global_create_instruction::create_global_instruction,
         global_deposit_instruction, global_evict_instruction, global_withdraw_instruction,
-        swap_instruction,
+        swap_instruction, ManifestError,
     },
     quantities::{GlobalAtoms, QuoteAtomsPerBaseAtom, WrapperU64},
     state::{
@@ -14,19 +15,119 @@ use manifest::{
         NO_EXPIRATION_LAST_VALID_SLOT,
     },
 };
+use solana_account::Account;
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
-use solana_program::{instruction::Instruction, pubkey::Pubkey, system_instruction::transfer};
+use solana_program::{pubkey::Pubkey, rent::Rent};
 use solana_program_test::tokio;
 use solana_signer::Signer;
+use solana_system_interface::instruction::{create_account, transfer};
+use solana_transaction::{InstructionError, TransactionError};
 
 use crate::{
-    send_tx_with_retry, GlobalFixture, MarketFixture, MintFixture, TestFixture, Token,
-    TokenAccountFixture,
+    collector_keypair, send_tx_with_retry, GlobalFixture, MarketFixture, MintFixture, TestFixture,
+    Token, TokenAccountFixture,
 };
 
 #[tokio::test]
 async fn create_global() -> anyhow::Result<()> {
     let _test_fixture: TestFixture = TestFixture::new().await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_global_rejects_transfer_fee_mint() -> anyhow::Result<()> {
+    let test_fixture: TestFixture = TestFixture::new().await;
+    let payer_keypair: Keypair = test_fixture.payer_keypair().insecure_clone();
+    let mint_fixture: MintFixture =
+        MintFixture::new_with_transfer_fee(Rc::clone(&test_fixture.context), 9, 100).await;
+
+    let error = send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[create_global_instruction(
+            &mint_fixture.key,
+            &payer_keypair.pubkey(),
+            &spl_token_2022::id(),
+        )],
+        Some(&payer_keypair.pubkey()),
+        &[&payer_keypair],
+    )
+    .await
+    .unwrap_err()
+    .unwrap();
+    assert_eq!(
+        error,
+        TransactionError::InstructionError(
+            0,
+            InstructionError::Custom(ManifestError::InvalidMint as u32),
+        ),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_global_rejects_transfer_hook_mint() -> anyhow::Result<()> {
+    let test_fixture: TestFixture = TestFixture::new().await;
+    let payer_keypair: Keypair = test_fixture.payer_keypair().insecure_clone();
+    let mint_keypair: Keypair = Keypair::new();
+    let extension_types = vec![spl_token_2022::extension::ExtensionType::TransferHook];
+    let mint_space = spl_token_2022::extension::ExtensionType::try_calculate_account_len::<
+        spl_token_2022::state::Mint,
+    >(&extension_types)
+    .unwrap();
+    let hook_program_id = Pubkey::new_unique();
+
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[
+            create_account(
+                &payer_keypair.pubkey(),
+                &mint_keypair.pubkey(),
+                Rent::default().minimum_balance(mint_space),
+                mint_space as u64,
+                &spl_token_2022::id(),
+            ),
+            spl_token_2022::extension::transfer_hook::instruction::initialize(
+                &spl_token_2022::id(),
+                &mint_keypair.pubkey(),
+                Some(payer_keypair.pubkey()),
+                Some(hook_program_id),
+            )?,
+            spl_token_2022::instruction::initialize_mint2(
+                &spl_token_2022::id(),
+                &mint_keypair.pubkey(),
+                &payer_keypair.pubkey(),
+                None,
+                9,
+            )?,
+        ],
+        Some(&payer_keypair.pubkey()),
+        &[&payer_keypair, &mint_keypair],
+    )
+    .await?;
+
+    let error = send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[create_global_instruction(
+            &mint_keypair.pubkey(),
+            &payer_keypair.pubkey(),
+            &spl_token_2022::id(),
+        )],
+        Some(&payer_keypair.pubkey()),
+        &[&payer_keypair],
+    )
+    .await
+    .unwrap_err()
+    .unwrap();
+    assert_eq!(
+        error,
+        TransactionError::InstructionError(
+            0,
+            InstructionError::Custom(ManifestError::InvalidMint as u32),
+        ),
+    );
 
     Ok(())
 }
@@ -203,6 +304,8 @@ async fn global_cancel_order() -> anyhow::Result<()> {
         )
         .await?;
 
+    let global_key = test_fixture.global_fixture.key;
+    let lamports_before_cancel = test_fixture.try_load(&global_key).await?.unwrap().lamports;
     test_fixture
         .batch_update_with_global_for_keypair(
             None,
@@ -216,6 +319,12 @@ async fn global_cancel_order() -> anyhow::Result<()> {
     let orders: Vec<RestingOrder> = test_fixture.market_fixture.get_resting_orders().await;
     assert_eq!(orders.len(), 0, "Did not cancel");
     test_fixture.global_fixture.reload().await;
+    let lamports_after_cancel = test_fixture.try_load(&global_key).await?.unwrap().lamports;
+    assert_eq!(
+        lamports_before_cancel - lamports_after_cancel,
+        manifest::state::GAS_DEPOSIT_LAMPORTS,
+        "a cancel-only batch must still settle the global gas refund",
+    );
 
     Ok(())
 }
@@ -253,6 +362,22 @@ async fn global_match_order() -> anyhow::Result<()> {
 
     test_fixture.deposit(Token::SOL, 1_000_000).await?;
 
+    let global_key: Pubkey = test_fixture.global_fixture.key;
+    let market_key: Pubkey = test_fixture.market_fixture.key;
+    let rent: Rent = test_fixture
+        .context
+        .borrow_mut()
+        .banks_client
+        .get_rent()
+        .await?;
+    let global_lamports_before: u64 = test_fixture.try_load(&global_key).await?.unwrap().lamports;
+    // Everything the market holds above its rent minimum is protocol fees
+    // waiting for the collector. The global placement above already left an
+    // advanced order fee there, so compare the excess before and after.
+    let market_before: Account = test_fixture.try_load(&market_key).await?.unwrap();
+    let market_excess_before: u64 =
+        market_before.lamports - rent.minimum_balance(market_before.data.len());
+
     test_fixture
         .batch_update_with_global_for_keypair(
             None,
@@ -268,6 +393,22 @@ async fn global_match_order() -> anyhow::Result<()> {
             &test_fixture.payer_keypair().insecure_clone(),
         )
         .await?;
+
+    // A batch update taker asked to do the cleanup, so the gas prepayment is
+    // refunded to them and nothing is parked on the market. Only swap sends it
+    // to the market for the fee collector.
+    let global_lamports_after: u64 = test_fixture.try_load(&global_key).await?.unwrap().lamports;
+    assert_eq!(
+        global_lamports_before - global_lamports_after,
+        manifest::state::GAS_DEPOSIT_LAMPORTS,
+        "the global account must release exactly one gas prepayment",
+    );
+    let market_after: Account = test_fixture.try_load(&market_key).await?.unwrap();
+    assert_eq!(
+        market_after.lamports - rent.minimum_balance(market_after.data.len()),
+        market_excess_before,
+        "a batch update refund must not be parked on the market",
+    );
 
     test_fixture.market_fixture.reload().await;
     let orders: Vec<RestingOrder> = test_fixture.market_fixture.get_resting_orders().await;
@@ -432,7 +573,7 @@ async fn global_deposit_withdraw_22() -> anyhow::Result<()> {
     let mut global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
         Rc::clone(&test_fixture.context),
         &usdc_mint_fixture.key,
-        &spl_token_2022_interface::id(),
+        &spl_token_2022::id(),
     )
     .await;
 
@@ -462,7 +603,7 @@ async fn global_deposit_withdraw_22() -> anyhow::Result<()> {
             &global_fixture.mint_key,
             &payer,
             &token_account_fixture.key,
-            &spl_token_2022_interface::id(),
+            &spl_token_2022::id(),
             1_000_000,
         )],
         Some(&payer),
@@ -483,7 +624,7 @@ async fn global_deposit_withdraw_22() -> anyhow::Result<()> {
             &global_fixture.mint_key,
             &payer,
             &token_account_fixture.key,
-            &spl_token_2022_interface::id(),
+            &spl_token_2022::id(),
             1_000_000,
         )],
         Some(&payer),
@@ -509,7 +650,7 @@ async fn global_match_22() -> anyhow::Result<()> {
     let mut global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
         Rc::clone(&test_fixture.context),
         &usdc_mint_fixture.key,
-        &spl_token_2022_interface::id(),
+        &spl_token_2022::id(),
     )
     .await;
 
@@ -540,7 +681,7 @@ async fn global_match_22() -> anyhow::Result<()> {
             &global_fixture.mint_key,
             &payer,
             &token_account_fixture.key,
-            &spl_token_2022_interface::id(),
+            &spl_token_2022::id(),
             1_000_000,
         )],
         Some(&payer),
@@ -580,9 +721,9 @@ async fn global_match_22() -> anyhow::Result<()> {
             NO_EXPIRATION_LAST_VALID_SLOT,
         )],
         Some(*market_fixture.market.get_base_mint()),
-        Some(spl_token_interface::id()),
+        Some(spl_token::id()),
         Some(*market_fixture.market.get_quote_mint()),
-        Some(spl_token_2022_interface::id()),
+        Some(spl_token_2022::id()),
     );
 
     send_tx_with_retry(
@@ -610,8 +751,8 @@ async fn global_match_22() -> anyhow::Result<()> {
         0,
         true,
         true,
-        spl_token_interface::id(),
-        spl_token_2022_interface::id(),
+        spl_token::id(),
+        spl_token_2022::id(),
         true,
     );
 
@@ -727,11 +868,12 @@ async fn global_get_balance_not_in_global() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn global_run_out_of_seats() -> anyhow::Result<()> {
-    let test_fixture: TestFixture = TestFixture::new().await;
+    let mut test_fixture: TestFixture = TestFixture::new().await;
     let payer: Pubkey = test_fixture.payer();
     let payer_keypair: Keypair = test_fixture.payer_keypair().insecure_clone();
+    let mut first_trader: Option<Keypair> = None;
 
-    for _ in 0..MAX_GLOBAL_SEATS {
+    for index in 0..MAX_GLOBAL_SEATS {
         let keypair: Keypair = Keypair::new();
         // Fund gas and fee for the account.
         let _ = send_tx_with_retry(
@@ -748,10 +890,58 @@ async fn global_run_out_of_seats() -> anyhow::Result<()> {
             &[&payer_keypair, &keypair],
         )
         .await;
+        if index == 0 {
+            first_trader = Some(keypair);
+        }
     }
 
     // Last one doesnt work.
     assert!(test_fixture.global_add_trader().await.is_err());
+
+    // Every occupied seat has the same zero deposit. Eviction must still work
+    // when withdrawal reinsertion changes which equal node is cached as the
+    // minimum.
+    let first_trader: Keypair = first_trader.expect("first trader was inserted");
+    let evictee_token: TokenAccountFixture = TokenAccountFixture::new(
+        Rc::clone(&test_fixture.context),
+        &test_fixture.global_fixture.mint_key,
+        &first_trader.pubkey(),
+    )
+    .await;
+    let evictor_token: TokenAccountFixture = TokenAccountFixture::new(
+        Rc::clone(&test_fixture.context),
+        &test_fixture.global_fixture.mint_key,
+        &test_fixture.second_keypair.pubkey(),
+    )
+    .await;
+    test_fixture
+        .usdc_mint_fixture
+        .mint_to(&evictor_token.key, 1_u64)
+        .await;
+
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[global_evict_instruction(
+            &test_fixture.global_fixture.mint_key,
+            &test_fixture.second_keypair.pubkey(),
+            &evictor_token.key,
+            &evictee_token.key,
+            &spl_token::id(),
+            1_u64,
+        )],
+        Some(&test_fixture.second_keypair.pubkey()),
+        &[&test_fixture.second_keypair.insecure_clone()],
+    )
+    .await?;
+
+    test_fixture.global_fixture.reload().await;
+    assert_eq!(
+        test_fixture
+            .global_fixture
+            .global
+            .get_balance_atoms(&test_fixture.second_keypair.pubkey()),
+        GlobalAtoms::new(1_u64)
+    );
 
     Ok(())
 }
@@ -792,7 +982,7 @@ async fn global_evict() -> anyhow::Result<()> {
                     &test_fixture.global_fixture.mint_key,
                     &new_keypair.pubkey(),
                     &token_account_fixture.key,
-                    &spl_token_interface::id(),
+                    &spl_token::id(),
                     1_000_000,
                 ),
             ],
@@ -855,7 +1045,7 @@ async fn global_evict() -> anyhow::Result<()> {
             &test_fixture.second_keypair.pubkey(),
             &evictor_account_fixture.key,
             &evictee_account_fixture.key,
-            &spl_token_interface::id(),
+            &spl_token::id(),
             1_000_000,
         )],
         Some(&test_fixture.second_keypair.pubkey()),
@@ -933,7 +1123,7 @@ async fn global_evict_22() -> anyhow::Result<()> {
     let mut global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
         Rc::clone(&test_fixture.context),
         &usdc_mint_fixture.key,
-        &spl_token_2022_interface::id(),
+        &spl_token_2022::id(),
     )
     .await;
 
@@ -963,7 +1153,7 @@ async fn global_evict_22() -> anyhow::Result<()> {
                     &global_fixture.mint_key,
                     &new_keypair.pubkey(),
                     &token_account_fixture.key,
-                    &spl_token_2022_interface::id(),
+                    &spl_token_2022::id(),
                     1_000_000,
                 ),
             ],
@@ -993,7 +1183,7 @@ async fn global_evict_22() -> anyhow::Result<()> {
                 &global_fixture.mint_key,
                 &payer,
                 &evictee_account_fixture.key,
-                &spl_token_2022_interface::id(),
+                &spl_token_2022::id(),
                 1_000,
             ),
         ],
@@ -1022,7 +1212,7 @@ async fn global_evict_22() -> anyhow::Result<()> {
             &test_fixture.second_keypair.pubkey(),
             &evictor_account_fixture.key,
             &evictee_account_fixture.key,
-            &spl_token_2022_interface::id(),
+            &spl_token_2022::id(),
             1_000_000,
         )],
         Some(&test_fixture.second_keypair.pubkey()),
@@ -1046,6 +1236,8 @@ async fn global_evict_22() -> anyhow::Result<()> {
 #[tokio::test]
 async fn global_clean() -> anyhow::Result<()> {
     let mut test_fixture: TestFixture = TestFixture::new().await;
+    // Global clean is collector only.
+    let collector: Keypair = collector_keypair(&test_fixture.context);
     test_fixture.claim_seat().await?;
 
     test_fixture.global_add_trader().await?;
@@ -1072,12 +1264,12 @@ async fn global_clean() -> anyhow::Result<()> {
         Rc::clone(&test_fixture.context),
         &[global_clean_instruction(
             &test_fixture.global_fixture.key,
-            &test_fixture.payer(),
+            &collector.pubkey(),
             &test_fixture.market_fixture.key,
             MARKET_BLOCK_SIZE as DataIndex
         ),],
-        Some(&test_fixture.payer()),
-        &[&test_fixture.payer_keypair().insecure_clone()],
+        Some(&collector.pubkey()),
+        &[&collector],
     )
     .await
     .is_err());
@@ -1088,12 +1280,12 @@ async fn global_clean() -> anyhow::Result<()> {
         Rc::clone(&test_fixture.context),
         &[global_clean_instruction(
             &test_fixture.global_fixture.key,
-            &test_fixture.payer(),
+            &collector.pubkey(),
             &test_fixture.market_fixture.key,
             MARKET_BLOCK_SIZE as DataIndex,
         )],
-        Some(&test_fixture.payer()),
-        &[&test_fixture.payer_keypair().insecure_clone()],
+        Some(&collector.pubkey()),
+        &[&collector],
     )
     .await?;
 
@@ -1103,10 +1295,14 @@ async fn global_clean() -> anyhow::Result<()> {
 #[tokio::test]
 async fn maintenance_clean() -> anyhow::Result<()> {
     let mut test_fixture: TestFixture = TestFixture::new().await;
+    // Global clean is collector only.
+    let collector: Keypair = collector_keypair(&test_fixture.context);
     test_fixture.claim_seat().await?;
     test_fixture.global_add_trader().await?;
     test_fixture.deposit(Token::USDC, 100).await?;
+    test_fixture.global_deposit(1_000_000).await?;
 
+    // Assume 1_000 is sufficiently far enough that it is not already expired.
     test_fixture
         .batch_update_for_keypair(
             None,
@@ -1117,7 +1313,7 @@ async fn maintenance_clean() -> anyhow::Result<()> {
                 0,
                 true,
                 OrderType::Limit,
-                NO_EXPIRATION_LAST_VALID_SLOT,
+                1_000,
             )],
             &test_fixture.payer_keypair().insecure_clone(),
         )
@@ -1125,17 +1321,56 @@ async fn maintenance_clean() -> anyhow::Result<()> {
 
     test_fixture.advance_time_seconds(14 * 24 * 60 * 60).await;
 
-    // Clean should succeed.
+    // Clean should succeed because expired
     send_tx_with_retry(
         Rc::clone(&test_fixture.context),
         &[global_clean_instruction(
             &test_fixture.global_fixture.key,
-            &test_fixture.payer(),
+            &collector.pubkey(),
             &test_fixture.market_fixture.key,
             MARKET_BLOCK_SIZE as DataIndex,
         )],
-        Some(&test_fixture.payer()),
-        &[&test_fixture.payer_keypair().insecure_clone()],
+        Some(&collector.pubkey()),
+        &[&collector],
+    )
+    .await?;
+
+    test_fixture.market_fixture.reload().await;
+
+    let bids = test_fixture.market_fixture.market.get_bids();
+    let next = bids.iter::<RestingOrder>().next();
+    assert_eq!(next, None);
+
+    test_fixture
+        .batch_update_with_global_for_keypair(
+            None,
+            vec![],
+            vec![PlaceOrderParams::new(
+                100,
+                1,
+                0,
+                true,
+                OrderType::Global,
+                NO_EXPIRATION_LAST_VALID_SLOT,
+            )],
+            &test_fixture.payer_keypair().insecure_clone(),
+        )
+        .await?;
+
+    // Unback the global.
+    test_fixture.global_withdraw(1_000_000).await?;
+
+    // Clean should succeed because unbacked
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[global_clean_instruction(
+            &test_fixture.global_fixture.key,
+            &collector.pubkey(),
+            &test_fixture.market_fixture.key,
+            MARKET_BLOCK_SIZE as DataIndex,
+        )],
+        Some(&collector.pubkey()),
+        &[&collector],
     )
     .await?;
 
@@ -1299,6 +1534,94 @@ async fn global_stop_without_global() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn global_deposit_with_transfer_fee() -> anyhow::Result<()> {
+    let test_fixture: TestFixture = TestFixture::new().await;
+    let payer: Pubkey = test_fixture.payer();
+    let payer_keypair: Keypair = test_fixture.payer_keypair().insecure_clone();
+
+    // Create the global while the mutable transfer fee is zero, then activate
+    // a 10% fee. Existing globals still need safe deposit/withdraw behavior.
+    let transfer_fee_bps: u16 = 1000; // 10%
+    let mut mint_fixture: MintFixture = MintFixture::new_with_mutable_transfer_fee(
+        Rc::clone(&test_fixture.context),
+        9, // decimals
+        0,
+    )
+    .await;
+
+    let mut global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
+        Rc::clone(&test_fixture.context),
+        &mint_fixture.key,
+        &spl_token_2022::id(),
+    )
+    .await;
+
+    mint_fixture
+        .set_transfer_fee_and_advance_epoch(transfer_fee_bps)
+        .await;
+
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[global_add_trader_instruction(&global_fixture.key, &payer)],
+        Some(&payer),
+        &[&payer_keypair],
+    )
+    .await?;
+
+    // Create a Token-2022 token account for the mint with transfer fee
+    // These accounts need the TransferFeeAmount extension
+    let token_account_keypair: Keypair = Keypair::new();
+    let token_account_fixture: TokenAccountFixture =
+        TokenAccountFixture::new_with_keypair_2022_transfer_fee(
+            Rc::clone(&test_fixture.context),
+            &mint_fixture.key,
+            &payer,
+            &token_account_keypair,
+        )
+        .await;
+
+    // Mint 1_000_000 tokens
+    let deposit_amount: u64 = 1_000_000;
+    mint_fixture
+        .mint_to_2022(&token_account_fixture.key, deposit_amount)
+        .await;
+
+    // Deposit to global
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[global_deposit_instruction(
+            &mint_fixture.key,
+            &payer,
+            &token_account_fixture.key,
+            &spl_token_2022::id(),
+            deposit_amount,
+        )],
+        Some(&payer),
+        &[&payer_keypair],
+    )
+    .await?;
+
+    global_fixture.reload().await;
+    let global_dynamic_account: &DynamicAccount<GlobalFixed, Vec<u8>> = &global_fixture.global;
+
+    // With 10% transfer fee, the vault should receive 90% of the deposited amount
+    // Transfer fee calculation: fee = amount * fee_bps / 10000
+    // fee = 1_000_000 * 1000 / 10000 = 100_000
+    // amount_after_fee = 1_000_000 - 100_000 = 900_000
+    let expected_balance: u64 = deposit_amount - (deposit_amount * transfer_fee_bps as u64 / 10000);
+    let balance_atoms: GlobalAtoms = global_dynamic_account.get_balance_atoms(&payer);
+    assert_eq!(
+        balance_atoms,
+        GlobalAtoms::new(expected_balance),
+        "Balance should be {} after 10% transfer fee, but got {}",
+        expected_balance,
+        balance_atoms.as_u64()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn global_crash_without_global() -> anyhow::Result<()> {
     let mut test_fixture: TestFixture = TestFixture::new().await;
     test_fixture.claim_seat().await?;
@@ -1341,6 +1664,831 @@ async fn global_crash_without_global() -> anyhow::Result<()> {
             .await
             .is_err(),
         "Walked past a global without global account and left crossed book"
+    );
+
+    Ok(())
+}
+
+/// Test matching through multiple levels of global orders.
+/// This tests the batched global token transfer optimization where
+/// all global token transfers are accumulated and done in a single CPI.
+#[tokio::test]
+async fn global_match_multiple_levels() -> anyhow::Result<()> {
+    let mut test_fixture: TestFixture = TestFixture::new().await;
+
+    // Setup maker with global orders at multiple price levels
+    let maker_keypair = test_fixture.second_keypair.insecure_clone();
+    test_fixture.claim_seat_for_keypair(&maker_keypair).await?;
+    test_fixture
+        .global_add_trader_for_keypair(&maker_keypair)
+        .await?;
+    test_fixture
+        .global_deposit_for_keypair(&maker_keypair, 10_000_000)
+        .await?;
+
+    // Place 3 global bid orders at different price levels
+    // Order 1: 100 base @ 1.2 (costs 120 quote)
+    // Order 2: 200 base @ 1.1 (costs 220 quote)
+    // Order 3: 300 base @ 1.0 (costs 300 quote)
+    // Total quote needed: 640
+    test_fixture
+        .batch_update_with_global_for_keypair(
+            None,
+            vec![],
+            vec![
+                PlaceOrderParams::new(
+                    100,
+                    12,
+                    -1, // price = 1.2
+                    true,
+                    OrderType::Global,
+                    NO_EXPIRATION_LAST_VALID_SLOT,
+                ),
+                PlaceOrderParams::new(
+                    200,
+                    11,
+                    -1, // price = 1.1
+                    true,
+                    OrderType::Global,
+                    NO_EXPIRATION_LAST_VALID_SLOT,
+                ),
+                PlaceOrderParams::new(
+                    300,
+                    10,
+                    -1, // price = 1.0
+                    true,
+                    OrderType::Global,
+                    NO_EXPIRATION_LAST_VALID_SLOT,
+                ),
+            ],
+            &maker_keypair,
+        )
+        .await?;
+
+    // Verify orders are on the book
+    test_fixture.market_fixture.reload().await;
+    let orders: Vec<RestingOrder> = test_fixture.market_fixture.get_resting_orders().await;
+    assert_eq!(orders.len(), 3, "Should have 3 resting orders");
+
+    // Setup taker
+    test_fixture.claim_seat().await?;
+    test_fixture.deposit(Token::SOL, 10_000_000).await?;
+
+    // Taker sells 600 base, which should match all 3 global orders
+    // Best bid is 1.2, then 1.1, then 1.0
+    // Match 100 @ 1.2 = 120 quote
+    // Match 200 @ 1.1 = 220 quote
+    // Match 300 @ 1.0 = 300 quote
+    // Total: 640 quote received by taker
+    test_fixture
+        .batch_update_with_global_for_keypair(
+            None,
+            vec![],
+            vec![PlaceOrderParams::new(
+                600,
+                1,
+                0, // willing to sell at any price >= 0.1
+                false,
+                OrderType::Limit,
+                NO_EXPIRATION_LAST_VALID_SLOT,
+            )],
+            &test_fixture.payer_keypair().insecure_clone(),
+        )
+        .await?;
+
+    // Verify all orders matched
+    test_fixture.market_fixture.reload().await;
+    let orders: Vec<RestingOrder> = test_fixture.market_fixture.get_resting_orders().await;
+    assert_eq!(orders.len(), 0, "All orders should be matched");
+
+    // Verify taker balances
+    // Started with 10_000_000 base, sold 600 = 9_999_400
+    // Received: 100*1.2 + 200*1.1 + 300*1.0 = 120 + 220 + 300 = 640 quote
+    assert_eq!(
+        test_fixture
+            .market_fixture
+            .get_base_balance_atoms(&test_fixture.payer())
+            .await,
+        10_000_000 - 600,
+        "Taker base balance incorrect"
+    );
+    assert_eq!(
+        test_fixture
+            .market_fixture
+            .get_quote_balance_atoms(&test_fixture.payer())
+            .await,
+        640,
+        "Taker quote balance incorrect"
+    );
+
+    // Verify maker balances
+    // Maker received 600 base total
+    // Maker spent 640 quote from global
+    assert_eq!(
+        test_fixture
+            .market_fixture
+            .get_base_balance_atoms(&maker_keypair.pubkey())
+            .await,
+        600,
+        "Maker base balance incorrect"
+    );
+    assert_eq!(
+        test_fixture
+            .market_fixture
+            .get_quote_balance_atoms(&maker_keypair.pubkey())
+            .await,
+        0,
+        "Maker quote balance incorrect"
+    );
+
+    // Verify global balance reduced correctly
+    // Started with 10_000_000, spent 640
+    test_fixture.global_fixture.reload().await;
+    assert_eq!(
+        test_fixture
+            .global_fixture
+            .global
+            .get_balance_atoms(&maker_keypair.pubkey())
+            .as_u64(),
+        10_000_000 - 640,
+        "Global balance incorrect"
+    );
+
+    Ok(())
+}
+
+/// Test that global creation succeeds when the global address PDA has been
+/// "dusted" with SOL before initialization. This verifies the recovery mechanism
+/// that transfers any existing lamports from the global address back to the payer
+/// before creating the account.
+#[tokio::test]
+async fn global_create_with_dusted_address() -> anyhow::Result<()> {
+    use manifest::validation::get_global_address;
+    use solana_system_interface::instruction::transfer;
+
+    let test_fixture: TestFixture = TestFixture::new().await;
+    let payer: Pubkey = test_fixture.payer();
+    let payer_keypair: Keypair = test_fixture.payer_keypair().insecure_clone();
+
+    // Create a new mint for this test (don't reuse the one from TestFixture
+    // since GlobalFixture is already created for that mint)
+    let mint_fixture: MintFixture =
+        MintFixture::new(Rc::clone(&test_fixture.context), Some(6)).await;
+
+    // Get the global PDA address that will be created for this mint
+    let (global_key, _global_bump) = get_global_address(&mint_fixture.key);
+
+    // "Dust" the global address with SOL before it's initialized
+    let dust_amount: u64 = 10_000_000; // 0.01 SOL
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[transfer(&payer, &global_key, dust_amount)],
+        Some(&payer),
+        &[&payer_keypair],
+    )
+    .await?;
+
+    // Verify the dust landed at the global address
+    let global_account_before = test_fixture
+        .context
+        .borrow_mut()
+        .banks_client
+        .get_account(global_key)
+        .await
+        .unwrap();
+    assert!(
+        global_account_before.is_some(),
+        "Global address should have lamports from dusting"
+    );
+    assert_eq!(
+        global_account_before.unwrap().lamports,
+        dust_amount,
+        "Global address should have exactly the dust amount"
+    );
+
+    // Now create the global - this should succeed despite the dust
+    let mut global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
+        Rc::clone(&test_fixture.context),
+        &mint_fixture.key,
+        &spl_token::id(),
+    )
+    .await;
+
+    // Verify the global was created successfully
+    global_fixture.reload().await;
+    assert_eq!(
+        *global_fixture.global.fixed.get_mint(),
+        mint_fixture.key,
+        "Global should be initialized with correct mint"
+    );
+
+    // Verify the global account now has the correct data and owner
+    let global_account_after = test_fixture
+        .context
+        .borrow_mut()
+        .banks_client
+        .get_account(global_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        global_account_after.owner,
+        manifest::id(),
+        "Global account should be owned by manifest program"
+    );
+
+    // Verify that the payer received the dust back (minus tx fees)
+    // The payer should have: initial - dust - create_cost - tx_fees + dust = initial - create_cost - tx_fees
+    // Since we can't easily calculate exact fees, we just verify the account works
+    // by doing a deposit operation
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[global_add_trader_instruction(&global_fixture.key, &payer)],
+        Some(&payer),
+        &[&payer_keypair],
+    )
+    .await?;
+
+    global_fixture.reload().await;
+    let balance_atoms = global_fixture.global.get_balance_atoms(&payer);
+    assert_eq!(balance_atoms, manifest::quantities::GlobalAtoms::ZERO);
+
+    Ok(())
+}
+
+/// Test matching through multiple global orders where some are unbacked.
+/// Verifies that unbacked orders are skipped and backed orders still match.
+#[tokio::test]
+async fn global_match_multiple_levels_with_unbacked() -> anyhow::Result<()> {
+    let mut test_fixture: TestFixture = TestFixture::new().await;
+
+    // Setup first maker with limited funds (can only back 2 of 3 orders)
+    let maker1_keypair = test_fixture.second_keypair.insecure_clone();
+    test_fixture.claim_seat_for_keypair(&maker1_keypair).await?;
+    test_fixture
+        .global_add_trader_for_keypair(&maker1_keypair)
+        .await?;
+    // Deposit only enough for 2 orders worth (120 + 220 = 340)
+    test_fixture
+        .global_deposit_for_keypair(&maker1_keypair, 340)
+        .await?;
+
+    // Place 3 orders but only have funds to back 2
+    test_fixture
+        .batch_update_with_global_for_keypair(
+            None,
+            vec![],
+            vec![
+                PlaceOrderParams::new(
+                    100,
+                    12,
+                    -1, // price = 1.2, costs 120 quote
+                    true,
+                    OrderType::Global,
+                    NO_EXPIRATION_LAST_VALID_SLOT,
+                ),
+                PlaceOrderParams::new(
+                    200,
+                    11,
+                    -1, // price = 1.1, costs 220 quote
+                    true,
+                    OrderType::Global,
+                    NO_EXPIRATION_LAST_VALID_SLOT,
+                ),
+                PlaceOrderParams::new(
+                    300,
+                    10,
+                    -1, // price = 1.0, costs 300 quote - UNBACKED
+                    true,
+                    OrderType::Global,
+                    NO_EXPIRATION_LAST_VALID_SLOT,
+                ),
+            ],
+            &maker1_keypair,
+        )
+        .await?;
+
+    test_fixture.market_fixture.reload().await;
+    let orders: Vec<RestingOrder> = test_fixture.market_fixture.get_resting_orders().await;
+    assert_eq!(orders.len(), 3, "Should have 3 resting orders");
+
+    // Setup taker
+    test_fixture.claim_seat().await?;
+    test_fixture.deposit(Token::SOL, 10_000_000).await?;
+
+    // Taker sells 600 base
+    // Should match: 100 @ 1.2 = 120, 200 @ 1.1 = 220
+    // Third order at 1.0 is unbacked and will be cleaned
+    test_fixture
+        .batch_update_with_global_for_keypair(
+            None,
+            vec![],
+            vec![PlaceOrderParams::new(
+                600,
+                1,
+                0,
+                false,
+                OrderType::Limit,
+                NO_EXPIRATION_LAST_VALID_SLOT,
+            )],
+            &test_fixture.payer_keypair().insecure_clone(),
+        )
+        .await?;
+
+    test_fixture.market_fixture.reload().await;
+    let orders: Vec<RestingOrder> = test_fixture.market_fixture.get_resting_orders().await;
+    // Unbacked order removed, taker's remaining 300 base rests as ask
+    assert_eq!(orders.len(), 1, "Should have 1 resting order (taker's ask)");
+    let remaining_order = orders.first().unwrap();
+    assert_eq!(
+        remaining_order.get_num_base_atoms(),
+        300,
+        "Remaining ask should be 300 base"
+    );
+
+    // Verify taker traded 300 base (100 + 200 matched, 300 rests)
+    assert_eq!(
+        test_fixture
+            .market_fixture
+            .get_base_balance_atoms(&test_fixture.payer())
+            .await,
+        10_000_000 - 600, // 600 deposited for the sell order
+        "Taker base balance incorrect"
+    );
+    // Received 120 + 220 = 340 quote
+    assert_eq!(
+        test_fixture
+            .market_fixture
+            .get_quote_balance_atoms(&test_fixture.payer())
+            .await,
+        340,
+        "Taker quote balance incorrect"
+    );
+
+    // Verify maker got 300 base (100 + 200)
+    assert_eq!(
+        test_fixture
+            .market_fixture
+            .get_base_balance_atoms(&maker1_keypair.pubkey())
+            .await,
+        300,
+        "Maker base balance incorrect"
+    );
+
+    // Verify global balance is zero (all 340 used)
+    test_fixture.global_fixture.reload().await;
+    assert_eq!(
+        test_fixture
+            .global_fixture
+            .global
+            .get_balance_atoms(&maker1_keypair.pubkey())
+            .as_u64(),
+        0,
+        "Global balance should be zero"
+    );
+
+    Ok(())
+}
+
+/// Test that global creation succeeds when the global vault address PDA has been
+/// "dusted" with SOL before initialization. This verifies the recovery mechanism
+/// that transfers any existing lamports from the vault address back to the payer
+/// before creating the token account. Tests both regular SPL token and Token-2022.
+#[tokio::test]
+async fn global_create_with_dusted_vault_address() -> anyhow::Result<()> {
+    use manifest::validation::get_global_vault_address;
+    use solana_system_interface::instruction::transfer;
+
+    let test_fixture: TestFixture = TestFixture::new().await;
+    let payer: Pubkey = test_fixture.payer();
+    let payer_keypair: Keypair = test_fixture.payer_keypair().insecure_clone();
+
+    {
+        // Create a new mint for this test
+        let mint_fixture: MintFixture =
+            MintFixture::new(Rc::clone(&test_fixture.context), Some(6)).await;
+
+        // Get the global vault PDA address
+        let (global_vault_key, _) = get_global_vault_address(&mint_fixture.key);
+
+        // "Dust" the global vault address with SOL before it's initialized
+        let dust_amount: u64 = 5_000_000; // 0.005 SOL
+        send_tx_with_retry(
+            Rc::clone(&test_fixture.context),
+            &[transfer(&payer, &global_vault_key, dust_amount)],
+            Some(&payer),
+            &[&payer_keypair],
+        )
+        .await?;
+
+        // Verify the dust landed at the global vault address
+        let vault_account_before = test_fixture
+            .context
+            .borrow_mut()
+            .banks_client
+            .get_account(global_vault_key)
+            .await
+            .unwrap();
+        assert!(
+            vault_account_before.is_some(),
+            "Vault address should have lamports from dusting"
+        );
+        assert_eq!(
+            vault_account_before.unwrap().lamports,
+            dust_amount,
+            "Vault address should have exactly the dust amount"
+        );
+
+        // Create the global - this should succeed despite the dust
+        let mut global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
+            Rc::clone(&test_fixture.context),
+            &mint_fixture.key,
+            &spl_token::id(),
+        )
+        .await;
+
+        // Verify the global was created successfully
+        global_fixture.reload().await;
+        assert_eq!(
+            *global_fixture.global.fixed.get_mint(),
+            mint_fixture.key,
+            "Global should be initialized with correct mint"
+        );
+
+        // Verify the vault is now a token account owned by the token program
+        let vault_account_after = test_fixture
+            .context
+            .borrow_mut()
+            .banks_client
+            .get_account(global_vault_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            vault_account_after.owner,
+            spl_token::id(),
+            "Vault should be owned by SPL token program"
+        );
+
+        // Verify the global can be used normally
+        send_tx_with_retry(
+            Rc::clone(&test_fixture.context),
+            &[global_add_trader_instruction(&global_fixture.key, &payer)],
+            Some(&payer),
+            &[&payer_keypair],
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Test that global eviction fails when transfer fees reduce the deposited amount
+/// below the evictee's balance. This verifies the fix that checks the actual deposited
+/// amount rather than the requested amount.
+#[tokio::test]
+async fn global_evict_fails_with_transfer_fee() -> anyhow::Result<()> {
+    let test_fixture: TestFixture = TestFixture::new().await;
+
+    let payer: Pubkey = test_fixture.payer();
+    let payer_keypair: Keypair = test_fixture.payer_keypair().insecure_clone();
+
+    // Create the global while the mutable transfer fee is zero, then activate
+    // a 20% fee. This models globals created before a mint configuration change.
+    let transfer_fee_bps: u16 = 2000; // 20%
+    let mut mint_fixture: MintFixture = MintFixture::new_with_mutable_transfer_fee(
+        Rc::clone(&test_fixture.context),
+        9, // decimals
+        0,
+    )
+    .await;
+
+    let mut global_fixture: GlobalFixture = GlobalFixture::new_with_token_program(
+        Rc::clone(&test_fixture.context),
+        &mint_fixture.key,
+        &spl_token_2022::id(),
+    )
+    .await;
+
+    mint_fixture
+        .set_transfer_fee_and_advance_epoch(transfer_fee_bps)
+        .await;
+
+    // Fill up the global to capacity - 1
+    for _ in 0..MAX_GLOBAL_SEATS - 1 {
+        let new_keypair: Keypair = Keypair::new();
+        let token_account_keypair: Keypair = Keypair::new();
+        let token_account_fixture: TokenAccountFixture =
+            TokenAccountFixture::new_with_keypair_2022_transfer_fee(
+                Rc::clone(&test_fixture.context),
+                &mint_fixture.key,
+                &new_keypair.pubkey(),
+                &token_account_keypair,
+            )
+            .await;
+        mint_fixture
+            .mint_to_2022(&token_account_fixture.key, 10_000_000)
+            .await;
+
+        let _ = send_tx_with_retry(
+            Rc::clone(&test_fixture.context),
+            &[
+                transfer(&payer, &new_keypair.pubkey(), 10_000_000),
+                global_add_trader_instruction(&global_fixture.key, &new_keypair.pubkey()),
+                global_deposit_instruction(
+                    &global_fixture.mint_key,
+                    &new_keypair.pubkey(),
+                    &token_account_fixture.key,
+                    &spl_token_2022::id(),
+                    10_000_000,
+                ),
+            ],
+            Some(&payer_keypair.pubkey()),
+            &[&payer_keypair, &new_keypair],
+        )
+        .await;
+    }
+
+    // Add the evictee (payer) with 1000 tokens (after 20% fee, they get 800)
+    let evictee_account_keypair: Keypair = Keypair::new();
+    let evictee_account_fixture: TokenAccountFixture =
+        TokenAccountFixture::new_with_keypair_2022_transfer_fee(
+            Rc::clone(&test_fixture.context),
+            &mint_fixture.key,
+            &payer,
+            &evictee_account_keypair,
+        )
+        .await;
+    mint_fixture
+        .mint_to_2022(&evictee_account_fixture.key, 1_000)
+        .await;
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[
+            global_add_trader_instruction(&global_fixture.key, &payer),
+            global_deposit_instruction(
+                &global_fixture.mint_key,
+                &payer,
+                &evictee_account_fixture.key,
+                &spl_token_2022::id(),
+                1_000,
+            ),
+        ],
+        Some(&payer_keypair.pubkey()),
+        &[&payer_keypair],
+    )
+    .await?;
+
+    // Evictee has 800 tokens after 20% fee on 1000
+    global_fixture.reload().await;
+    let evictee_balance = global_fixture.global.get_balance_atoms(&payer);
+    assert_eq!(
+        evictee_balance.as_u64(),
+        800,
+        "Evictee should have 800 after 20% fee"
+    );
+
+    // Evictor tries to deposit 1000 tokens, which would be valid without fees
+    // But with 20% fee, they only deposit 800 which is NOT greater than evictee's 800
+    let evictor_account_keypair: Keypair = Keypair::new();
+    let evictor_account_fixture: TokenAccountFixture =
+        TokenAccountFixture::new_with_keypair_2022_transfer_fee(
+            Rc::clone(&test_fixture.context),
+            &mint_fixture.key,
+            &test_fixture.second_keypair.pubkey(),
+            &evictor_account_keypair,
+        )
+        .await;
+    mint_fixture
+        .mint_to_2022(&evictor_account_fixture.key, 1_000)
+        .await;
+
+    // This eviction should FAIL because 1000 * 0.8 = 800 is NOT > 800
+    let result = send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[global_evict_instruction(
+            &global_fixture.mint_key,
+            &test_fixture.second_keypair.pubkey(),
+            &evictor_account_fixture.key,
+            &evictee_account_fixture.key,
+            &spl_token_2022::id(),
+            1_000,
+        )],
+        Some(&test_fixture.second_keypair.pubkey()),
+        &[&test_fixture.second_keypair.insecure_clone()],
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "Eviction should fail when transfer fee makes deposited amount not greater than evictee balance"
+    );
+
+    // Verify evictee still has their balance
+    global_fixture.reload().await;
+    let evictee_balance_after = global_fixture.global.get_balance_atoms(&payer);
+    assert_eq!(
+        evictee_balance_after.as_u64(),
+        800,
+        "Evictee should still have 800 tokens after failed eviction"
+    );
+
+    Ok(())
+}
+
+// Regression test: cancelling a global order on one side while placing a
+// global order on the other side in the same batch update used to fail with
+// "sum of account balances before and after instruction do not match". The
+// cancel refunded the gas prepayment with a direct lamport move from the base
+// global account, and the gas prepayment CPI for the new bid only included
+// the quote global account, so the runtime lamport sum check at the CPI
+// boundary saw the payer credit without the base global debit.
+#[tokio::test]
+async fn global_cancel_and_place_opposite_sides() -> anyhow::Result<()> {
+    let mut test_fixture: TestFixture = TestFixture::new().await;
+    test_fixture.claim_seat().await?;
+    let payer: Pubkey = test_fixture.payer();
+    let payer_keypair: Keypair = test_fixture.payer_keypair().insecure_clone();
+
+    // Quote (USDC) global to back the bid.
+    test_fixture.global_add_trader().await?;
+    test_fixture.global_deposit(1_000_000).await?;
+
+    // Base (SOL) global to back the ask.
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[global_add_trader_instruction(
+            &test_fixture.sol_global_fixture.key,
+            &payer,
+        )],
+        Some(&payer),
+        &[&payer_keypair],
+    )
+    .await?;
+    let token_account_keypair: Keypair = Keypair::new();
+    let token_account_fixture: TokenAccountFixture = TokenAccountFixture::new_with_keypair(
+        Rc::clone(&test_fixture.context),
+        &test_fixture.sol_global_fixture.mint_key,
+        &payer,
+        &token_account_keypair,
+    )
+    .await;
+    test_fixture
+        .sol_mint_fixture
+        .mint_to(&token_account_fixture.key, 1_000_000)
+        .await;
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[global_deposit_instruction(
+            &test_fixture.sol_global_fixture.mint_key,
+            &payer,
+            &token_account_fixture.key,
+            &spl_token::id(),
+            1_000_000,
+        )],
+        Some(&payer),
+        &[&payer_keypair],
+    )
+    .await?;
+
+    let base_mint: Pubkey = *test_fixture.market_fixture.market.get_base_mint();
+    let quote_mint: Pubkey = *test_fixture.market_fixture.market.get_quote_mint();
+
+    // Place a global ask.
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[batch_update_instruction(
+            &test_fixture.market_fixture.key,
+            &payer,
+            None,
+            vec![],
+            vec![PlaceOrderParams::new(
+                10,
+                2,
+                0,
+                false,
+                OrderType::Global,
+                NO_EXPIRATION_LAST_VALID_SLOT,
+            )],
+            Some(base_mint),
+            None,
+            Some(quote_mint),
+            None,
+        )],
+        Some(&payer),
+        &[&payer_keypair],
+    )
+    .await?;
+
+    // Cancel the global ask and place a global bid in the same instruction.
+    // The refund comes from the base global account while the gas prepayment
+    // CPI only includes the quote global account.
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[batch_update_instruction(
+            &test_fixture.market_fixture.key,
+            &payer,
+            None,
+            vec![CancelOrderParams::new(0)],
+            vec![PlaceOrderParams::new(
+                10,
+                1,
+                0,
+                true,
+                OrderType::Global,
+                NO_EXPIRATION_LAST_VALID_SLOT,
+            )],
+            Some(base_mint),
+            None,
+            Some(quote_mint),
+            None,
+        )],
+        Some(&payer),
+        &[&payer_keypair],
+    )
+    .await?;
+
+    test_fixture.market_fixture.reload().await;
+    let orders: Vec<RestingOrder> = test_fixture.market_fixture.get_resting_orders().await;
+    assert_eq!(orders.len(), 1, "Expected only the new bid to be resting");
+    assert!(orders.get(0).unwrap().get_is_bid(), "Expected a bid");
+
+    // A mixed batch must prepay each global only for its own global orders.
+    // Include a local IOC so non-global orders cannot be counted accidentally.
+    let globals = [
+        test_fixture.sol_global_fixture.key,
+        test_fixture.global_fixture.key,
+    ];
+    let mut before = [0u64; 2];
+    for (i, key) in globals.iter().enumerate() {
+        before[i] = test_fixture
+            .context
+            .borrow_mut()
+            .banks_client
+            .get_account(*key)
+            .await?
+            .unwrap()
+            .lamports;
+    }
+    let mixed_orders = [
+        (true, OrderType::Global),
+        (false, OrderType::Global),
+        (false, OrderType::ImmediateOrCancel),
+        (true, OrderType::Global),
+        (false, OrderType::Global),
+        (false, OrderType::Global),
+    ]
+    .into_iter()
+    .map(|(is_bid, order_type)| {
+        PlaceOrderParams::new(
+            if order_type == OrderType::Global {
+                10
+            } else {
+                0
+            },
+            if is_bid { 1 } else { 2 },
+            0,
+            is_bid,
+            order_type,
+            NO_EXPIRATION_LAST_VALID_SLOT,
+        )
+    })
+    .collect();
+    send_tx_with_retry(
+        Rc::clone(&test_fixture.context),
+        &[batch_update_instruction(
+            &test_fixture.market_fixture.key,
+            &payer,
+            None,
+            vec![],
+            mixed_orders,
+            Some(base_mint),
+            None,
+            Some(quote_mint),
+            None,
+        )],
+        Some(&payer),
+        &[&payer_keypair],
+    )
+    .await?;
+    for (i, count) in [3u64, 2].into_iter().enumerate() {
+        let after = test_fixture
+            .context
+            .borrow_mut()
+            .banks_client
+            .get_account(globals[i])
+            .await?
+            .unwrap()
+            .lamports;
+        assert_eq!(
+            after - before[i],
+            count * manifest::state::GAS_DEPOSIT_LAMPORTS
+        );
+    }
+    test_fixture.market_fixture.reload().await;
+    assert_eq!(
+        test_fixture.market_fixture.get_resting_orders().await.len(),
+        6
     );
 
     Ok(())

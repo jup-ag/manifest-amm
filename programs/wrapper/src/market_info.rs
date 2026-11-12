@@ -28,9 +28,17 @@ pub struct MarketInfo {
     /// Quote volume traded over lifetime, can overflow.
     pub quote_volume: QuoteAtoms,
 
-    /// Last slot that a sync was called on.
-    pub last_updated_slot: u32,
-    pub _padding: [u32; 3],
+    /// Reserved for byte-layout compatibility. The deployed wrapper wrote its
+    /// last-updated slot here, but the candidate does not use it as a cursor.
+    pub cancel_all_scan_cursor: u32,
+    /// Open orders of type Global on this market that the wrapper tracks.
+    /// Those can be removed by global clean and evict without any order being
+    /// placed, so while it is non zero the opening sync always walks the
+    /// orders (see `sync_fast`). Recounted on every full walk. Was padding.
+    pub num_open_global_orders: u32,
+    /// The market's order sequence number the last time the wrapper's view of
+    /// its open orders was exact, zero if never. Was padding.
+    pub last_synced_order_sequence_number: u64,
 }
 
 // Blocks on wrapper are bigger than blocks on the market because there is more
@@ -42,8 +50,9 @@ pub struct MarketInfo {
 // 8 +  // base_balance
 // 8 +  // quote_balance
 // 8 +  // quote_volume
-// 4 +  // last_updated_slot
-// 12   // padding
+// 4 +  // cancel_all_scan_cursor
+// 4 +  // num_open_global_orders
+// 8    // last_synced_order_sequence_number
 // = 80
 const_assert_eq!(size_of::<MarketInfo>(), WRAPPER_BLOCK_PAYLOAD_SIZE);
 const_assert_eq!(size_of::<MarketInfo>() % 16, 0);
@@ -89,7 +98,7 @@ impl std::fmt::Display for MarketInfo {
 #[test]
 fn test_display() {
     let market_info: MarketInfo = MarketInfo::new_empty(Pubkey::default(), 0);
-    format!("{}", market_info);
+    let _ = format!("{}", market_info);
 }
 
 #[test]

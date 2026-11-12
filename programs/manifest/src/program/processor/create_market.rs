@@ -1,33 +1,38 @@
-use std::{cell::Ref, mem::size_of};
+use crate::validation::{to_program_error, AccountViewExt};
+use pinocchio::{
+    account::AccountView,
+    sysvars::{rent::Rent, Sysvar},
+    ProgramResult,
+};
+use std::mem::size_of;
 
+#[cfg(not(feature = "certora"))]
+use crate::validation::get_global_address;
 use crate::{
     logs::{emit_stack, CreateMarketLog},
     program::{expand_market_if_needed, invoke},
     require,
     state::MarketFixed,
     utils::create_account,
-    validation::{get_vault_address, loaders::CreateMarketContext},
+    validation::loaders::CreateMarketContext,
 };
 use hypertree::{get_mut_helper, trace};
-use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, program_pack::Pack, pubkey::Pubkey,
-    rent::Rent, sysvar::Sysvar,
-};
+use solana_program::{program_pack::Pack, pubkey::Pubkey};
 use spl_token_2022_interface::{
     extension::{
+        account_len::try_calculate_account_len_from_mint_data,
         mint_close_authority::MintCloseAuthority, permanent_delegate::PermanentDelegate,
-        BaseStateWithExtensions, ExtensionType, PodStateWithExtensions, StateWithExtensions,
+        BaseStateWithExtensions, StateWithExtensions,
     },
-    pod::PodMint,
-    state::{Account, Mint},
+    state::Mint,
 };
 
 pub(crate) fn process_create_market(
     _program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    accounts: &[AccountView],
     _data: &[u8],
 ) -> ProgramResult {
-    trace!("process_create_market accs={accounts:?}");
+    trace!("process_create_market accs={}", accounts.len());
     let create_market_context: CreateMarketContext = CreateMarketContext::load(accounts)?;
 
     let CreateMarketContext {
@@ -37,22 +42,28 @@ pub(crate) fn process_create_market(
         quote_mint,
         base_vault,
         quote_vault,
+        base_vault_bump,
+        quote_vault_bump,
         system_program,
-        token_program,
-        token_program_22,
+        // Validated on load; the CPIs below name the accounts the
+        // instruction names, and a program is not one of them.
+        token_program: _,
+        // Validated on load; the CPIs below name the accounts the
+        // instruction names, and a program is not one of them.
+        token_program_22: _,
     } = create_market_context;
 
     require!(
-        base_mint.info.key != quote_mint.info.key,
+        base_mint.info.pubkey() != quote_mint.info.pubkey(),
         crate::program::ManifestError::InvalidMarketParameters,
         "Base and quote must be different",
     )?;
 
     for mint in [base_mint.as_ref(), quote_mint.as_ref()] {
-        if *mint.owner == spl_token_2022_interface::id() {
-            let mint_data: Ref<'_, &mut [u8]> = mint.data.borrow();
+        if mint.owner_pubkey() == spl_token_2022::id() {
+            let mint_data: pinocchio::account::Ref<[u8]> = mint.try_borrow()?;
             let pool_mint: StateWithExtensions<'_, Mint> =
-                StateWithExtensions::<Mint>::unpack(&mint_data)?;
+                StateWithExtensions::<Mint>::unpack(&mint_data).map_err(to_program_error)?;
             // Closable mints can be replaced with different ones, breaking some saved info on the market.
             if let Ok(extension) = pool_mint.get_extension::<MintCloseAuthority>() {
                 let close_authority: Option<Pubkey> = extension.close_authority.into();
@@ -62,9 +73,12 @@ pub(crate) fn process_create_market(
                     );
                 }
             }
-            // Permanent delegates can steal your tokens. This will break all
-            // accounting in the market, so there is no assertion of security
-            // against loss of funds on these markets.
+            // Accepted risk: permissionless Token-2022 support means we cannot
+            // prevent a mint authority from choosing PermanentDelegate without
+            // excluding those mints entirely. A delegate can debit this
+            // market's vault behind Manifest's accounting. The direct-market
+            // damage is isolated to the market being created; users must not
+            // treat other markets as collateral for it.
             if let Ok(extension) = pool_mint.get_extension::<PermanentDelegate>() {
                 let permanent_delegate: Option<Pubkey> = extension.delegate.into();
                 if permanent_delegate.is_some() {
@@ -79,36 +93,29 @@ pub(crate) fn process_create_market(
     {
         // Create the base and quote vaults of this market
         let rent: Rent = Rent::get()?;
-        for (token_account, mint) in [
-            (base_vault.as_ref(), base_mint.as_ref()),
-            (quote_vault.as_ref(), quote_mint.as_ref()),
+        for (token_account, mint, bump) in [
+            (base_vault.as_ref(), base_mint.as_ref(), base_vault_bump),
+            (quote_vault.as_ref(), quote_mint.as_ref(), quote_vault_bump),
         ] {
             // We dont have to deserialize the mint, just check the owner.
-            let is_mint_22: bool = *mint.owner == spl_token_2022_interface::id();
+            let is_mint_22: bool = mint.owner_pubkey() == spl_token_2022::id();
             let token_program_for_mint: Pubkey = if is_mint_22 {
-                spl_token_2022_interface::id()
+                spl_token_2022::id()
             } else {
-                spl_token_interface::id()
+                spl_token::id()
             };
 
-            let (_vault_key, bump) = get_vault_address(market.key, mint.key);
             let seeds: Vec<Vec<u8>> = vec![
                 b"vault".to_vec(),
-                market.key.as_ref().to_vec(),
-                mint.key.as_ref().to_vec(),
+                market.pubkey().as_ref().to_vec(),
+                mint.pubkey().as_ref().to_vec(),
                 vec![bump],
             ];
 
             if is_mint_22 {
-                let mint_data: Ref<'_, &mut [u8]> = mint.data.borrow();
-                let mint_with_extension: PodStateWithExtensions<'_, PodMint> =
-                    PodStateWithExtensions::<PodMint>::unpack(&mint_data).unwrap();
-                let mint_extensions: Vec<ExtensionType> =
-                    mint_with_extension.get_extension_types()?;
-                let required_extensions: Vec<ExtensionType> =
-                    ExtensionType::get_required_init_account_extensions(&mint_extensions);
-                let space: usize =
-                    ExtensionType::try_calculate_account_len::<Account>(&required_extensions)?;
+                let mint_data: pinocchio::account::Ref<[u8]> = mint.try_borrow()?;
+                let space: usize = try_calculate_account_len_from_mint_data(&mint_data, &[])
+                    .map_err(to_program_error)?;
                 create_account(
                     payer.as_ref(),
                     token_account,
@@ -119,21 +126,18 @@ pub(crate) fn process_create_market(
                     seeds,
                 )?;
                 invoke(
-                    &spl_token_2022_interface::instruction::initialize_account3(
+                    &spl_token_2022::instruction::initialize_account3(
                         &token_program_for_mint,
-                        token_account.key,
-                        mint.key,
-                        token_account.key,
-                    )?,
-                    &[
-                        payer.as_ref().clone(),
-                        token_account.clone(),
-                        mint.clone(),
-                        token_program_22.as_ref().clone(),
-                    ],
+                        token_account.pubkey(),
+                        mint.pubkey(),
+                        token_account.pubkey(),
+                    )
+                    .map_err(to_program_error)?,
+                    // initialize_account3 names the account and its mint.
+                    &[token_account, mint],
                 )?;
             } else {
-                let space: usize = spl_token_interface::state::Account::LEN;
+                let space: usize = spl_token::state::Account::LEN;
                 create_account(
                     payer.as_ref(),
                     token_account,
@@ -144,18 +148,15 @@ pub(crate) fn process_create_market(
                     seeds,
                 )?;
                 invoke(
-                    &spl_token_interface::instruction::initialize_account3(
+                    &spl_token::instruction::initialize_account3(
                         &token_program_for_mint,
-                        token_account.key,
-                        mint.key,
-                        token_account.key,
-                    )?,
-                    &[
-                        payer.as_ref().clone(),
-                        token_account.clone(),
-                        mint.clone(),
-                        token_program.as_ref().clone(),
-                    ],
+                        token_account.pubkey(),
+                        mint.pubkey(),
+                        token_account.pubkey(),
+                    )
+                    .map_err(to_program_error)?,
+                    // initialize_account3 names the account and its mint.
+                    &[token_account, mint],
                 )?;
             }
         }
@@ -169,18 +170,34 @@ pub(crate) fn process_create_market(
         // would use an inactive market when multiple exist.
 
         // Setup the empty market
-        let empty_market_fixed: MarketFixed =
-            MarketFixed::new_empty(&base_mint, &quote_mint, market.key);
+        #[allow(unused_mut)]
+        let mut empty_market_fixed: MarketFixed = MarketFixed::new_empty_with_vaults(
+            &base_mint,
+            &quote_mint,
+            *base_vault.info.pubkey(),
+            base_vault_bump,
+            *quote_vault.info.pubkey(),
+            quote_vault_bump,
+        );
+        // Cache the global account addresses so that global trades on this
+        // market never have to derive them.
+        #[cfg(not(feature = "certora"))]
+        {
+            let (base_global, _) = get_global_address(base_mint.info.pubkey());
+            let (quote_global, _) = get_global_address(quote_mint.info.pubkey());
+            empty_market_fixed.set_base_global(base_global);
+            empty_market_fixed.set_quote_global(quote_global);
+        }
         assert_eq!(market.data_len(), size_of::<MarketFixed>());
 
-        let market_bytes: &mut [u8] = &mut market.try_borrow_mut_data()?[..];
+        let market_bytes: &mut [u8] = &mut market.try_borrow_mut()?[..];
         *get_mut_helper::<MarketFixed>(market_bytes, 0_u32) = empty_market_fixed;
 
         emit_stack(CreateMarketLog {
-            market: *market.key,
-            creator: *payer.key,
-            base_mint: *base_mint.info.key,
-            quote_mint: *quote_mint.info.key,
+            market: *market.pubkey(),
+            creator: *payer.pubkey(),
+            base_mint: *base_mint.info.pubkey(),
+            quote_mint: *quote_mint.info.pubkey(),
         })?;
     }
 

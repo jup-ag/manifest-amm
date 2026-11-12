@@ -359,8 +359,16 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
             // quote remaining against price 1.001, then the answer should be
             // 100, because the rounding is in favor of the taker. It takes 100
             // base atoms to exhaust 100 quote atoms at that price.
-            let base_atoms_limit: BaseAtoms =
-                matched_price.checked_base_for_quote(remaining_quote_atoms, !is_bid)?;
+            //
+            // A limit beyond u64::MAX base atoms (a dust-priced resting order
+            // against a large remaining quote) is capped rather than
+            // propagated: the min() below bounds the fill by the resting
+            // order's actual size either way, and failing instead would let
+            // one dust-priced resting order error every quote-denominated
+            // swap on the market. (upstream #751)
+            let base_atoms_limit: BaseAtoms = matched_price
+                .checked_base_for_quote(remaining_quote_atoms, !is_bid)
+                .unwrap_or(BaseAtoms::new(u64::MAX));
             // Either fill the entire resting order, or only the
             // base_atoms_limit, in which case, this is the last iteration.
             let matched_base_atoms: BaseAtoms =
@@ -387,7 +395,11 @@ impl<Fixed: DerefOrBorrow<MarketFixed>, Dynamic: DerefOrBorrow<[u8]>>
 
             total_matched_base_atoms = total_matched_base_atoms.checked_add(matched_base_atoms)?;
 
-            if !did_fully_match_resting_order {
+            // A complete fill can round its quote proceeds above the remaining
+            // target (one base atom at price 1.5 charges two quote atoms
+            // against a remaining target of one). The target is reached, so
+            // stop before the subtraction below underflows. (upstream #751)
+            if !did_fully_match_resting_order || matched_quote_atoms >= remaining_quote_atoms {
                 break;
             }
 

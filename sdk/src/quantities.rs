@@ -219,18 +219,13 @@ pub struct QuoteAtomsPerBaseAtom {
 // These conversions are necessary, bc. the compiler forces 16 byte alignment
 // on the u128 type, which is not necessary given that the target architecture
 // has no native support for u128 math and requires us only to be 8 byte
-// aligned.
+// aligned. Little endian split done with shifts, as upstream does, instead of
+// reinterpreting the bytes through a pointer cast.
 const fn u128_to_u64_slice(a: u128) -> [u64; 2] {
-    unsafe {
-        let ptr: *const u128 = &a;
-        *ptr.cast::<[u64; 2]>()
-    }
+    [a as u64, (a >> 64) as u64]
 }
-pub(crate) fn u64_slice_to_u128(a: [u64; 2]) -> u128 {
-    unsafe {
-        let ptr: *const [u64; 2] = &a;
-        *ptr.cast::<u128>()
-    }
+pub(crate) const fn u64_slice_to_u128(a: [u64; 2]) -> u128 {
+    ((a[1] as u128) << 64) | (a[0] as u128)
 }
 
 const ATOM_LIMIT: u128 = u64::MAX as u128;

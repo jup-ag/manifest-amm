@@ -85,7 +85,7 @@ pub struct GlobalFixed {
     num_seats_claimed: u16,
 }
 
-impl Get for GlobalFixed {}
+unsafe impl Get for GlobalFixed {}
 
 impl GlobalFixed {
     pub fn new_empty(mint: &Pubkey) -> Self {

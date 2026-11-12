@@ -85,7 +85,7 @@ impl TypeName for MarketFixed {
     const NAME: &'static str = "manifest::state::market::MarketFixed";
 }
 
-impl Get for MarketFixed {}
+unsafe impl Get for MarketFixed {}
 
 impl ManifestAccount for MarketFixed {
     fn verify_discriminant(&self) -> ProgramResult {
